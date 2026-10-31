@@ -18,9 +18,11 @@ import youtube from "./youtube";
 import browser from "./browser";
 import doctor from "./doctor";
 import update from "./update";
+import tiktok from "./tiktok";
+import telegram from "./telegram";
 
 // THE dispatch table. Order = order in `socmedia --help`. To add a command: new module + one line here.
-export const COMMANDS: Command[] = [service, queue, tabs, profile, contacts, post, page, screenshot, search, config, extension, inbox, message, youtube, browser, doctor, update];
+export const COMMANDS: Command[] = [service, queue, tabs, profile, contacts, post, page, screenshot, search, config, extension, inbox, message, youtube, browser, doctor, update, tiktok, telegram];
 
 // Help data only (no runners): what --help, --help --json, and the parity tests read.
 export const COMMAND_REGISTRY: CommandMeta[] = COMMANDS.map(({ run: _run, ...meta }) => meta);

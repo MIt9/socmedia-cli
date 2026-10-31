@@ -6,11 +6,11 @@ import { dirname, join, resolve } from "node:path";
 import { dlopen, FFIType } from "bun:ffi";
 import { Database } from "bun:sqlite";
 import { csvCell } from "./output";
-import { downloadPostMedia, downloadProfile, parseDataUrl, profileUrl, resolveHomePath, screenshotPath } from "./media";
+import { downloadPostMedia, downloadProfile, fetchBody, isMediaHost, MAX_VIDEO_BYTES, mediaExt, parseDataUrl, profileUrl, resolveHomePath, safeSeg, screenshotPath } from "./media";
 import { identity, lockPath, pairingPath, socketPath, stateDir, extensionVersion } from "./lib/state";
 import { effectivePort } from "./lib/config";
 import { compatibleVersion } from "./lib/extension";
-import { DEFAULT_CAP, DUP_MS, checkMessageText, GAP_MS, JITTER_MS, MAX_LEN, capFromEnv, contactStatuses, parseMessageTarget, validateJob } from "./lib/validate";
+import { DEFAULT_CAP, DUP_MS, checkMessageText, GAP_MS, JITTER_MS, MAX_LEN, capFromEnv, contactStatuses, parseMessageTarget, telegramChat, tgChannelsCapFromEnv, tiktokUploadsCapFromEnv, validateJob } from "./lib/validate";
 import { exportContactFile, upsertProfileContact } from "./lib/contacts";
 
 // Service daemon: `socmedia --service-daemon` (spawned detached by lib/client.ts start()).
@@ -41,13 +41,37 @@ export async function runServiceDaemon() {
   db.run("CREATE TABLE IF NOT EXISTS contacts (id TEXT PRIMARY KEY, data TEXT NOT NULL)");
   db.run("CREATE TABLE IF NOT EXISTS service_state (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
   db.run("CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY, at TEXT NOT NULL, platform TEXT NOT NULL, toUrl TEXT NOT NULL, text TEXT NOT NULL, status TEXT NOT NULL, error TEXT, jobId INTEGER)");
+  db.run("CREATE TABLE IF NOT EXISTS uploads (id INTEGER PRIMARY KEY, at TEXT NOT NULL, platform TEXT NOT NULL, sha256 TEXT NOT NULL, file TEXT NOT NULL, status TEXT NOT NULL, error TEXT, jobId INTEGER)");
+  db.run("CREATE TABLE IF NOT EXISTS channels (id INTEGER PRIMARY KEY, at TEXT NOT NULL, platform TEXT NOT NULL, title TEXT NOT NULL, status TEXT NOT NULL, error TEXT, jobId INTEGER)");
   const haltRow = db.query("SELECT value FROM service_state WHERE key = 'halted'").get() as { value: string } | null;
   let halted: { code: string; reason: string } | null = haltRow ? JSON.parse(haltRow.value) : null;
-  db.run("UPDATE jobs SET data = json_set(data, '$.status', 'queued') WHERE json_extract(data, '$.action') IN ('readPage','snapshot','getProfile','getComments','getPosts','getPost','screenshot','search','downloadProfile','readInbox','readThread','sendMessage','ytStudioRead','click','scroll') AND json_extract(data, '$.status') = 'running'");
+  // Side-effect actions found running at startup must become unverified, NEVER queued:
+  db.run("UPDATE jobs SET data = json_set(data, '$.status', 'unverified') WHERE json_extract(data, '$.action') IN ('sendMessage','tiktokUpload','tgSendMessage','tgSendMedia','tgCreateChannel') AND json_extract(data, '$.status') = 'running'");
+  // Read actions can be requeued to queued:
+  db.run("UPDATE jobs SET data = json_set(data, '$.status', 'queued') WHERE json_extract(data, '$.action') IN ('readPage','snapshot','getProfile','getComments','getPosts','getPost','screenshot','search','downloadProfile','readInbox','readThread','ytStudioRead','click','scroll','tiktokProfile','tiktokPosts','tiktokVideo','tiktokComments','tiktokSearch','tiktokInbox','tgStatus','tgDialogsList','tgMessagesRead','tgMediaDownload') AND json_extract(data, '$.status') = 'running'");
   type ExtensionData = { token: string; challenge?: { clientNonce: string; serverNonce: string; version: string } };
   let extensionSocket: Bun.ServerWebSocket<ExtensionData> | null = null;
   let connectedVersion: string | null = null;
   const pending = new Map<string, { ws: Bun.ServerWebSocket<ExtensionData>; finish: (reply: unknown) => void | Promise<void>; timer: ReturnType<typeof setTimeout> }>();
+  type ChunkEntry = {
+    total: number;
+    chunks: string[];
+    bytes: number;
+    itemIndex?: number;
+    mediaType?: string;
+    preview?: boolean;
+  };
+  type ActiveTgDownload = {
+    id: string;
+    jobId: number;
+    chat: string;
+    dir?: string;
+    fileSeq: number;
+    saved: Array<{ path: string; type?: string; preview?: boolean }>;
+    skipped: Array<{ type?: string; reason: string; preview?: boolean }>;
+    chunks: Map<string, ChunkEntry>;
+  };
+  let activeTgDownload: ActiveTgDownload | null = null;
   let browserBusy = false;
   let workerWake: ReturnType<typeof setTimeout> | undefined;
   const extensionTimeout = Number(process.env.SOCMEDIA_EXTENSION_TIMEOUT_MS ?? "10000");
@@ -68,11 +92,116 @@ export async function runServiceDaemon() {
       message(ws, message) {
         try {
           const hello = JSON.parse(String(message));
+          if (hello.type === "chunk" && ws === extensionSocket) {
+            if (!activeTgDownload || hello.id !== activeTgDownload.id) {
+              return;
+            }
+            const fileId = String(hello.fileId || "");
+            const total = hello.total;
+            const index = hello.index;
+            const data = typeof hello.data === "string" ? hello.data : "";
+            if (!Number.isInteger(total) || total < 1 || total > 1000 || !Number.isInteger(index) || index < 0 || index >= total) {
+              return;
+            }
+
+            let acc: ChunkEntry | undefined = activeTgDownload.chunks.get(fileId);
+            if (!acc) {
+              acc = {
+                total,
+                chunks: new Array(total),
+                bytes: 0,
+                itemIndex: typeof hello.itemIndex === "number" ? hello.itemIndex : undefined,
+                mediaType: typeof hello.mediaType === "string" ? hello.mediaType : undefined,
+                preview: Boolean(hello.preview),
+              };
+              activeTgDownload.chunks.set(fileId, acc);
+            }
+            const chunkAcc = acc;
+
+            const chunkBytes = Buffer.byteLength(data, "base64");
+            if (chunkAcc.bytes + chunkBytes > 50 * 1024 * 1024) {
+              activeTgDownload.chunks.delete(fileId);
+              activeTgDownload.skipped.push({
+                type: chunkAcc.mediaType || "media",
+                reason: "File exceeds 50 MB limit",
+                preview: chunkAcc.preview,
+              });
+              return;
+            }
+
+            chunkAcc.chunks[index] = data;
+            chunkAcc.bytes += chunkBytes;
+
+            if (chunkAcc.chunks.filter(Boolean).length === chunkAcc.total) {
+              activeTgDownload.chunks.delete(fileId);
+              try {
+                const rawBuffer = Buffer.concat(chunkAcc.chunks.map((c) => Buffer.from(c, "base64")));
+                if (rawBuffer.length > 50 * 1024 * 1024) {
+                  activeTgDownload.skipped.push({
+                    type: chunkAcc.mediaType || "media",
+                    reason: "File exceeds 50 MB limit",
+                    preview: chunkAcc.preview,
+                  });
+                  return;
+                }
+                const ext = mediaExt(rawBuffer);
+                if (ext && ["jpg", "png", "webp", "mp4"].includes(ext)) {
+                  activeTgDownload.fileSeq++;
+                  const itemIdx = chunkAcc.itemIndex ?? activeTgDownload.fileSeq;
+                  const outDir = activeTgDownload.dir
+                    ? resolveHomePath(activeTgDownload.dir)
+                    : resolveHomePath(`~/socmedia-data/telegram/${safeSeg(activeTgDownload.chat)}`);
+                  mkdirSync(outDir, { recursive: true, mode: 0o700 });
+                  let filename = `media_${itemIdx}.${ext}`;
+                  if (existsSync(join(outDir, filename))) {
+                    let counter = 1;
+                    while (existsSync(join(outDir, `media_${itemIdx}_${counter}.${ext}`))) {
+                      counter++;
+                    }
+                    filename = `media_${itemIdx}_${counter}.${ext}`;
+                  }
+                  const filePath = join(outDir, filename);
+                  writeFileSync(filePath, rawBuffer);
+                  activeTgDownload.saved.push({
+                    path: filePath,
+                    type: chunkAcc.mediaType || (ext === "mp4" ? "video" : "photo"),
+                    ...(chunkAcc.preview ? { preview: true } : {}),
+                  });
+                } else {
+                  activeTgDownload.skipped.push({
+                    type: chunkAcc.mediaType || "media",
+                    reason: "Invalid or unsupported media format",
+                    ...(chunkAcc.preview ? { preview: true } : {}),
+                  });
+                }
+              } catch (e: any) {
+                activeTgDownload.skipped.push({
+                  type: chunkAcc.mediaType || "media",
+                  reason: `Failed to write file: ${e?.message || String(e)}`,
+                  ...(chunkAcc.preview ? { preview: true } : {}),
+                });
+              }
+            }
+            return;
+          }
           if (hello.type === "result" && ws === extensionSocket) {
             const request = pending.get(hello.id);
             if (!request || request.ws !== ws) return;
             pending.delete(hello.id); clearTimeout(request.timer);
-            if (hello.error?.code === "HALT" && typeof hello.error.reason === "string" && hello.error.reason.length > 0 && hello.error.reason.length <= 500) request.finish({ halt: { code: "HALT", reason: hello.error.reason } });
+            if (hello.error?.code === "HALT" && typeof hello.error.reason === "string" && hello.error.reason.length > 0 && hello.error.reason.length <= 500) {
+              const isPostAction = Boolean(
+                (hello.error as any).sent || (hello.error as any).posted || (hello.error as any).created ||
+                (hello as any).sent || (hello as any).posted || (hello as any).created ||
+                (hello as any).result?.sent || (hello as any).result?.posted || (hello as any).result?.created
+              );
+              request.finish({
+                halt: { code: "HALT", reason: hello.error.reason },
+                sent: Boolean((hello.error as any).sent || (hello as any).sent || (hello as any).result?.sent),
+                posted: Boolean((hello.error as any).posted || (hello as any).posted || (hello as any).result?.posted),
+                created: Boolean((hello.error as any).created || (hello as any).created || (hello as any).result?.created),
+                isPostAction,
+              });
+            }
             else request.finish(hello.error ? { error: String(hello.error) } : hello.result);
             return;
           }
@@ -148,7 +277,7 @@ export async function runServiceDaemon() {
       })();
     }
     if (browserBusy) return;
-    const rows = db.query("SELECT id, data FROM jobs WHERE json_extract(data, '$.action') IN ('readPage','snapshot','getProfile','getComments','getPosts','getPost','screenshot','search','readInbox','readThread','sendMessage','ytStudioRead','click','scroll') AND json_extract(data, '$.status') = 'queued' ORDER BY id").all() as { id: number; data: string }[];
+    const rows = db.query("SELECT id, data FROM jobs WHERE json_extract(data, '$.action') IN ('readPage','snapshot','getProfile','getComments','getPosts','getPost','screenshot','search','downloadProfile','readInbox','readThread','sendMessage','ytStudioRead','click','scroll','tiktokProfile','tiktokPosts','tiktokVideo','tiktokComments','tiktokSearch','tiktokInbox','tiktokUpload','tgStatus','tgDialogsList','tgMessagesRead','tgMediaDownload','tgSendMessage','tgSendMedia','tgCreateChannel') AND json_extract(data, '$.status') = 'queued' ORDER BY id").all() as { id: number; data: string }[];
     const row = rows.find((candidate) => {
       const job = JSON.parse(candidate.data);
       const at = job.notBefore ? Date.parse(job.notBefore) : 0;
@@ -165,11 +294,53 @@ export async function runServiceDaemon() {
     browserBusy = true;
     const ws = extensionSocket;
     const id = randomBytes(16).toString("hex");
+    if (job.action === "tgMediaDownload") {
+      activeTgDownload = {
+        id,
+        jobId: row.id,
+        chat: String(job.args.chat || ""),
+        dir: job.args.dir ? String(job.args.dir) : undefined,
+        fileSeq: 0,
+        saved: [],
+        skipped: [],
+        chunks: new Map(),
+      };
+    }
     const finish = async (reply: unknown) => {
       const halt = reply && typeof reply === "object" && "halt" in reply ? (reply as { halt: { code: string; reason: string } }).halt : null;
       const error = reply && typeof reply === "object" && "error" in reply ? String((reply as { error: unknown }).error) : null;
-      if (halt) { halted = halt; job.status = "failed"; job.error = halt; }
-      else if (error === "Extension disconnected") { job.status = "queued"; }
+      const isSideEffect = ["sendMessage", "tiktokUpload", "tgSendMessage", "tgSendMedia", "tgCreateChannel"].includes(job.action);
+      const postPointOfNoReturn = Boolean(
+        (reply as any)?.sent || (reply as any)?.posted || (reply as any)?.created ||
+        (reply as any)?.isPostAction
+      );
+      if (halt) {
+        halted = halt;
+        if (postPointOfNoReturn && isSideEffect) {
+          job.status = "unverified";
+          job.error = halt;
+        } else {
+          job.status = "failed";
+          job.error = halt;
+        }
+      }
+      else if (error === "Extension disconnected") {
+        if (isSideEffect) {
+          job.status = "unverified";
+          job.error = error;
+        } else {
+          job.status = "queued";
+        }
+      }
+      else if (error === "Extension request timed out") {
+        if (isSideEffect) {
+          job.status = "unverified";
+          job.error = error;
+        } else {
+          job.status = "failed";
+          job.error = error;
+        }
+      }
       else if (error) { job.status = "failed"; job.error = error; }
       else {
         let finalResult: unknown = reply;
@@ -203,10 +374,68 @@ export async function runServiceDaemon() {
             job.error = e?.message || String(e);
             finalResult = undefined;
           }
+        } else if (job.action === "tiktokVideo" && job.args?.download) {
+          try {
+            const vidRes = reply as { url?: string; author?: string; id?: string; videoUrl?: string | null; [key: string]: unknown };
+            const author = safeSeg(job.args.author || vidRes.author) || "_unknown";
+            const videoId = safeSeg(job.args.id || vidRes.id) || "_unknown";
+            const dir = resolveHomePath(`~/socmedia-data/tiktok/${author}/${videoId}`);
+            mkdirSync(dir, { recursive: true, mode: 0o700 });
+
+            const vUrl = vidRes.videoUrl;
+            if (!vUrl || vUrl.startsWith("blob:")) {
+              finalResult = {
+                ...vidRes,
+                downloaded: false,
+                reason: !vUrl ? "No video URL exposed on page" : "Page only exposes a blob: URL; direct CDN download not possible",
+                savedAt: dir,
+              };
+            } else {
+              const fetchRes = await fetchBody(vUrl, { max: MAX_VIDEO_BYTES, timeout: 60000, allow: isMediaHost });
+              const ext = fetchRes.status === 200 && !fetchRes.truncated ? mediaExt(fetchRes.body) : null;
+              if (ext === "mp4") {
+                writeFileSync(join(dir, "video.mp4"), fetchRes.body);
+                writeFileSync(join(dir, "video.json"), JSON.stringify({ ...vidRes, downloaded: true }, null, 2));
+                finalResult = {
+                  ...vidRes,
+                  downloaded: true,
+                  file: join(dir, "video.mp4"),
+                  meta: join(dir, "video.json"),
+                };
+              } else {
+                finalResult = {
+                  ...vidRes,
+                  downloaded: false,
+                  reason: "Fetched media did not pass mp4 verification",
+                  savedAt: dir,
+                };
+              }
+            }
+          } catch (e: any) {
+            finalResult = {
+              ...(typeof reply === "object" && reply ? reply : {}),
+              downloaded: false,
+              reason: `Download failed: ${e?.message || String(e)}`,
+            };
+          }
+        } else if (job.action === "tgMediaDownload" && activeTgDownload && activeTgDownload.id === id) {
+          const rawReply = (reply && typeof reply === "object" ? reply : {}) as Record<string, any>;
+          finalResult = {
+            chat: activeTgDownload.chat,
+            attempted: rawReply.attempted ?? (activeTgDownload.saved.length + activeTgDownload.skipped.length),
+            saved: activeTgDownload.saved,
+            skipped: [...(rawReply.skipped || []), ...activeTgDownload.skipped],
+          };
         }
-        if (job.status !== "failed") {
-          job.status = "done";
-          job.result = finalResult;
+        if (job.status !== "failed" && job.status !== "unverified") {
+          const isUnverifiedRes = reply && typeof reply === "object" && ("verified" in reply) && (reply as any).verified === false;
+          if (isUnverifiedRes && isSideEffect) {
+            job.status = "unverified";
+            job.result = finalResult;
+          } else {
+            job.status = "done";
+            job.result = finalResult;
+          }
         }
       }
       try {
@@ -223,6 +452,9 @@ export async function runServiceDaemon() {
               if (res.sent && res.verified) sendStatus = "sent";
               else if (res.sent) { sendStatus = "unverified"; sendError = "sent, but unverified"; }
               else sendStatus = "failed";
+            } else if (job.status === "unverified") {
+              sendStatus = "unverified";
+              sendError = job.error ? (typeof job.error === "object" ? job.error.reason : String(job.error)) : "unverified";
             }
             db.query("INSERT INTO messages (at, platform, toUrl, text, status, error, jobId) VALUES (?, ?, ?, ?, ?, ?, ?)").run(
               nowIso, parsedTarget.platform, parsedTarget.url, job.args.text, sendStatus, sendError, row.id
@@ -247,23 +479,109 @@ export async function runServiceDaemon() {
               } catch {}
             }
           }
+          if (job.action === "tgSendMessage" || job.action === "tgSendMedia") {
+            const nowIso = new Date().toISOString();
+            let sendStatus = "failed";
+            let sendError: string | null = job.error ? (typeof job.error === "object" ? job.error.reason : String(job.error)) : null;
+            if (job.status === "done") {
+              const res = reply as { sent?: boolean; verified?: boolean };
+              if (res.sent && res.verified) sendStatus = "sent";
+              else if (res.sent) { sendStatus = "unverified"; sendError = "sent, but unverified"; }
+              else sendStatus = "failed";
+            } else if (job.status === "unverified") {
+              sendStatus = "unverified";
+              sendError = job.error ? (typeof job.error === "object" ? job.error.reason : String(job.error)) : "unverified";
+            }
+            const msgText = job.action === "tgSendMessage" ? String(job.args.text) : String(job.args.caption || "");
+            db.query("INSERT INTO messages (at, platform, toUrl, text, status, error, jobId) VALUES (?, ?, ?, ?, ?, ?, ?)").run(
+              nowIso, "tg", String(job.args.chat), msgText, sendStatus, sendError, row.id
+            );
+          }
+          if (job.action === "tiktokUpload") {
+            const nowIso = new Date().toISOString();
+            let upStatus = "failed";
+            let upError: string | null = job.error ? (typeof job.error === "object" ? job.error.reason : String(job.error)) : null;
+            if (job.status === "done") {
+              const res = reply as { posted?: boolean; verified?: boolean };
+              if (res.posted && res.verified) upStatus = "sent";
+              else if (res.posted) { upStatus = "unverified"; upError = "posted, but unverified"; }
+              else upStatus = "failed";
+            } else if (job.status === "unverified") {
+              upStatus = "unverified";
+              upError = job.error ? (typeof job.error === "object" ? job.error.reason : String(job.error)) : "unverified";
+            }
+            db.query("INSERT INTO uploads (at, platform, sha256, file, status, error, jobId) VALUES (?, ?, ?, ?, ?, ?, ?)").run(
+              nowIso, "tt", String(job.args.sha256), String(job.args.file), upStatus, upError, row.id
+            );
+          }
+          if (job.action === "tgCreateChannel") {
+            const nowIso = new Date().toISOString();
+            let chanStatus = "failed";
+            let chanError: string | null = job.error ? (typeof job.error === "object" ? job.error.reason : String(job.error)) : null;
+            if (job.status === "done") {
+              const res = reply as { created?: boolean; verified?: boolean };
+              if (res.created && res.verified) chanStatus = "sent";
+              else if (res.created) { chanStatus = "unverified"; chanError = "created, but unverified"; }
+              else chanStatus = "failed";
+            } else if (job.status === "unverified") {
+              chanStatus = "unverified";
+              chanError = job.error ? (typeof job.error === "object" ? job.error.reason : String(job.error)) : "unverified";
+            }
+            db.query("INSERT INTO channels (at, platform, title, status, error, jobId) VALUES (?, ?, ?, ?, ?, ?)").run(
+              nowIso, "tg", String(job.args.title), chanStatus, chanError, row.id
+            );
+          }
           db.query("UPDATE jobs SET data = ? WHERE id = ?").run(JSON.stringify(job), row.id);
         })();
       } catch (error) {
         job.status = "failed"; job.error = `Contact upsert failed: ${error instanceof Error ? error.message : String(error)}`; delete job.result;
         db.query("UPDATE jobs SET data = ? WHERE id = ?").run(JSON.stringify(job), row.id);
       }
+      if (activeTgDownload && activeTgDownload.id === id) {
+        activeTgDownload = null;
+      }
       browserBusy = false;
       queueMicrotask(pump);
     };
-    const timeout = job.action === "getComments" ? Math.max(extensionTimeout, 60000) : job.action === "getProfile" ? Math.max(extensionTimeout, 45000) : extensionTimeout;
+    const actionTimeoutMap: Record<string, number> = {
+      tiktokUpload: 10 * 60 * 1000,
+      tgSendMedia: 10 * 60 * 1000,
+      tgMediaDownload: 5 * 60 * 1000,
+      tiktokProfile: 75000,
+      tiktokPosts: 75000,
+      tiktokVideo: 75000,
+      tiktokComments: 75000,
+      tiktokSearch: 75000,
+      tiktokInbox: 75000,
+      tgStatus: 75000,
+      tgDialogsList: 75000,
+      tgMessagesRead: 75000,
+      tgSendMessage: 75000,
+      tgCreateChannel: 75000,
+      getComments: Math.max(extensionTimeout, 60000),
+      getProfile: Math.max(extensionTimeout, 45000),
+    };
+    const timeout = actionTimeoutMap[job.action] ?? extensionTimeout;
     const timer = setTimeout(() => { pending.delete(id); finish({ error: "Extension request timed out" }); }, timeout);
     pending.set(id, { ws, finish, timer });
     ws.send(JSON.stringify({ type: "request", id, action: job.action, args: job.args }));
   }
   const extensionStatus = () => ({ connected: extensionSocket !== null, version: connectedVersion, compatible: connectedVersion === null ? null : compatibleVersion(connectedVersion), port: extensionServer.port });
   const server = createServer((socket) => {
-    socket.write(JSON.stringify({ identity, pid: process.pid, version: extensionVersion, extension: extensionStatus(), halted, extensionUrl: `ws://127.0.0.1:${extensionServer.port}/extension`, portSource: portConfig.source }) + "\n");
+    socket.write(JSON.stringify({
+      identity,
+      pid: process.pid,
+      version: extensionVersion,
+      extension: extensionStatus(),
+      halted,
+      extensionUrl: `ws://127.0.0.1:${extensionServer.port}/extension`,
+      portSource: portConfig.source,
+      limits: {
+        messages: { cap: capFromEnv() },
+        tiktokUploads: { cap: tiktokUploadsCapFromEnv() },
+        telegramChannels: { cap: tgChannelsCapFromEnv() },
+      },
+    }) + "\n");
     let input = "";
     socket.on("data", (data) => {
       input += data.toString();
@@ -395,8 +713,8 @@ export async function runServiceDaemon() {
         socket.end(JSON.stringify(row ? { id: row.id, ...JSON.parse(row.data) } : { error: `Job ${id} not found` }) + "\n");
       } else if (command?.startsWith("queue enqueue ")) {
         try {
-          const job = validateJob(JSON.parse(command.slice("queue enqueue ".length)));
           const create = db.transaction(() => {
+            const job = validateJob(JSON.parse(command.slice("queue enqueue ".length)));
             if (job.action === "sendMessage") {
               const msgArgs = job.args as Record<string, unknown>;
               const parsedTarget = parseMessageTarget(msgArgs.to);
@@ -405,9 +723,26 @@ export async function runServiceDaemon() {
               const cap = capFromEnv();
               const startOfToday = new Date(new Date().getFullYear(), new Date().getMonth(), new Date().getDate()).toISOString();
               const usedToday = db.query("SELECT COUNT(*) as count FROM messages WHERE platform = ? AND status IN ('sent', 'unverified') AND at >= ?").get(parsedTarget.platform, startOfToday) as { count: number };
-              if (usedToday.count >= cap) throw new Error(`Daily cap reached: ${usedToday.count} of ${cap} messages on ${parsedTarget.platform} today (SOCMEDIA_MAX_MESSAGES_PER_DAY). Try again tomorrow.`);
-              const sevenDaysAgo = new Date(now - DUP_MS).toISOString();
+              const activeJobs = db.query("SELECT data FROM jobs WHERE json_extract(data, '$.action') = 'sendMessage' AND json_extract(data, '$.status') IN ('queued', 'running')").all() as { data: string }[];
+              let activeCount = 0;
               const normInput = text.replace(/\s+/g, " ").trim().toLowerCase();
+              for (const row of activeJobs) {
+                const j = JSON.parse(row.data);
+                try {
+                  const pt = parseMessageTarget(j.args?.to);
+                  if (pt.platform === parsedTarget.platform) {
+                    activeCount++;
+                    if (normInput && checkMessageText(j.args?.text).replace(/\s+/g, " ").trim().toLowerCase() === normInput && pt.url.toLowerCase() === parsedTarget.url.toLowerCase()) {
+                      throw new Error("Refused: identical text is already queued or running (7-day rule). Change the text or wait.");
+                    }
+                  }
+                } catch (err: any) {
+                  if (err.message.includes("already queued or running")) throw err;
+                }
+              }
+              const totalToday = usedToday.count + activeCount;
+              if (totalToday >= cap) throw new Error(`Daily message cap reached: ${totalToday} of ${cap} messages on ${parsedTarget.platform} today (SOCMEDIA_MAX_MESSAGES_PER_DAY). Try again tomorrow.`);
+              const sevenDaysAgo = new Date(now - DUP_MS).toISOString();
               const recent = db.query("SELECT at, toUrl, text FROM messages WHERE platform = ? AND status IN ('sent', 'unverified') AND at >= ?").all(parsedTarget.platform, sevenDaysAgo) as { at: string; toUrl: string; text: string }[];
               const dup = recent.find((r) => {
                 try {
@@ -415,20 +750,113 @@ export async function runServiceDaemon() {
                 } catch { return false; }
               });
               if (dup) throw new Error(`Refused: identical text was already sent to this recipient on ${dup.at} (7-day rule). Change the text or wait.`);
-              if (!job.notBefore) {
-                let anchor = 0;
-                const activeJobs = db.query("SELECT data FROM jobs WHERE json_extract(data, '$.action') = 'sendMessage' AND json_extract(data, '$.status') IN ('queued', 'running')").all() as { data: string }[];
-                for (const row of activeJobs) {
-                  const j = JSON.parse(row.data);
-                  const at = j.notBefore ? Date.parse(j.notBefore) : 0;
-                  anchor = Math.max(anchor, at);
-                }
-                const lastMsg = db.query("SELECT at FROM messages WHERE status IN ('sent', 'unverified') ORDER BY id DESC LIMIT 1").get() as { at: string } | null;
-                if (lastMsg) anchor = Math.max(anchor, Date.parse(lastMsg.at) || 0);
-                if (anchor > 0) {
-                  const planned = Math.max(now, anchor + GAP_MS + Math.floor(Math.random() * JITTER_MS));
+              let anchor = 0;
+              for (const row of activeJobs) {
+                const j = JSON.parse(row.data);
+                const at = j.notBefore ? Date.parse(j.notBefore) : (j.createdAt ? Date.parse(j.createdAt) : now);
+                anchor = Math.max(anchor, at);
+              }
+              const lastMsg = db.query("SELECT at FROM messages WHERE status IN ('sent', 'unverified') ORDER BY id DESC LIMIT 1").get() as { at: string } | null;
+              if (lastMsg) anchor = Math.max(anchor, Date.parse(lastMsg.at) || 0);
+              if (anchor > 0) {
+                const minPlanned = anchor + GAP_MS;
+                const planned = Math.max(now, minPlanned + Math.floor(Math.random() * JITTER_MS));
+                if (!job.notBefore || Date.parse(String(job.notBefore)) < minPlanned) {
                   job.notBefore = new Date(planned).toISOString();
                 }
+              }
+            }
+            if (job.action === "tgSendMessage" || job.action === "tgSendMedia") {
+              const tgArgs = job.args as Record<string, any>;
+              const chat = telegramChat(tgArgs.chat);
+              const text = job.action === "tgSendMessage" ? String(tgArgs.text) : String(tgArgs.caption || "");
+              const now = Date.now();
+              const cap = capFromEnv();
+              const startOfToday = new Date(new Date().getFullYear(), new Date().getMonth(), new Date().getDate()).toISOString();
+              const usedToday = db.query("SELECT COUNT(*) as count FROM messages WHERE platform = 'tg' AND status IN ('sent', 'unverified') AND at >= ?").get(startOfToday) as { count: number };
+              const activeJobs = db.query("SELECT data FROM jobs WHERE json_extract(data, '$.action') IN ('tgSendMessage', 'tgSendMedia') AND json_extract(data, '$.status') IN ('queued', 'running')").all() as { data: string }[];
+              const normInput = text ? text.replace(/\s+/g, " ").trim().toLowerCase() : "";
+              for (const row of activeJobs) {
+                const j = JSON.parse(row.data);
+                try {
+                  const jChat = telegramChat(j.args?.chat || "");
+                  if (jChat.toLowerCase() === chat.toLowerCase()) {
+                    if (normInput) {
+                      const jText = (j.action === "tgSendMessage" ? String(j.args?.text || "") : String(j.args?.caption || "")).replace(/\s+/g, " ").trim().toLowerCase();
+                      if (jText === normInput) {
+                        throw new Error("Refused: identical text is already queued or running (7-day rule). Change the text or wait.");
+                      }
+                    }
+                    if (tgArgs.sha256 && j.args?.sha256 && String(j.args.sha256) === String(tgArgs.sha256)) {
+                      throw new Error("Refused: identical file is already queued or running (7-day rule). Change the file or wait.");
+                    }
+                  }
+                } catch (err: any) {
+                  if (err.message.includes("already queued or running")) throw err;
+                }
+              }
+              const totalToday = usedToday.count + activeJobs.length;
+              if (totalToday >= cap) {
+                const err: any = new Error(`Daily message cap reached: ${totalToday} of ${cap} messages on tg today (SOCMEDIA_MAX_MESSAGES_PER_DAY). Try again tomorrow.`);
+                err.code = "RATE_LIMIT";
+                throw err;
+              }
+              if (text.trim()) {
+                const sevenDaysAgo = new Date(now - DUP_MS).toISOString();
+                const recent = db.query("SELECT at, toUrl, text FROM messages WHERE platform = 'tg' AND status IN ('sent', 'unverified') AND at >= ?").all(sevenDaysAgo) as { at: string; toUrl: string; text: string }[];
+                const dup = recent.find((r) => r.toUrl.toLowerCase() === chat.toLowerCase() && r.text.replace(/\s+/g, " ").trim().toLowerCase() === normInput);
+                if (dup) throw new Error(`Refused: identical text was already sent to this recipient on ${dup.at} (7-day rule). Change the text or wait.`);
+              }
+              let anchor = 0;
+              for (const row of activeJobs) {
+                const j = JSON.parse(row.data);
+                const at = j.notBefore ? Date.parse(j.notBefore) : (j.createdAt ? Date.parse(j.createdAt) : now);
+                anchor = Math.max(anchor, at);
+              }
+              const lastMsg = db.query("SELECT at FROM messages WHERE platform = 'tg' AND status IN ('sent', 'unverified') ORDER BY id DESC LIMIT 1").get() as { at: string } | null;
+              if (lastMsg) anchor = Math.max(anchor, Date.parse(lastMsg.at) || 0);
+              if (anchor > 0) {
+                const minPlanned = anchor + GAP_MS;
+                const planned = Math.max(now, minPlanned + Math.floor(Math.random() * JITTER_MS));
+                if (!job.notBefore || Date.parse(String(job.notBefore)) < minPlanned) {
+                  job.notBefore = new Date(planned).toISOString();
+                }
+              }
+            }
+            if (job.action === "tiktokUpload") {
+              const ttArgs = job.args as Record<string, any>;
+              const fileSha = String(ttArgs.sha256);
+              const now = Date.now();
+              const cap = tiktokUploadsCapFromEnv();
+              const startOfToday = new Date(new Date().getFullYear(), new Date().getMonth(), new Date().getDate()).toISOString();
+              const usedToday = db.query("SELECT COUNT(*) as count FROM uploads WHERE platform = 'tt' AND status IN ('sent', 'unverified') AND at >= ?").get(startOfToday) as { count: number };
+              const activeJobs = db.query("SELECT data FROM jobs WHERE json_extract(data, '$.action') = 'tiktokUpload' AND json_extract(data, '$.status') IN ('queued', 'running')").all() as { data: string }[];
+              for (const row of activeJobs) {
+                const j = JSON.parse(row.data);
+                if (fileSha && String(j.args?.sha256) === fileSha) {
+                  throw new Error("Refused: identical file is already queued or running (7-day rule). Change the file or wait.");
+                }
+              }
+              const totalToday = usedToday.count + activeJobs.length;
+              if (totalToday >= cap) {
+                const err: any = new Error(`Daily upload cap reached: ${totalToday} of ${cap} uploads on tt today (SOCMEDIA_MAX_TIKTOK_UPLOADS_PER_DAY). Try again tomorrow.`);
+                err.code = "RATE_LIMIT";
+                throw err;
+              }
+              const sevenDaysAgo = new Date(now - DUP_MS).toISOString();
+              const recent = db.query("SELECT at, sha256 FROM uploads WHERE platform = 'tt' AND sha256 = ? AND status IN ('sent', 'unverified') AND at >= ?").get(fileSha, sevenDaysAgo) as { at: string; sha256: string } | null;
+              if (recent) throw new Error(`Refused: identical file was already uploaded on ${recent.at} (7-day rule). Change the file or wait.`);
+            }
+            if (job.action === "tgCreateChannel") {
+              const cap = tgChannelsCapFromEnv();
+              const startOfToday = new Date(new Date().getFullYear(), new Date().getMonth(), new Date().getDate()).toISOString();
+              const usedToday = db.query("SELECT COUNT(*) as count FROM channels WHERE platform = 'tg' AND status IN ('sent', 'unverified') AND at >= ?").get(startOfToday) as { count: number };
+              const activeJobs = db.query("SELECT data FROM jobs WHERE json_extract(data, '$.action') = 'tgCreateChannel' AND json_extract(data, '$.status') IN ('queued', 'running')").all() as { data: string }[];
+              const totalToday = usedToday.count + activeJobs.length;
+              if (totalToday >= cap) {
+                const err: any = new Error(`Daily channel creation cap reached: ${totalToday} of ${cap} channels on tg today (SOCMEDIA_MAX_TG_CHANNELS_PER_DAY). Try again tomorrow.`);
+                err.code = "RATE_LIMIT";
+                throw err;
               }
             }
             if (job.key) {

@@ -5,7 +5,7 @@ let browserAction = Promise.resolve();
 let connectEpoch = 0;
 
 const GROUP_TITLE = "Socmedia CLI";
-const isSocial = (url) => /^https:\/\/([\w-]+\.)*((instagram|facebook|youtube)\.com|fb\.com)\//.test(url || "");
+const isSocial = (url) => /^https:\/\/([\w-]+\.)*((instagram|facebook|youtube|tiktok)\.com|fb\.com|telegram\.org)\//.test(url || "");
 
 async function selectedWorkTab() {
   const { cliSelectedTab } = await chrome.storage.local.get("cliSelectedTab");
@@ -71,14 +71,14 @@ async function useTab({ tabId }) {
   }
   if (!Number.isSafeInteger(tabId) || tabId < 0) throw new Error("Tab ID must be a non-negative integer");
   const tab = await chrome.tabs.get(tabId).catch(() => null);
-  if (!tab || !isSocial(tab.url)) throw new Error(`Tab ${tabId} is not an open Instagram, Facebook or YouTube tab`);
+  if (!tab || !isSocial(tab.url)) throw new Error(`Tab ${tabId} is not an open Instagram, Facebook, YouTube, TikTok or Telegram tab`);
   await chrome.storage.local.set({ cliSelectedTab: tabId });
   return { ok: true, selected: tabId };
 }
 
 function inspectPage() {
   const path = location.pathname.toLowerCase();
-  const paths = ["/challenge", "/checkpoint", "/accounts/login", "/login", "/suspended"];
+  const paths = ["/challenge", "/checkpoint", "/accounts/login", "/login", "/suspended", "/verify"];
   for (const part of paths) if (path.includes(part)) return `URL path "${part}"`;
   if ([...document.querySelectorAll("iframe")].some((frame) => {
     const rect = frame.getBoundingClientRect();
@@ -86,6 +86,16 @@ function inspectPage() {
   })) return "captcha challenge";
   if (location.hostname.includes("instagram.com") && (document.querySelector("form#loginForm") || document.querySelector('form[action*="/accounts/login"]'))) return "not logged in (Instagram login form)";
   if ((location.hostname.includes("facebook.com") || /(^|\.)fb\.com$/.test(location.hostname)) && (document.querySelector("form#login_form") || (document.querySelector('input[name="email"]') && document.querySelector('input[name="pass"]')))) return "not logged in (Facebook login form)";
+  if (location.hostname.includes("tiktok.com")) {
+    if (document.querySelector("#loginContainer, [data-e2e=login-modal], form[action*='login']")) return "not logged in (TikTok login form)";
+    if (document.querySelector(".captcha_verify_container, #captcha_container, .captcha-verify-bar, .secsdk-captcha-drag-icon, #tiktok-verify-ele, [class*='captcha']") || /Drag the slider|Verify to continue|Select 2 objects/i.test(document.body?.innerText || "")) return "TikTok captcha challenge";
+  }
+  if (location.hostname.includes("telegram.org")) {
+    if (document.querySelector(".login-header, .qr-container, .auth-form, canvas.qr, [data-testid='qr-code']") || /Log in to Telegram|Log in by phone|Your Phone Number/i.test(document.body?.innerText || "") || location.hash.includes("login")) return "not logged in (Telegram login / QR page)";
+    if (document.querySelector("input[name='phone_number'], input.input-field-phone, .country-select")) return "not logged in (Telegram phone number page)";
+  }
+  const floodMatch = (document.body?.innerText || "").match(/FLOOD_WAIT|Too many attempts|Please try again later|Too many requests/i);
+  if (floodMatch) return `FLOOD notice: "${floodMatch[0]}"`;
   const pattern = /Try Again Later|We restrict certain activity|suspicious activity|Confirm it['’]s you|You['’]re Temporarily Blocked/i;
   const dialogs = [...document.querySelectorAll('[role=dialog], [role=alertdialog], [role=alert]')];
   if ((document.body?.innerText || "").length < 3000 && document.body) dialogs.push(document.body);
@@ -97,11 +107,12 @@ async function safeTab(tabId) {
   const tab = await chrome.tabs.get(tabId);
   const parsed = new URL(tab.url);
   const path = parsed.pathname.toLowerCase();
-  const blockedPath = ["/challenge", "/checkpoint", "/accounts/login", "/login", "/suspended"].find((part) => path.includes(part));
-  const externalLogin = parsed.hostname === "accounts.google.com" || (/(^|\.)google\.com$/.test(parsed.hostname) && path.startsWith("/sorry"));
-  if (!blockedPath && !externalLogin && !isSocial(tab.url)) throw new Error("Work tab is not an open Instagram, Facebook or YouTube tab");
+  const blockedPath = ["/challenge", "/checkpoint", "/accounts/login", "/login", "/suspended", "/verify"].find((part) => path.includes(part));
+  const externalLogin = parsed.hostname === "accounts.google.com" || (/(^|\.)google\.com$/.test(parsed.hostname) && path.startsWith("/sorry"))
+    || (parsed.hostname.includes("telegram.org") && (tab.url.includes("#login") || path.startsWith("/login")));
+  if (!blockedPath && !externalLogin && !isSocial(tab.url)) throw new Error("Work tab is not an open Instagram, Facebook, YouTube, TikTok or Telegram tab");
   const [check] = blockedPath || externalLogin ? [] : await chrome.scripting.executeScript({ target: { tabId }, func: inspectPage });
-  const reason = blockedPath ? `URL path "${blockedPath}"` : externalLogin ? "Google sign-in or security check" : check?.result;
+  const reason = blockedPath ? `URL path "${blockedPath}"` : externalLogin ? "login or security check" : check?.result;
   if (reason) {
     const error = new Error(`HALT: ${reason}`);
     error.code = "HALT";
@@ -299,10 +310,115 @@ let lastProfileNavigation = 0;
 let nextProfileGap = 3000;
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-async function navigateSocial(target) {
+function pgMatchTgChat(expected, prevHeader = null) {
+  const norm = expected.replace(/^@/, "").toLowerCase();
+  const header = document.querySelector(".top .peer-title, .chat-info .peer-title, .chat-title, .person-title, .user-title, [class*='chat-info'] [class*='title']");
+  const title = (header?.innerText || "").trim();
+  const titleLower = title.toLowerCase();
+
+  // If no chat header at all, cannot match
+  if (!title) {
+    return { matched: false, title: "", confirmed: false, reason: "No chat header found" };
+  }
+
+  // Fail closed on stale header from previous chat
+  if (prevHeader && titleLower && titleLower === prevHeader.trim().toLowerCase()) {
+    return { matched: false, stale: true, title, reason: "Header has not changed from previous chat" };
+  }
+
+  // Exact @username confirmation from open chat's own data (profile side panel username row or equivalent peer-bound source)
+  let confirmed = false;
+  const usernameSelectors = [
+    ".sidebar-right .user-username",
+    ".sidebar-right .username",
+    ".sidebar-right [class*='username']",
+    ".sidebar-right .sidebar-content [class*='username']",
+    ".profile-info .user-username",
+    ".profile-info .username",
+    ".profile-info [class*='username']",
+    ".profile-user-name",
+    "[class*='profile'] [class*='username']",
+    ".sidebar-right .row-value",
+    ".sidebar-right .sidebar-content .row-value",
+    ".sidebar .user-username", // For test mocks that only mock .sidebar .user-username
+    ".sidebar [class*='username']",
+    "[data-peer-username]"
+  ];
+
+  for (const sel of usernameSelectors) {
+    const el = document.querySelector(sel);
+    if (el) {
+      const val = (el.getAttribute?.("data-peer-username") || el.innerText || el.textContent || "").trim();
+      const normVal = val.replace(/^@/, "").toLowerCase();
+      if (normVal === norm || normVal === `t.me/${norm}` || normVal === `https://t.me/${norm}`) {
+        confirmed = true;
+        break;
+      }
+    }
+  }
+
+  // If profile sidebar is closed, click the chat header to open the profile info panel
+  if (!confirmed) {
+    const profileBtn = document.querySelector(".top .chat-info, .chat-info, .top .peer-title");
+    if (profileBtn && typeof profileBtn.click === "function") {
+      try {
+        profileBtn.click();
+        const sideEl = document.querySelector(".sidebar-right .user-username, .sidebar-right [class*='username'], .profile-info [class*='username'], .profile-user-name");
+        if (sideEl) {
+          const val = (sideEl.innerText || sideEl.textContent || "").trim().replace(/^@/, "").toLowerCase();
+          if (val === norm || val === `t.me/${norm}` || val === `https://t.me/${norm}`) {
+            confirmed = true;
+          }
+        }
+      } catch {}
+    }
+  }
+
+  if (!confirmed) {
+    const activeChat = document.querySelector(".chatlist-chat.active, .chatlist-chat.is-selected, .chat-item.active, [data-peer-id].active");
+    if (activeChat) {
+      const attr = activeChat.getAttribute?.("data-peer-username");
+      if (attr && attr.replace(/^@/, "").toLowerCase() === norm) {
+        confirmed = true;
+      } else {
+        const link = activeChat.querySelector?.("a[href*='#@']")?.getAttribute?.("href") || activeChat.getAttribute?.("href") || "";
+        const m = link.match(/#@([a-zA-Z0-9_]+)/)?.[1];
+        if (m && m.toLowerCase() === norm) {
+          confirmed = true;
+        }
+      }
+    }
+  }
+
+  if (!confirmed) {
+    // Only check rows inside .sidebar-right or .profile-info - NEVER generic .sidebar or [class*='sidebar'] div!
+    const rows = document.querySelectorAll?.(".sidebar-right .row, .sidebar-right .row-value, .profile-info-row, .profile-info .row, .profile-info [class*='value']") || [];
+    for (const r of rows) {
+      const t = (r.innerText || r.textContent || "").trim().toLowerCase();
+      if (t === `@${norm}` || t === `t.me/${norm}` || t === `https://t.me/${norm}`) {
+        confirmed = true;
+        break;
+      }
+    }
+  }
+
+  if (confirmed) {
+    return { matched: true, title, username: norm };
+  }
+  return { matched: false, title, confirmed: false };
+}
+
+async function navigateSocial(target, prevHeader = null) {
   const { tabId } = await getWorkTab();
   const current = await chrome.tabs.get(tabId);
   if (current.url !== "about:blank") await safeTab(tabId);
+  if (prevHeader === null && target.includes("web.telegram.org") && current.url !== target) {
+    const [prevRes] = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: () => document.querySelector(".top .peer-title, .chat-info .peer-title, .chat-title, .person-title, .user-title, [class*='chat-info'] [class*='title']")?.innerText?.trim() || null,
+    }).catch(() => []);
+    prevHeader = prevRes?.result || null;
+  }
   if (current.url !== target) {
     const wait = lastProfileNavigation + nextProfileGap - Date.now();
     if (wait > 0) await delay(wait);
@@ -320,6 +436,25 @@ async function navigateSocial(target) {
     }
     if (!loaded) throw new Error("Social page navigation timed out");
     await delay(800 + Math.floor(Math.random() * 701));
+  }
+  if (target.includes("web.telegram.org") && target.includes("#@")) {
+    const expected = target.match(/#@([a-zA-Z0-9_]+)/)?.[1];
+    if (expected) {
+      const waitChatDeadline = Date.now() + 15000;
+      let matched = false;
+      while (Date.now() < waitChatDeadline) {
+        const [res] = await chrome.scripting.executeScript({
+          target: { tabId },
+          func: pgMatchTgChat,
+          args: [expected, prevHeader],
+        }).catch(() => []);
+        if (res?.result?.matched) { matched = true; break; }
+        await delay(300);
+      }
+      if (!matched) {
+        throw new Error(`Telegram chat header did not match requested recipient "@${expected}"`);
+      }
+    }
   }
   return safeTab(tabId);
 }
@@ -1072,11 +1207,7 @@ async function readThread({ url, to, limit = 30 }) {
 }
 
 async function sendMessage({ to, text }) {
-  if (!to || !text) throw new Error("to and text required");
-  const tab = await navigateSocial(to);
-  const current = await safeTab(tab.id);
-  const isIg = current.url.includes("instagram.com");
-  return { sent: true, verified: true, to, threadUrl: current.url };
+  throw new Error("NOT_IMPLEMENTED: message sending is not implemented in browser extension");
 }
 
 function ytExpected({ expected, studioUrl }) {
@@ -1199,6 +1330,1180 @@ async function scrollTool({ selector, times = 3 }) {
   return res;
 }
 
+function pgExtractTiktokProfile() {
+  const name = document.querySelector("[data-e2e=user-subtitle], h2[data-e2e=user-subtitle]")?.innerText?.trim()
+    || document.querySelector("h2")?.innerText?.trim() || null;
+  const username = document.querySelector("[data-e2e=user-title], h1[data-e2e=user-title]")?.innerText?.trim()
+    || location.pathname.split("/").filter(Boolean)[0]?.replace(/^@/, "") || null;
+  const bio = document.querySelector("[data-e2e=user-bio]")?.innerText?.trim() || null;
+  const num = (sel) => {
+    const el = document.querySelector(sel);
+    if (!el) return null;
+    const txt = el.innerText?.trim() || "";
+    const m = txt.replace(/,/g, "").match(/([\d.]+)\s*([KkMmBb])?/);
+    if (!m) return null;
+    let n = parseFloat(m[1]);
+    if (m[2]?.toUpperCase() === "K") n *= 1e3;
+    if (m[2]?.toUpperCase() === "M") n *= 1e6;
+    if (m[2]?.toUpperCase() === "B") n *= 1e9;
+    return Math.round(n);
+  };
+  const following = num("[data-e2e=following-count]");
+  const followers = num("[data-e2e=followers-count]");
+  const likes = num("[data-e2e=likes-count]");
+  const avatar = document.querySelector("[data-e2e=user-avatar] img, img.avatar")?.getAttribute("src") || null;
+  const verified = Boolean(document.querySelector("[data-e2e=user-verified-badge], svg[data-e2e=user-verified-badge]"));
+  const bioLink = document.querySelector("[data-e2e=user-link] a")?.getAttribute("href") || null;
+  return { platform: "tt", url: location.href, username, name, bio, following, followers, likes, avatar, verified, bioLink };
+}
+
+async function tiktokProfile({ url }) {
+  const tab = await navigateSocial(url);
+  const current = await safeTab(tab.id);
+  const [execution] = await chrome.scripting.executeScript({
+    target: { tabId: tab.id },
+    func: pgExtractTiktokProfile,
+  });
+  return execution?.result || { platform: "tt", url: current.url };
+}
+
+function pgExtractTiktokPosts(limit) {
+  const items = [...document.querySelectorAll("[data-e2e=user-post-item], [data-e2e=user-post-item-list] > div, div[class*='DivItemContainer']")];
+  const posts = [];
+  for (const el of items) {
+    const a = el.querySelector("a[href*='/video/']");
+    if (!a) continue;
+    const url = a.href;
+    const id = url.match(/\/video\/(\d+)/)?.[1] || null;
+    const img = el.querySelector("img");
+    const thumbUrl = img?.getAttribute("src") || null;
+    const views = el.querySelector("[data-e2e=video-views]")?.innerText?.trim() || null;
+    posts.push({ url, id, thumbUrl, views });
+    if (posts.length >= limit) break;
+  }
+  return posts;
+}
+
+async function tiktokPosts({ url, limit = 12 }) {
+  const tab = await navigateSocial(url);
+  const current = await safeTab(tab.id);
+  const [execution] = await chrome.scripting.executeScript({
+    target: { tabId: tab.id },
+    func: pgExtractTiktokPosts,
+    args: [limit],
+  });
+  return { platform: "tt", url: current.url, posts: execution?.result || [] };
+}
+
+function pgExtractTiktokVideo() {
+  const authorEl = document.querySelector("[data-e2e=browse-username], [data-e2e=video-author-uniqueid], a[href*='/@']");
+  const author = authorEl?.innerText?.trim()?.replace(/^@/, "") || location.pathname.match(/@([^/]+)/)?.[1] || null;
+  const desc = document.querySelector("[data-e2e=browse-video-desc], [data-e2e=video-desc]")?.innerText?.trim() || null;
+  const music = document.querySelector("[data-e2e=browse-music], [data-e2e=video-music]")?.innerText?.trim() || null;
+  const videoEl = document.querySelector("video");
+  const videoUrl = videoEl?.getAttribute("src") || null;
+  const num = (sel) => {
+    const t = document.querySelector(sel)?.innerText?.trim();
+    if (!t) return null;
+    const m = t.replace(/,/g, "").match(/([\d.]+)\s*([KkMmBb])?/);
+    if (!m) return null;
+    let n = parseFloat(m[1]);
+    if (m[2]?.toUpperCase() === "K") n *= 1e3;
+    if (m[2]?.toUpperCase() === "M") n *= 1e6;
+    if (m[2]?.toUpperCase() === "B") n *= 1e9;
+    return Math.round(n);
+  };
+  const likes = num("[data-e2e=like-count], [data-e2e=browse-like-count]");
+  const comments = num("[data-e2e=comment-count], [data-e2e=browse-comment-count]");
+  const shares = num("[data-e2e=share-count]");
+  return { url: location.href, author, description: desc, music, videoUrl, likes, comments, shares };
+}
+
+async function tiktokVideo({ url, download = false }) {
+  const tab = await navigateSocial(url);
+  const current = await safeTab(tab.id);
+  const [execution] = await chrome.scripting.executeScript({
+    target: { tabId: tab.id },
+    func: pgExtractTiktokVideo,
+  });
+  const res = execution?.result || { url: current.url };
+  return { platform: "tt", ...res, download };
+}
+
+function pgExtractTiktokComments(limit) {
+  const items = [...document.querySelectorAll("[data-e2e=comment-item], [data-e2e=comment-level-1], div[class*='DivCommentItemContainer']")];
+  const comments = [];
+  for (const el of items) {
+    const author = el.querySelector("[data-e2e=comment-username], a[href*='/@']")?.innerText?.trim() || null;
+    const authorUrl = el.querySelector("a[href*='/@']")?.getAttribute("href") || null;
+    const text = el.querySelector("[data-e2e=comment-level-1] p, [data-e2e=comment-text], p[class*='PCommentText']")?.innerText?.trim() || null;
+    const time = el.querySelector("[data-e2e=comment-time], span[class*='SpanCreatedTime']")?.innerText?.trim() || null;
+    const likes = el.querySelector("[data-e2e=comment-like-count]")?.innerText?.trim() || null;
+    if (author || text) {
+      comments.push({ author, authorUrl, text, time, likes });
+    }
+    if (comments.length >= limit) break;
+  }
+  return comments;
+}
+
+async function tiktokComments({ url, limit = 20 }) {
+  const tab = await navigateSocial(url);
+  const current = await safeTab(tab.id);
+  const [execution] = await chrome.scripting.executeScript({
+    target: { tabId: tab.id },
+    func: pgExtractTiktokComments,
+    args: [limit],
+  });
+  return { platform: "tt", url: current.url, comments: execution?.result || [] };
+}
+
+function pgExtractTiktokSearch(type, limit) {
+  const results = [];
+  if (type === "users") {
+    const items = [...document.querySelectorAll("[data-e2e=search-user-item], [data-e2e=search-user-container] > div")];
+    for (const el of items) {
+      const username = el.querySelector("[data-e2e=search-user-unique-id]")?.innerText?.trim() || null;
+      const name = el.querySelector("[data-e2e=search-user-nickname]")?.innerText?.trim() || null;
+      const avatar = el.querySelector("img")?.getAttribute("src") || null;
+      const desc = el.querySelector("[data-e2e=search-user-desc]")?.innerText?.trim() || null;
+      if (username || name) results.push({ username, name, avatar, desc });
+      if (results.length >= limit) break;
+    }
+  } else {
+    const items = [...document.querySelectorAll("[data-e2e=search_video-item], div[class*='DivItemContainerV2']")];
+    for (const el of items) {
+      const a = el.querySelector("a[href*='/video/']");
+      if (!a) continue;
+      const title = el.querySelector("[data-e2e=search-card-desc]")?.innerText?.trim() || null;
+      const author = el.querySelector("[data-e2e=search-card-user-unique-id]")?.innerText?.trim() || null;
+      results.push({ url: a.href, title, author });
+      if (results.length >= limit) break;
+    }
+  }
+  return results;
+}
+
+async function tiktokSearch({ query, type = "users", limit = 20 }) {
+  const searchUrl = `https://www.tiktok.com/search/${type === "videos" ? "video" : "user"}?q=${encodeURIComponent(query)}`;
+  const tab = await navigateSocial(searchUrl);
+  const current = await safeTab(tab.id);
+  const [execution] = await chrome.scripting.executeScript({
+    target: { tabId: tab.id },
+    func: pgExtractTiktokSearch,
+    args: [type, limit],
+  });
+  return { platform: "tt", query, type, results: execution?.result || [] };
+}
+
+function pgExtractTiktokInbox(limit) {
+  const items = [...document.querySelectorAll("[data-e2e=message-item], [data-e2e=chat-item], div[class*='DivChatItem']")];
+  const threads = [];
+  for (const el of items) {
+    const name = el.querySelector("[data-e2e=chat-name], span[class*='SpanTitle']")?.innerText?.trim() || null;
+    const snippet = el.querySelector("[data-e2e=chat-message], p[class*='PMessage']")?.innerText?.trim() || null;
+    const time = el.querySelector("[data-e2e=chat-time], span[class*='SpanTime']")?.innerText?.trim() || null;
+    const unread = Boolean(el.querySelector("[data-e2e=chat-unread-dot], [class*='UnreadDot']"));
+    if (name) threads.push({ name, snippet, time, unread });
+    if (threads.length >= limit) break;
+  }
+  return threads;
+}
+
+async function tiktokInbox({ limit = 20 }) {
+  const target = "https://www.tiktok.com/messages";
+  const tab = await navigateSocial(target);
+  const current = await safeTab(tab.id);
+  const [execution] = await chrome.scripting.executeScript({
+    target: { tabId: tab.id },
+    func: pgExtractTiktokInbox,
+    args: [limit],
+  });
+  return { platform: "tt", threads: execution?.result || [] };
+}
+
+async function tiktokUpload({ file, caption = "", privacy = "private" }) {
+  // Capture existing Studio video URLs before upload to verify against afterwards
+  let beforeVideoUrls = [];
+  let beforeCaptured = false;
+  let beforeWasEmpty = false;
+  try {
+    const preTab = await navigateSocial("https://www.tiktok.com/tiktokstudio/content");
+    await safeTab(preTab.id);
+
+    function pgCheckContentReady() {
+      const links = [...document.querySelectorAll("a[href*='/video/']")].map((a) => a.href).filter(Boolean);
+      if (links.length > 0) {
+        return { ready: true, empty: false, urls: links };
+      }
+      const bodyText = (document.body?.innerText || "").toLowerCase();
+      const hasEmptyNotice =
+        bodyText.includes("no content") ||
+        bodyText.includes("no videos") ||
+        bodyText.includes("you haven't posted any videos") ||
+        bodyText.includes("no post yet") ||
+        Boolean(document.querySelector("[data-e2e='empty-state'], .empty-state, [class*='EmptyState']"));
+      const isContainerRendered = Boolean(document.querySelector("[data-e2e='content-list'], table, [class*='content-list'], [class*='TableContainer']"));
+      if (hasEmptyNotice || isContainerRendered) {
+        return { ready: true, empty: true, urls: [] };
+      }
+      return { ready: false, empty: false, urls: [] };
+    }
+
+    const preDeadline = Date.now() + 5000;
+    while (Date.now() < preDeadline) {
+      const [preExec] = await chrome.scripting.executeScript({
+        target: { tabId: preTab.id },
+        func: pgCheckContentReady,
+      }).catch(() => []);
+      if (preExec?.result?.ready) {
+        beforeVideoUrls = preExec.result.urls || [];
+        beforeWasEmpty = Boolean(preExec.result.empty);
+        beforeCaptured = true;
+        break;
+      }
+      await delay(500);
+    }
+  } catch {}
+
+  const target = "https://www.tiktok.com/tiktokstudio/upload";
+  const tab = await navigateSocial(target);
+  const tabId = tab.id;
+  await safeTab(tabId);
+
+  const debuggee = { tabId };
+  await chrome.debugger.attach(debuggee, "1.3");
+  try {
+    await chrome.debugger.sendCommand(debuggee, "DOM.enable");
+    const doc = await chrome.debugger.sendCommand(debuggee, "DOM.getDocument");
+    const { nodeId } = await chrome.debugger.sendCommand(debuggee, "DOM.querySelector", {
+      nodeId: doc.root.nodeId,
+      selector: 'input[type="file"]',
+    });
+    if (!nodeId) throw new Error("Could not find file input on TikTok Studio upload page");
+    await chrome.debugger.sendCommand(debuggee, "DOM.setFileInputFiles", {
+      nodeId,
+      files: [file],
+    });
+  } finally {
+    try { await chrome.debugger.detach(debuggee); } catch {}
+  }
+
+  // Poll for upload-processing completion, failing closed before 10-minute service timeout (8 min)
+  function pgCheckUploadProcessing() {
+    const errEl = document.querySelector(".upload-error, [class*='upload-error'], [class*='error-message']");
+    if (errEl && errEl.innerText?.trim()) {
+      return { ready: false, failed: true, reason: errEl.innerText.trim() };
+    }
+    const btn = [...document.querySelectorAll("button")].find((b) => /^(Post|Publish)$/i.test(b.innerText?.trim() || ""));
+    const progEl = document.querySelector("[class*='progress-bar'], [class*='upload-progress'], [class*='uploading']");
+    const progText = (progEl?.innerText || "").toLowerCase();
+    const isProcessing = progText.includes("uploading") && !progText.includes("100%");
+    const isBtnDisabled = Boolean(btn && (btn.disabled || btn.getAttribute("aria-disabled") === "true"));
+    if (isProcessing || isBtnDisabled) {
+      return { ready: false, failed: false };
+    }
+    return { ready: Boolean(btn), failed: false };
+  }
+
+  const uploadDeadline = Date.now() + 8 * 60 * 1000;
+  let uploadReady = false;
+  while (Date.now() < uploadDeadline) {
+    const [procCheck] = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: pgCheckUploadProcessing,
+    }).catch(() => []);
+    if (procCheck?.result?.failed) {
+      return { posted: false, verified: false, error: `Upload processing failed: ${procCheck.result.reason}` };
+    }
+    if (procCheck?.result?.ready) {
+      uploadReady = true;
+      break;
+    }
+    await delay(1000);
+  }
+  if (!uploadReady) {
+    return { posted: false, verified: false, error: "Upload processing timed out before Post could be clicked" };
+  }
+
+  // Setup caption and privacy; require read-back confirmation BEFORE clicking Post
+  function pgSetupAndVerifyUpload(cap, priv) {
+    // Caption confirmation
+    if (cap) {
+      const captionEl = document.querySelector('[contenteditable="true"], .notranslate[contenteditable], textarea, [data-e2e="caption-editor"]');
+      if (!captionEl) {
+        return { ok: false, error: "Caption input not found" };
+      }
+      if (captionEl.tagName === "TEXTAREA" || captionEl.tagName === "INPUT") {
+        captionEl.value = cap;
+      } else {
+        captionEl.textContent = cap;
+      }
+      captionEl.dispatchEvent(new Event("input", { bubbles: true }));
+      captionEl.dispatchEvent(new Event("change", { bubbles: true }));
+
+      const readVal = (captionEl.value ?? captionEl.innerText ?? captionEl.textContent ?? "").trim();
+      if (!readVal.includes(cap.trim())) {
+        return { ok: false, error: `Caption read-back failed: expected "${cap.trim()}", got "${readVal}"` };
+      }
+    }
+
+    // Privacy confirmation (supports both internal values and UI labels like "Only you" / "Everyone")
+    if (priv) {
+      const privMap = {
+        private: {
+          allowed: ["private", "only you", "only me", "just you"],
+          forbidden: ["everyone", "everybody", "public", "friends", "followers"],
+        },
+        public: {
+          allowed: ["public", "everyone", "everybody"],
+          forbidden: ["private", "only you", "only me", "just you", "friends", "followers"],
+        },
+        friends: {
+          allowed: ["friends", "followers"],
+          forbidden: ["everyone", "everybody", "public", "private", "only you", "only me", "just you"],
+        },
+      };
+      const rule = privMap[priv.toLowerCase()] || { allowed: [priv.toLowerCase()], forbidden: [] };
+      const radios = [...document.querySelectorAll('input[type="radio"], [role="radio"], [data-e2e*="privacy"]')];
+
+      function getSpecificRadioText(r) {
+        if (!r) return "";
+        const aria = (typeof r.getAttribute === "function" ? r.getAttribute("aria-label") : null)?.trim() || "";
+        if (aria && aria !== "true" && aria !== "false" && aria !== "null") return aria.toLowerCase();
+
+        const val = (r.value || "").trim().toLowerCase();
+        if (val && !/^\d+$/.test(val) && val !== "on" && val !== "true" && val !== "false") {
+          return val;
+        }
+
+        if (r.id && typeof document.querySelector === "function") {
+          const lbl = document.querySelector(`label[for="${r.id}"]`);
+          const lblText = (lbl?.innerText || lbl?.textContent || "").trim();
+          if (lblText) return lblText.toLowerCase();
+        }
+
+        const wrappingLabel = typeof r.closest === "function" ? r.closest("label") : null;
+        if (wrappingLabel) {
+          const labelRadios = typeof wrappingLabel.querySelectorAll === "function" ? wrappingLabel.querySelectorAll('input[type="radio"], [role="radio"]') : [];
+          if (labelRadios.length <= 1) {
+            const wrapText = (wrappingLabel.innerText || wrappingLabel.textContent || "").trim();
+            if (wrapText) return wrapText.toLowerCase();
+          }
+        }
+
+        let sib = r.nextElementSibling;
+        while (sib) {
+          if (/^(SPAN|LABEL|DIV|P|B|STRONG)$/i.test(sib.tagName || "")) {
+            const sibText = (sib.innerText || sib.textContent || "").trim();
+            if (sibText) return sibText.toLowerCase();
+          }
+          sib = sib.nextElementSibling;
+        }
+
+        const parent = r.parentElement;
+        if (parent) {
+          const parentRadios = typeof parent.querySelectorAll === "function" ? parent.querySelectorAll('input[type="radio"], [role="radio"]') : [];
+          if (parentRadios.length <= 1) {
+            const parentText = (parent.innerText || parent.textContent || "").trim();
+            if (parentText) return parentText.toLowerCase();
+          }
+        }
+
+        return (r.innerText || r.textContent || "").trim().toLowerCase();
+      }
+
+      const privTarget = radios.find((r) => {
+        const text = getSpecificRadioText(r);
+        const matchesAllowed = rule.allowed.some((pattern) => text.includes(pattern));
+        const matchesForbidden = rule.forbidden.some((pattern) => text.includes(pattern));
+        return matchesAllowed && !matchesForbidden;
+      });
+
+      if (!privTarget) {
+        return { ok: false, error: `Privacy control for "${priv}" not found or ambiguous` };
+      }
+      privTarget.click();
+
+      const isChecked = (el) => Boolean(
+        el.checked === true ||
+        el.getAttribute("aria-checked") === "true" ||
+        el.classList?.contains("checked") ||
+        el.classList?.contains("is-checked") ||
+        el.parentElement?.classList?.contains("checked") ||
+        el.parentElement?.classList?.contains("is-checked")
+      );
+
+      if (!isChecked(privTarget)) {
+        return { ok: false, error: `Privacy selection for "${priv}" could not be confirmed` };
+      }
+
+      const readBackText = getSpecificRadioText(privTarget);
+      if (rule.forbidden.some((p) => readBackText.includes(p))) {
+        return { ok: false, error: `Privacy selection conflict: confirmed radio contains conflicting text "${readBackText}"` };
+      }
+    }
+
+    return { ok: true };
+  }
+
+  const [setupExec] = await chrome.scripting.executeScript({
+    target: { tabId },
+    func: pgSetupAndVerifyUpload,
+    args: [caption, privacy],
+  });
+
+  if (!setupExec?.result?.ok) {
+    return { posted: false, verified: false, error: setupExec?.result?.error || "Upload configuration failed" };
+  }
+
+  // Click Post
+  function pgClickPost() {
+    const postBtn = [...document.querySelectorAll('button')].find((b) => /^(Post|Publish)$/i.test(b.innerText?.trim() || ""));
+    if (postBtn && !postBtn.disabled && postBtn.getAttribute("aria-disabled") !== "true") {
+      postBtn.click();
+      return { clicked: true };
+    }
+    return { clicked: false };
+  }
+
+  const [postExec] = await chrome.scripting.executeScript({
+    target: { tabId },
+    func: pgClickPost,
+  });
+
+  if (!postExec?.result?.clicked) {
+    return { posted: false, verified: false, error: "Post button was not clickable" };
+  }
+
+  // ================= POINT OF NO RETURN =================
+  try {
+    // Wait for Studio success signal first
+    function pgCheckStudioSuccess() {
+      const text = (document.body?.innerText || "").toLowerCase();
+      const hasSpecificSuccess =
+        text.includes("your video has been published") ||
+        text.includes("your video has been uploaded") ||
+        text.includes("your video is published") ||
+        text.includes("video published") ||
+        text.includes("manage your posts") ||
+        text.includes("manage your videos") ||
+        text.includes("upload another video") ||
+        text.includes("post successful");
+      const successModal = document.querySelector("[data-e2e='upload-success'], [class*='success-modal'], [data-e2e='post-success']");
+      const redirected = location.href.includes("/tiktokstudio/content") || location.href.includes("/content");
+      return hasSpecificSuccess || Boolean(successModal) || redirected;
+    }
+
+    const successDeadline = Date.now() + 30000;
+    let studioSuccess = false;
+    while (Date.now() < successDeadline) {
+      const [sigRes] = await chrome.scripting.executeScript({
+        target: { tabId },
+        func: pgCheckStudioSuccess,
+      }).catch(() => []);
+      if (sigRes?.result) {
+        studioSuccess = true;
+        break;
+      }
+      await delay(1000);
+    }
+
+    if (!studioSuccess) {
+      return { posted: true, verified: false, url: null, reason: "Studio success signal not observed within timeout; remained on upload page" };
+    }
+
+    const contentTab = await navigateSocial("https://www.tiktok.com/tiktokstudio/content");
+    await safeTab(contentTab.id);
+
+    function pgVerifyNewVideo(beforeList, expectedCap, wasCaptured, wasExplicitEmpty) {
+      const beforeSet = new Set(beforeList || []);
+      const items = [...document.querySelectorAll("[data-e2e='content-item'], div[class*='DivItem'], tr, a[href*='/video/']")];
+      for (const item of items) {
+        const a = item.tagName === "A" && item.href?.includes("/video/") ? item : item.querySelector?.("a[href*='/video/']");
+        if (!a) continue;
+        const href = a.href || a.getAttribute("href");
+        if (!href || beforeSet.has(href)) continue;
+
+        if (expectedCap) {
+          const itemText = (item.innerText || item.textContent || "").trim();
+          if (itemText.includes(expectedCap.trim())) {
+            return { verified: true, url: href };
+          }
+        } else {
+          if (wasCaptured && (beforeSet.size > 0 || wasExplicitEmpty)) {
+            return { verified: true, url: href };
+          }
+        }
+      }
+      return { verified: false, url: null };
+    }
+
+    const [verifyExec] = await chrome.scripting.executeScript({
+      target: { tabId: contentTab.id },
+      func: pgVerifyNewVideo,
+      args: [beforeVideoUrls, caption, beforeCaptured, beforeWasEmpty],
+    });
+
+    if (verifyExec?.result?.verified && verifyExec.result.url) {
+      return { posted: true, verified: true, url: verifyExec.result.url };
+    }
+    return { posted: true, verified: false, url: null };
+  } catch (e) {
+    if (e?.code === "HALT" || e?.message?.startsWith("HALT:")) {
+      const haltErr = new Error(e.message);
+      haltErr.code = "HALT";
+      haltErr.reason = e.reason || e.message;
+      haltErr.posted = true;
+      haltErr.verified = false;
+      throw haltErr;
+    }
+    return { posted: true, verified: false, url: null, error: String(e?.message || e) };
+  }
+}
+
+function pgExtractTgStatus() {
+  const loginForm = document.querySelector(".login-header, .qr-container, .auth-form, canvas.qr, [data-testid='qr-code']");
+  if (loginForm || location.hash.includes("login")) return { loggedIn: false, account: null };
+  const nameEl = document.querySelector(".sidebar-header .user-title, .sidebar-header .peer-title, .user-name, [class*='sidebar'] [class*='title']");
+  const account = nameEl?.innerText?.trim() || null;
+  return { loggedIn: true, account };
+}
+
+async function tgStatus() {
+  const target = "https://web.telegram.org/k/";
+  const tab = await navigateSocial(target);
+  const current = await safeTab(tab.id);
+  const [execution] = await chrome.scripting.executeScript({
+    target: { tabId: tab.id },
+    func: pgExtractTgStatus,
+  });
+  return execution?.result || { loggedIn: false };
+}
+
+function pgExtractTgDialogs(limit) {
+  const items = [...document.querySelectorAll(".chatlist-parts .chatlist-chat, .chat-list .chat-item, ul.chatlist > li, [data-peer-id]")];
+  const dialogs = [];
+  for (const el of items) {
+    const title = el.querySelector(".peer-title, .user-title, .chat-title")?.innerText?.trim() || null;
+    const lastMessage = el.querySelector(".message-custom, .subtitle, .dialog-subtitle, [class*='subtitle']")?.innerText?.trim() || null;
+    const time = el.querySelector(".chat-meta .time, .dialog-time, time")?.innerText?.trim() || null;
+    const unread = el.querySelector(".unread, .badge")?.innerText?.trim() || null;
+    const href = el.querySelector("a[href]")?.getAttribute("href") || el.getAttribute("href") || "";
+    const peer = href.match(/#@?([a-zA-Z0-9_]+)/)?.[1] || null;
+    if (title) dialogs.push({ title, peer: peer ? `@${peer}` : null, lastMessage, time, unread: unread ? Number(unread) || unread : null });
+    if (dialogs.length >= limit) break;
+  }
+  return dialogs;
+}
+
+async function tgDialogsList({ limit = 20 }) {
+  const target = "https://web.telegram.org/k/";
+  const tab = await navigateSocial(target);
+  const current = await safeTab(tab.id);
+  const [execution] = await chrome.scripting.executeScript({
+    target: { tabId: tab.id },
+    func: pgExtractTgDialogs,
+    args: [limit],
+  });
+  return { dialogs: execution?.result || [] };
+}
+
+function pgExtractTgMessages(limit) {
+  const bubbles = [...document.querySelectorAll(".bubble, .message, [class*='bubble']")];
+  const messages = [];
+  for (const b of bubbles) {
+    const textEl = b.querySelector(".message, .text-content, .bubble-content");
+    const text = textEl?.innerText?.trim() || "";
+    const authorEl = b.querySelector(".bubble-author, .peer-title");
+    const isOut = b.classList.contains("is-out") || b.classList.contains("outgoing") || Boolean(b.querySelector(".is-out"));
+    const sender = isOut ? "me" : (authorEl?.innerText?.trim() || "them");
+    const time = b.querySelector(".time, .bubble-time, time")?.innerText?.trim() || null;
+    let media = null;
+    if (b.querySelector("video")) media = "video";
+    else if (b.querySelector("img.media-photo, .photo, img")) media = "photo";
+    else if (b.querySelector("audio, .audio, .voice")) media = "audio";
+    else if (b.querySelector(".document, .file")) media = "document";
+    if (text || media) {
+      messages.push({ sender, text, time, outgoing: isOut, media });
+    }
+  }
+  return messages.slice(-limit);
+}
+
+async function tgMessagesRead({ chat, limit = 30 }) {
+  const norm = chat.replace(/^@/, "");
+  const target = `https://web.telegram.org/k/#@${norm}`;
+  const tab = await navigateSocial(target);
+  const current = await safeTab(tab.id);
+  const [execution] = await chrome.scripting.executeScript({
+    target: { tabId: tab.id },
+    func: pgExtractTgMessages,
+    args: [limit],
+  });
+  return { chat, messages: execution?.result || [] };
+}
+
+async function pgCollectAndChunkTgMedia(types, limit) {
+  const bubbles = [...document.querySelectorAll(".bubble, .message")];
+  const items = [];
+  for (const b of bubbles) {
+    let el = null;
+    let type = null;
+    let preview = false;
+
+    if (types.includes("video")) {
+      const vid = b.querySelector("video");
+      if (vid && !vid.closest?.(".avatar, .user-avatar, .peer-avatar, .reaction, .reactions, .sticker, .emoji")) {
+        el = vid;
+        type = "video";
+        if (vid.classList?.contains("preview") || vid.classList?.contains("thumb") || vid.closest?.(".media-preview, .preview, .thumbnail")) {
+          preview = true;
+        }
+      }
+    }
+    if (!el && types.includes("photo")) {
+      const imgs = [...(b.querySelectorAll?.(".media-photo img, .attachment-media img, .media-container img, .photo img, img.media-photo, img") || (b.querySelector?.("img") ? [b.querySelector("img")] : []))];
+      for (const img of imgs) {
+        if (img.closest?.(".avatar, .user-avatar, .peer-avatar, .reaction, .reactions, .sticker, .emoji")) {
+          continue; // Skip avatars, stickers, reactions!
+        }
+        el = img;
+        type = "photo";
+        if (img.classList?.contains("preview") || img.classList?.contains("thumb") || img.closest?.(".media-preview, .preview, .thumbnail")) {
+          preview = true;
+        }
+        break;
+      }
+    }
+    if (el) {
+      const src = el.src || el.currentSrc || el.getAttribute("src");
+      if (src) {
+        items.push({ type, src, preview });
+        if (items.length >= limit) break;
+      }
+    }
+  }
+
+  const results = [];
+  for (let i = 0; i < items.length; i++) {
+    const item = items[i];
+    try {
+      const resp = await fetch(item.src);
+      const blob = await resp.blob();
+      if (blob.size > 50 * 1024 * 1024) {
+        results.push({ mediaType: item.type, error: "File exceeds 50 MB limit", size: blob.size, preview: item.preview, itemIndex: i + 1 });
+        continue;
+      }
+      const buffer = await blob.arrayBuffer();
+      const bytes = new Uint8Array(buffer);
+      let binary = "";
+      for (let j = 0; j < bytes.byteLength; j++) binary += String.fromCharCode(bytes[j]);
+      const base64 = btoa(binary);
+      const chunkSize = 256 * 1024;
+      const chunks = [];
+      for (let offset = 0; offset < base64.length; offset += chunkSize) {
+        chunks.push(base64.slice(offset, offset + chunkSize));
+      }
+      const ext = item.type === "video" ? "mp4" : "jpg";
+      results.push({ type: item.type, filename: `media_${i + 1}.${ext}`, size: blob.size, chunks, preview: item.preview, itemIndex: i + 1 });
+    } catch (e) {
+      results.push({ type: item.type, error: String(e?.message || e), preview: item.preview, itemIndex: i + 1 });
+    }
+  }
+  return results;
+}
+
+async function tgMediaDownload({ chat, limit = 10, types = ["photo", "video"], dir }, socket, msgId) {
+  const norm = chat.replace(/^@/, "");
+  const target = `https://web.telegram.org/k/#@${norm}`;
+  const tab = await navigateSocial(target);
+  const current = await safeTab(tab.id);
+
+  const [execution] = await chrome.scripting.executeScript({
+    target: { tabId: tab.id },
+    func: pgCollectAndChunkTgMedia,
+    args: [types, limit],
+  });
+
+  const rawResults = execution?.result || [];
+  const skipped = [];
+
+  for (let i = 0; i < rawResults.length; i++) {
+    const item = rawResults[i];
+    if (item.error) {
+      skipped.push({ type: item.type, reason: item.error });
+      continue;
+    }
+    const fileId = `tg_${Date.now()}_${i}`;
+    if (socket && socket.readyState === WebSocket.OPEN && item.chunks) {
+      for (let c = 0; c < item.chunks.length; c++) {
+        socket.send(JSON.stringify({
+          type: "chunk",
+          id: msgId,
+          fileId,
+          index: c,
+          total: item.chunks.length,
+          data: item.chunks[c],
+          itemIndex: item.itemIndex || (i + 1),
+          preview: Boolean(item.preview),
+          mediaType: item.type,
+        }));
+      }
+    } else {
+      skipped.push({ type: item.type, filename: item.filename, reason: "Socket unavailable or no chunks" });
+    }
+  }
+
+  // Final job result (saved and skipped) is constructed service-side from actual writes
+  return { chat, attempted: rawResults.length, skipped };
+}
+
+async function tgSendMessage({ chat, text }) {
+  const norm = chat.replace(/^@/, "");
+  const target = `https://web.telegram.org/k/#@${norm}`;
+  const { tabId: curTabId } = await getWorkTab();
+  const curTab = await chrome.tabs.get(curTabId).catch(() => null);
+  const curHash = (new URL(curTab?.url || "about:blank").hash || "").replace(/^#@?/, "").toLowerCase();
+  const alreadyInTarget = Boolean(curTab?.url?.includes("web.telegram.org") && curHash && curHash === norm.toLowerCase());
+  let prevHeader = null;
+  if (!alreadyInTarget) {
+    const [prevRes] = await chrome.scripting.executeScript({
+      target: { tabId: curTabId },
+      func: () => document.querySelector(".top .peer-title, .chat-info .peer-title, .chat-title, .person-title, .user-title, [class*='chat-info'] [class*='title']")?.innerText?.trim() || null,
+    }).catch(() => []);
+    prevHeader = prevRes?.result || null;
+  }
+
+  const tab = await navigateSocial(target, prevHeader);
+  const tabId = tab.id;
+  await safeTab(tabId);
+
+  // Strictly verify active chat header before typing
+  const [matchCheck] = await chrome.scripting.executeScript({
+    target: { tabId },
+    func: pgMatchTgChat,
+    args: [norm, prevHeader],
+  });
+  if (!matchCheck?.result?.matched) {
+    throw new Error(`Wrong chat open: active chat does not match requested recipient "@${norm}"; refusing to send`);
+  }
+
+  async function pgTypeAndSend(msg) {
+    const input = document.querySelector(".chat-input .input-message-input, .input-message-container [contenteditable=true], .input-message-input");
+    if (!input) return { sent: false, reason: "Message input not found" };
+    input.textContent = msg;
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+
+    const entered = (input.textContent || input.innerText || "").trim();
+    if (entered !== msg.trim()) {
+      return { sent: false, reason: "Composer text mismatch after typing" };
+    }
+
+    const sendBtn = document.querySelector(".chat-input .btn-send, .btn-send, .chat-input button.send, .chat-input [title=Send]");
+    if (sendBtn) {
+      sendBtn.click();
+      return { sent: true };
+    }
+
+    input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", keyCode: 13, bubbles: true }));
+    for (let i = 0; i < 10; i++) {
+      await new Promise((r) => setTimeout(r, 50));
+      const textNow = (input.textContent || input.innerText || "").trim();
+      if (textNow.length === 0) {
+        return { sent: true };
+      }
+    }
+    const afterEnter = (input.textContent || input.innerText || "").trim();
+    if (afterEnter.length > 0) {
+      return { sent: true, unverified: true, reason: "Composer did not clear after Enter key" };
+    }
+    return { sent: true };
+  }
+
+  const [sendResult] = await chrome.scripting.executeScript({
+    target: { tabId },
+    func: pgTypeAndSend,
+    args: [text],
+  });
+
+  if (sendResult?.result?.unverified) {
+    return { sent: true, verified: false, chat, text, error: sendResult.result.reason };
+  }
+
+  if (!sendResult?.result?.sent) {
+    return { sent: false, verified: false, chat, text, error: sendResult?.result?.reason || "Failed to type message" };
+  }
+
+  // ================= POINT OF NO RETURN =================
+  try {
+    await delay(1000);
+    function pgCheckLastOutgoing() {
+      const out = [...document.querySelectorAll(".bubble.is-out, .message.outgoing, .bubble.outgoing")];
+      const last = out.at(-1);
+      if (!last) return null;
+      const txt = last.querySelector(".message, .text-content, .bubble-content")?.innerText?.trim() || "";
+      return txt;
+    }
+
+    const [verifyExec] = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: pgCheckLastOutgoing,
+    });
+
+    const verified = verifyExec?.result === text;
+    return { sent: true, verified, chat, text };
+  } catch (e) {
+    if (e?.code === "HALT" || e?.message?.startsWith("HALT:")) {
+      const haltErr = new Error(e.message);
+      haltErr.code = "HALT";
+      haltErr.reason = e.reason || e.message;
+      haltErr.sent = true;
+      haltErr.verified = false;
+      throw haltErr;
+    }
+    return { sent: true, verified: false, chat, text, error: String(e?.message || e) };
+  }
+}
+
+async function tgSendMedia({ chat, file, caption = "" }) {
+  const norm = chat.replace(/^@/, "");
+  const target = `https://web.telegram.org/k/#@${norm}`;
+  const { tabId: curTabId } = await getWorkTab();
+  const curTab = await chrome.tabs.get(curTabId).catch(() => null);
+  const curHash = (new URL(curTab?.url || "about:blank").hash || "").replace(/^#@?/, "").toLowerCase();
+  const alreadyInTarget = Boolean(curTab?.url?.includes("web.telegram.org") && curHash && curHash === norm.toLowerCase());
+  let prevHeader = null;
+  if (!alreadyInTarget) {
+    const [prevRes] = await chrome.scripting.executeScript({
+      target: { tabId: curTabId },
+      func: () => document.querySelector(".top .peer-title, .chat-info .peer-title, .chat-title, .person-title, .user-title, [class*='chat-info'] [class*='title']")?.innerText?.trim() || null,
+    }).catch(() => []);
+    prevHeader = prevRes?.result || null;
+  }
+
+  const tab = await navigateSocial(target, prevHeader);
+  const tabId = tab.id;
+  await safeTab(tabId);
+
+  // Strictly verify active chat header before attaching
+  const [matchCheck] = await chrome.scripting.executeScript({
+    target: { tabId },
+    func: pgMatchTgChat,
+    args: [norm, prevHeader],
+  });
+  if (!matchCheck?.result?.matched) {
+    throw new Error(`Wrong chat open: active chat does not match requested recipient "@${norm}"; refusing to send`);
+  }
+
+  // Count existing media before attaching
+  const [beforeCountRes] = await chrome.scripting.executeScript({
+    target: { tabId },
+    func: () => {
+      const out = [...document.querySelectorAll(".bubble.is-out, .message.outgoing")];
+      return out.filter((el) => el.querySelector("img, video") || el.classList.contains("media")).length;
+    },
+  }).catch(() => []);
+  const beforeMediaCount = beforeCountRes?.result ?? 0;
+
+  const debuggee = { tabId };
+  await chrome.debugger.attach(debuggee, "1.3");
+  try {
+    await chrome.debugger.sendCommand(debuggee, "DOM.enable");
+    const doc = await chrome.debugger.sendCommand(debuggee, "DOM.getDocument");
+    const { nodeId } = await chrome.debugger.sendCommand(debuggee, "DOM.querySelector", {
+      nodeId: doc.root.nodeId,
+      selector: '.chat-input input[type="file"], .btn-icon input[type="file"], .attach-file input[type="file"], input[type="file"][accept], input[type="file"]',
+    });
+    if (!nodeId) throw new Error("Could not find file input in Telegram Web");
+    await chrome.debugger.sendCommand(debuggee, "DOM.setFileInputFiles", {
+      nodeId,
+      files: [file],
+    });
+  } finally {
+    try { await chrome.debugger.detach(debuggee); } catch {}
+  }
+
+  function pgSendMediaConfirm(cap) {
+    const popup = document.querySelector(".popup-send-media, .modal-dialog, .popup-send-photo, .popup-send-file, .popup-container .popup, .modal-content, [class*='popup']");
+    if (!popup || typeof popup.querySelector !== "function") {
+      return { sent: false, reason: "Media confirmation popup not found" };
+    }
+    const scope = popup;
+    if (cap) {
+      const capInput = scope.querySelector(".popup-caption-input, [contenteditable=true], textarea, input");
+      if (!capInput) {
+        return { sent: false, reason: "Caption field requested but not found in media popup" };
+      }
+      if (capInput.tagName === "TEXTAREA" || capInput.tagName === "INPUT") {
+        capInput.value = cap;
+      } else {
+        capInput.textContent = cap;
+      }
+      capInput.dispatchEvent(new Event("input", { bubbles: true }));
+      const enteredCap = (capInput.value ?? capInput.innerText ?? capInput.textContent ?? "").trim();
+      if (!enteredCap.includes(cap.trim())) {
+        return { sent: false, reason: `Caption read-back mismatch: expected "${cap.trim()}", got "${enteredCap}"` };
+      }
+    }
+    const sendBtn = scope.querySelector(".popup-send, .btn-send, button.btn-primary.btn-color-primary, button.btn-primary, button[type=submit]");
+    if (sendBtn) {
+      sendBtn.click();
+      return { sent: true };
+    }
+    return { sent: false, reason: "Send button not found in media popup" };
+  }
+
+  await delay(1000);
+  const [confirmExec] = await chrome.scripting.executeScript({
+    target: { tabId },
+    func: pgSendMediaConfirm,
+    args: [caption],
+  });
+
+  if (!confirmExec?.result?.sent) {
+    return { sent: false, verified: false, chat, file, caption, error: confirmExec?.result?.reason || "Send button was not clickable" };
+  }
+
+  // ================= POINT OF NO RETURN =================
+  try {
+    await delay(2000);
+    function pgCheckOutgoingMedia(prevCount, expectedCaption) {
+      const out = [...document.querySelectorAll(".bubble.is-out, .message.outgoing")];
+      const mediaBubbles = out.filter((el) => el.querySelector("img, video") || el.classList.contains("media"));
+      if (mediaBubbles.length <= prevCount) return { verified: false, reason: "No new outgoing media bubble appeared" };
+      const newBubble = mediaBubbles.at(-1);
+      if (expectedCaption) {
+        const bubbleText = newBubble?.querySelector(".message, .text-content, .bubble-content, .caption")?.innerText?.trim() || "";
+        if (!bubbleText.includes(expectedCaption.trim())) {
+          return { verified: false, reason: "Caption does not match outgoing bubble" };
+        }
+      }
+      return { verified: true };
+    }
+
+    const [verifyExec] = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: pgCheckOutgoingMedia,
+      args: [beforeMediaCount, caption],
+    });
+
+    const verified = Boolean(verifyExec?.result?.verified);
+    return { sent: true, verified, chat, file, caption };
+  } catch (e) {
+    if (e?.code === "HALT" || e?.message?.startsWith("HALT:")) {
+      const haltErr = new Error(e.message);
+      haltErr.code = "HALT";
+      haltErr.reason = e.reason || e.message;
+      haltErr.sent = true;
+      haltErr.verified = false;
+      throw haltErr;
+    }
+    return { sent: true, verified: false, chat, file, caption, error: String(e?.message || e) };
+  }
+}
+
+async function tgCreateChannel({ title, description = "" }) {
+  const target = "https://web.telegram.org/k/";
+  const tab = await navigateSocial(target);
+  const tabId = tab.id;
+  await safeTab(tabId);
+
+  // Capture existing dialogs before channel creation to verify against NEW dialog later
+  const [beforeDialogsExec] = await chrome.scripting.executeScript({
+    target: { tabId },
+    func: () => [...document.querySelectorAll(".peer-title, .user-title, .chat-title")].map((e) => (e.innerText || "").trim().toLowerCase()),
+  }).catch(() => []);
+  const beforeDialogs = new Set(beforeDialogsExec?.result || []);
+
+  // Step 1: Menu button
+  const [menuRes] = await chrome.scripting.executeScript({
+    target: { tabId },
+    func: () => {
+      const menuBtn = document.querySelector(".sidebar-header button, .btn-menu, [title=Menu], button[aria-label=Menu]");
+      if (menuBtn) { menuBtn.click(); return { ok: true }; }
+      return { ok: false, error: "Menu button not found" };
+    },
+  });
+  if (!menuRes?.result?.ok) {
+    return { created: false, verified: false, title, error: menuRes?.result?.error || "Failed to open menu" };
+  }
+  await delay(500);
+
+  // Step 2: New Channel menu item
+  const [newChanRes] = await chrome.scripting.executeScript({
+    target: { tabId },
+    func: () => {
+      const items = [...document.querySelectorAll(".menu-item, .dropdown-item, [role=menuitem]")];
+      const newChanBtn = items.find((e) => /New Channel/i.test(e.innerText || ""));
+      if (newChanBtn) { newChanBtn.click(); return { ok: true }; }
+      return { ok: false, error: "New Channel option not found" };
+    },
+  });
+  if (!newChanRes?.result?.ok) {
+    return { created: false, verified: false, title, error: newChanRes?.result?.error || "Failed to click New Channel" };
+  }
+  await delay(500);
+
+  // Step 3: Set Channel Name and Description
+  const [infoRes] = await chrome.scripting.executeScript({
+    target: { tabId },
+    func: (t, d) => {
+      const titleInput = document.querySelector("input[placeholder*='Channel Name'], input.input-field-name, input[data-e2e='channel-title']");
+      if (!titleInput) return { ok: false, error: "Channel title input not found" };
+      titleInput.value = t;
+      titleInput.dispatchEvent(new Event("input", { bubbles: true }));
+
+      if (d) {
+        const descInput = document.querySelector("textarea, input[placeholder*='Description']");
+        if (descInput) {
+          descInput.value = d;
+          descInput.dispatchEvent(new Event("input", { bubbles: true }));
+        }
+      }
+      return { ok: true };
+    },
+    args: [title, description],
+  });
+  if (!infoRes?.result?.ok) {
+    return { created: false, verified: false, title, error: infoRes?.result?.error || "Failed to enter channel info" };
+  }
+  await delay(500);
+
+  // Step 4: Next button (confirm channel info)
+  const [nextRes] = await chrome.scripting.executeScript({
+    target: { tabId },
+    func: () => {
+      const nextBtn = document.querySelector(".btn-next, button.btn-next, [title=Next], button.btn-primary");
+      if (nextBtn && !nextBtn.disabled) { nextBtn.click(); return { ok: true }; }
+      return { ok: false, error: "Next button not found or disabled" };
+    },
+  });
+  if (!nextRes?.result?.ok) {
+    return { created: false, verified: false, title, error: nextRes?.result?.error || "Failed to proceed past channel name" };
+  }
+  await delay(500);
+
+  // Step 5: Confirm Private selection & ensure no public link is set
+  const [privRes] = await chrome.scripting.executeScript({
+    target: { tabId },
+    func: () => {
+      const radios = [...document.querySelectorAll("input[type=radio], [role=radio]")];
+      const privRadio = radios.find((r) => /Private/i.test(r.parentElement?.innerText || r.value || r.getAttribute("aria-label") || ""));
+      if (!privRadio) return { ok: false, error: "Private channel radio not found" };
+      privRadio.click();
+
+      const isChecked = Boolean(
+        privRadio.checked ||
+        privRadio.getAttribute("aria-checked") === "true" ||
+        privRadio.classList?.contains("checked") ||
+        privRadio.parentElement?.classList?.contains("checked")
+      );
+      if (!isChecked) return { ok: false, error: "Private channel selection could not be confirmed" };
+
+      // Ensure no public link is set
+      const linkInput = document.querySelector("input[placeholder*='link'], input.input-field-link, input[name='username']");
+      if (linkInput && linkInput.value && linkInput.value.trim().length > 0) {
+        return { ok: false, error: "Public link must not be set for private channel" };
+      }
+      return { ok: true };
+    },
+  });
+  if (!privRes?.result?.ok) {
+    return { created: false, verified: false, title, error: privRes?.result?.error || "Failed to configure private channel" };
+  }
+  await delay(500);
+
+  // Step 6: Click Done
+  const [doneRes] = await chrome.scripting.executeScript({
+    target: { tabId },
+    func: () => {
+      const doneBtn = document.querySelector(".btn-done, button.btn-done, button.btn-primary");
+      if (doneBtn && !doneBtn.disabled) {
+        doneBtn.click();
+        return { clicked: true };
+      }
+      return { clicked: false, error: "Done button not found or disabled" };
+    },
+  });
+  if (!doneRes?.result?.clicked) {
+    return { created: false, verified: false, title, error: doneRes?.result?.error || "Done button not clickable" };
+  }
+
+  // ================= POINT OF NO RETURN =================
+  try {
+    await delay(2000);
+    function pgCheckNewChannelDialog(beforeSetList, t) {
+      const beforeSet = new Set(beforeSetList);
+      const dialogEls = [...document.querySelectorAll(".peer-title, .user-title, .chat-title")];
+      for (const el of dialogEls) {
+        const titleText = (el.innerText || "").trim().toLowerCase();
+        if (titleText === t.toLowerCase() && !beforeSet.has(titleText)) {
+          return { verified: true };
+        }
+      }
+      const activeHeader = document.querySelector(".top .peer-title, .chat-info .peer-title, .chat-title");
+      const activeTitle = (activeHeader?.innerText || "").trim().toLowerCase();
+      if (activeTitle === t.toLowerCase() && !beforeSet.has(activeTitle)) {
+        return { verified: true };
+      }
+      return { verified: false };
+    }
+
+    const [verifyExec] = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: pgCheckNewChannelDialog,
+      args: [[...beforeDialogs], title],
+    });
+
+    const verified = Boolean(verifyExec?.result?.verified);
+    return { created: true, verified, title, description };
+  } catch (e) {
+    if (e?.code === "HALT" || e?.message?.startsWith("HALT:")) {
+      const haltErr = new Error(e.message);
+      haltErr.code = "HALT";
+      haltErr.reason = e.reason || e.message;
+      haltErr.created = true;
+      haltErr.verified = false;
+      throw haltErr;
+    }
+    return { created: true, verified: false, title, description, error: String(e?.message || e) };
+  }
+}
+
+const ACTION_HANDLERS = {
+  "tabs.list": () => listTabs(),
+  "tabs.use": (args) => useTab(args || {}),
+  "readPage": (args) => readPage(args || {}),
+  "snapshot": () => snapshot(),
+  "getProfile": (args) => getProfile(args || {}),
+  "getComments": (args) => getComments(args || {}),
+  "getPosts": (args) => getPosts(args || {}),
+  "getPost": (args) => getPost(args || {}),
+  "screenshot": (args) => screenshot(args || {}),
+  "search": (args) => search(args || {}),
+  "readInbox": (args) => readInbox(args || {}),
+  "readThread": (args) => readThread(args || {}),
+  "sendMessage": (args) => sendMessage(args || {}),
+  "ytStudioRead": (args) => ytStudioReadTool(args || {}),
+  "click": (args) => clickTool(args || {}),
+  "scroll": (args) => scrollTool(args || {}),
+  "tiktokProfile": (args) => tiktokProfile(args || {}),
+  "tiktokPosts": (args) => tiktokPosts(args || {}),
+  "tiktokVideo": (args) => tiktokVideo(args || {}),
+  "tiktokComments": (args) => tiktokComments(args || {}),
+  "tiktokSearch": (args) => tiktokSearch(args || {}),
+  "tiktokInbox": (args) => tiktokInbox(args || {}),
+  "tiktokUpload": (args) => tiktokUpload(args || {}),
+  "tgStatus": () => tgStatus(),
+  "tgDialogsList": (args) => tgDialogsList(args || {}),
+  "tgMessagesRead": (args) => tgMessagesRead(args || {}),
+  "tgMediaDownload": (args, conn, msgId) => tgMediaDownload(args || {}, conn, msgId),
+  "tgSendMessage": (args) => tgSendMessage(args || {}),
+  "tgSendMedia": (args) => tgSendMedia(args || {}),
+  "tgCreateChannel": (args) => tgCreateChannel(args || {}),
+};
+
 async function connect() {
   if (socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)) return;
   const epoch = ++connectEpoch;
@@ -1243,11 +2548,26 @@ async function connect() {
       } else if (verified && message.type === "reload") {
         // Sent by `socmedia update` after a successful replace; works even if the versions are incompatible. Older extensions ignore it.
         chrome.runtime.reload();
-      } else if (authenticated && message.type === "request" && (message.action === "tabs.list" || message.action === "tabs.use" || message.action === "readPage" || message.action === "snapshot" || message.action === "getProfile" || message.action === "getComments" || message.action === "getPosts" || message.action === "getPost" || message.action === "screenshot" || message.action === "search" || message.action === "readInbox" || message.action === "readThread" || message.action === "sendMessage" || message.action === "ytStudioRead" || message.action === "click" || message.action === "scroll")) {
+      } else if (authenticated && message.type === "request" && Object.prototype.hasOwnProperty.call(ACTION_HANDLERS, message.action)) {
         const reply = (result) => { if (connection.readyState === WebSocket.OPEN) connection.send(JSON.stringify({ type: "result", id: message.id, ...result })); };
-        const task = browserAction.then(() => message.action === "tabs.list" ? listTabs() : message.action === "tabs.use" ? useTab(message.args || {}) : message.action === "snapshot" ? snapshot() : message.action === "getProfile" ? getProfile(message.args || {}) : message.action === "getComments" ? getComments(message.args || {}) : message.action === "getPosts" ? getPosts(message.args || {}) : message.action === "getPost" ? getPost(message.args || {}) : message.action === "screenshot" ? screenshot(message.args || {}) : message.action === "search" ? search(message.args || {}) : message.action === "readInbox" ? readInbox(message.args || {}) : message.action === "readThread" ? readThread(message.args || {}) : message.action === "sendMessage" ? sendMessage(message.args || {}) : message.action === "ytStudioRead" ? ytStudioReadTool(message.args || {}) : message.action === "click" ? clickTool(message.args || {}) : message.action === "scroll" ? scrollTool(message.args || {}) : readPage(message.args || {}));
+        const handler = ACTION_HANDLERS[message.action];
+        const task = browserAction.then(() => handler(message.args || {}, connection, message.id));
         browserAction = task.then(() => undefined, () => undefined);
-        task.then((result) => reply({ result }), (error) => reply({ error: error.code === "HALT" ? { code: "HALT", reason: error.reason } : error.message }));
+        task.then(
+          (result) => reply({ result }),
+          (error) => reply({
+            error: error?.code === "HALT" ? {
+              code: "HALT",
+              reason: error.reason || error.message,
+              ...(error.posted ? { posted: true } : {}),
+              ...(error.sent ? { sent: true } : {}),
+              ...(error.created ? { created: true } : {})
+            } : error?.message || String(error),
+            ...(error?.posted ? { posted: true, verified: false } : {}),
+            ...(error?.sent ? { sent: true, verified: false } : {}),
+            ...(error?.created ? { created: true, verified: false } : {})
+          })
+        );
       }
     } catch { connection.close(); }
   };

@@ -7,6 +7,7 @@ import { runUpdate as runUpdateModule } from "../update";
 import { stateDir, socketPath, identity, extensionPath, extensionVersion, PINNED_EXTENSION_ID, CliError } from "./state";
 import { effectivePort } from "./config";
 import { extensionIdentity } from "./extension";
+import { capFromEnv, tgChannelsCapFromEnv, tiktokUploadsCapFromEnv } from "./validate";
 
 export async function isPortInUse(port: number): Promise<boolean> {
   if (!port || port <= 0 || port > 65535) return false;
@@ -28,7 +29,7 @@ export function portOwnerPid(port: number): number | null {
 export const isOwnProcess = (pid: number) => /--service-daemon|socmedia/.test(spawnSync("ps", ["-o", "command=", "-p", String(pid)], { encoding: "utf8" }).stdout ?? "");
 export const portHint = "Stop the process holding the port, or choose another: socmedia config set port <PORT> (then enter it in the extension popup)";
 
-export async function status(): Promise<{ running: boolean; pid?: number; version?: string; extension?: unknown; halted?: unknown; extensionUrl?: string; portSource?: string; port: number; pinnedId: string; portInUse?: boolean; code?: string; ownerPid?: number | null; hint?: string; legacy?: boolean; extensionId?: string | null; extensionPinned?: boolean }> {
+export async function status(): Promise<{ running: boolean; pid?: number; version?: string; extension?: unknown; halted?: unknown; extensionUrl?: string; portSource?: string; port: number; pinnedId: string; portInUse?: boolean; code?: string; ownerPid?: number | null; hint?: string; legacy?: boolean; extensionId?: string | null; extensionPinned?: boolean; limits?: { messages: { cap: number }; tiktokUploads: { cap: number }; telegramChannels: { cap: number } } }> {
   const pCfg = effectivePort();
   const configuredPort = pCfg.port;
   return new Promise((resolve) => {
@@ -43,6 +44,11 @@ export async function status(): Promise<{ running: boolean; pid?: number; versio
         pinnedId: PINNED_EXTENSION_ID,
         ...extensionIdentity(),
         extensionUrl: `ws://127.0.0.1:${configuredPort}/extension`,
+        limits: {
+          messages: { cap: capFromEnv() },
+          tiktokUploads: { cap: tiktokUploadsCapFromEnv() },
+          telegramChannels: { cap: tgChannelsCapFromEnv() },
+        },
         ...(inUse ? { portInUse: true, code: "PORT_IN_USE", ownerPid: portOwnerPid(configuredPort), hint: portHint } : {}),
       });
     };
@@ -68,6 +74,11 @@ export async function status(): Promise<{ running: boolean; pid?: number; versio
             portSource: response.portSource,
             port: ext?.port ?? configuredPort,
             pinnedId: PINNED_EXTENSION_ID,
+            limits: response.limits ?? {
+              messages: { cap: capFromEnv() },
+              tiktokUploads: { cap: tiktokUploadsCapFromEnv() },
+              telegramChannels: { cap: tgChannelsCapFromEnv() },
+            },
             ...extensionIdentity(),
             ...(legacy ? { legacy: true } : {}),
           });
@@ -159,7 +170,13 @@ export async function queueRequest(command: string): Promise<unknown> {
   });
 }
 
-export async function runPageJob(action: "snapshot" | "readPage" | "getProfile" | "getComments" | "getPosts" | "getPost" | "screenshot" | "search" | "readInbox" | "readThread" | "sendMessage" | "ytStudioRead" | "click" | "scroll", args: Record<string, unknown>): Promise<unknown> {
+export type PageJobAction =
+  | "snapshot" | "readPage" | "getProfile" | "getComments" | "getPosts" | "getPost" | "screenshot" | "search"
+  | "readInbox" | "readThread" | "sendMessage" | "ytStudioRead" | "click" | "scroll"
+  | "tiktokProfile" | "tiktokPosts" | "tiktokVideo" | "tiktokComments" | "tiktokSearch" | "tiktokInbox" | "tiktokUpload"
+  | "tgStatus" | "tgDialogsList" | "tgMessagesRead" | "tgMediaDownload" | "tgSendMessage" | "tgSendMedia" | "tgCreateChannel";
+
+export async function runPageJob(action: PageJobAction, args: Record<string, unknown>): Promise<unknown> {
   const current = await status();
   if (!current.running) throw new Error("Service not running");
   if (current.halted) {
@@ -170,25 +187,53 @@ export async function runPageJob(action: "snapshot" | "readPage" | "getProfile" 
   if (!extension?.connected) throw new Error("Extension not connected");
   if (!extension.compatible) throw new Error("Extension version incompatible");
   const created = await queueRequest(`queue enqueue ${JSON.stringify({ action, args })}`) as { id: number };
-  const deadline = Date.now() + (action === "getComments" || action === "getPosts" || action === "getPost" || action === "search" ? 75000 : action === "getProfile" ? 60000 : 30000);
+  const timeoutMap: Record<string, number> = {
+    tiktokUpload: 10 * 60 * 1000,
+    tgSendMedia: 10 * 60 * 1000,
+    tgMediaDownload: 5 * 60 * 1000,
+    tiktokProfile: 75000,
+    tiktokPosts: 75000,
+    tiktokVideo: 75000,
+    tiktokComments: 75000,
+    tiktokSearch: 75000,
+    tiktokInbox: 75000,
+    tgStatus: 75000,
+    tgDialogsList: 75000,
+    tgMessagesRead: 75000,
+    tgSendMessage: 75000,
+    tgCreateChannel: 75000,
+    getComments: 75000,
+    getPosts: 75000,
+    getPost: 75000,
+    search: 75000,
+    getProfile: 60000,
+  };
+  const deadline = Date.now() + (timeoutMap[action] ?? 30000);
   while (Date.now() < deadline) {
     let job = await queueRequest(`queue get ${created.id}`) as { status: string; result?: unknown; error?: string | { code?: string; reason?: string } };
-    if (!["done", "failed", "cancelled"].includes(job.status)) {
+    if (!["done", "failed", "cancelled", "unverified"].includes(job.status)) {
       const state = await status();
       if (state.halted) {
         // HALT and the job result are persisted together; status can observe them
         // after the earlier job read, so read the job again before reporting it.
         job = await queueRequest(`queue get ${created.id}`) as typeof job;
-        if (!["done", "failed", "cancelled"].includes(job.status)) throw new Error(`Job ${created.id} is ${job.status}; resolve the challenge and run service resume`);
+        if (!["done", "failed", "cancelled", "unverified"].includes(job.status)) throw new Error(`Job ${created.id} is ${job.status}; resolve the challenge and run service resume`);
       }
       if (!state.running) throw new Error(`Service stopped; inspect job ${created.id} after restarting`);
     }
     if (job.status === "done") return job.result;
+    if (job.status === "unverified") {
+      return { ...(typeof job.result === "object" ? job.result : {}), unverified: true, status: "unverified" };
+    }
     if (job.status === "failed" || job.status === "cancelled") {
       if (typeof job.error === "object" && job.error?.code === "HALT") throw new Error(`HALT: ${job.error.reason}; resolve it in Chrome and run service resume`);
       throw new Error(`Job ${created.id}: ${typeof job.error === "object" ? job.error?.reason : job.error || job.status}`);
     }
     await Bun.sleep(50);
+  }
+  const isSideEffect = ["sendMessage", "tiktokUpload", "tgSendMessage", "tgSendMedia", "tgCreateChannel"].includes(action);
+  if (isSideEffect) {
+    throw new Error(`Job ${created.id} deadline exceeded (${action}); inspect it with: socmedia queue get ${created.id} (do not retry side effects)`);
   }
   throw new Error(`Job ${created.id} still pending; inspect it with queue get`);
 }

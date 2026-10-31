@@ -1,0 +1,161 @@
+import type { Command } from "./types";
+import type { CommandMeta } from "../output";
+import { printError, printOutput } from "../output";
+import { runPageJob } from "../lib/client";
+import { tiktokProfileUrl, tiktokVideoUrl, validateMediaFile } from "../lib/validate";
+import { resolveHomePath } from "../media";
+
+// Help data: feeds --help, --help --json, and the tests/command-table.test.ts completeness checks.
+export const meta: CommandMeta = {
+  name: "tiktok",
+  usage: "socmedia tiktok <profile|posts|video|comments|search|inbox|upload> [options]",
+  summary: "Interact with TikTok profiles, videos, comments, and uploads",
+  commands: [
+    { name: "profile URL", summary: "Read TikTok user profile" },
+    { name: "posts URL", summary: "List TikTok videos from a user profile" },
+    { name: "video URL", summary: "Get video details and optionally download" },
+    { name: "comments URL", summary: "Read comments on a TikTok video" },
+    { name: "search QUERY", summary: "Search TikTok users or videos" },
+    { name: "inbox list", summary: "List recent inbox messages (read-only)" },
+    { name: "upload FILE", summary: "Upload video to TikTok Studio with caption and privacy" },
+  ],
+  options: [
+    { flag: "--limit NUM", description: "Limit results: posts 1-100 (default: 12), comments 1-500 (default: 20), search 1-50 (default: 20), inbox 1-100 (default: 20)" },
+    { flag: "--download", description: "Download video and save to ~/socmedia-data/tiktok/" },
+    { flag: "--type TYPE", description: "Search type: users or videos (default: users)" },
+    { flag: "--caption TEXT", description: "Caption for uploaded video (max 2200 characters)" },
+    { flag: "--privacy PRIV", description: "Upload privacy: public, friends, or private (default: private)" },
+    { flag: "--confirm", description: "Confirm write action; without this flag, returns preview" },
+    { flag: "--json", description: "Print the result as JSON" },
+    { flag: "--text", description: "Print the result as plain text" },
+    { flag: "--help", description: "Show this help message" },
+  ],
+};
+
+async function run(argv: string[]): Promise<void> {
+  const sub = argv[3];
+  try {
+    if (sub === "profile") {
+      const url = argv[4];
+      if (!url || url.startsWith("--")) throw new Error("Usage: socmedia tiktok profile URL [options]");
+      const res = await runPageJob("tiktokProfile", { url: tiktokProfileUrl(url) });
+      printOutput(res);
+    } else if (sub === "posts") {
+      const url = argv[4];
+      if (!url || url.startsWith("--")) throw new Error("Usage: socmedia tiktok posts URL [options]");
+      let limit = 12;
+      for (let i = 5; i < argv.length; i++) {
+        if (argv[i] === "--json" || argv[i] === "--text") continue;
+        if (argv[i] === "--limit") {
+          limit = parseInt(argv[++i], 10);
+        } else throw new Error(`Unknown tiktok posts option: ${argv[i]}`);
+      }
+      const res = await runPageJob("tiktokPosts", { url: tiktokProfileUrl(url), limit });
+      printOutput(res);
+    } else if (sub === "video") {
+      const url = argv[4];
+      if (!url || url.startsWith("--")) throw new Error("Usage: socmedia tiktok video URL [options]");
+      let download = false;
+      for (let i = 5; i < argv.length; i++) {
+        if (argv[i] === "--json" || argv[i] === "--text") continue;
+        if (argv[i] === "--download") download = true;
+        else throw new Error(`Unknown tiktok video option: ${argv[i]}`);
+      }
+      const parsed = tiktokVideoUrl(url);
+      const res = await runPageJob("tiktokVideo", { url: parsed.url, download });
+      printOutput(res);
+    } else if (sub === "comments") {
+      const url = argv[4];
+      if (!url || url.startsWith("--")) throw new Error("Usage: socmedia tiktok comments URL [options]");
+      let limit = 20;
+      for (let i = 5; i < argv.length; i++) {
+        if (argv[i] === "--json" || argv[i] === "--text") continue;
+        if (argv[i] === "--limit") {
+          limit = parseInt(argv[++i], 10);
+        } else throw new Error(`Unknown tiktok comments option: ${argv[i]}`);
+      }
+      const parsed = tiktokVideoUrl(url);
+      const res = await runPageJob("tiktokComments", { url: parsed.url, limit });
+      printOutput(res);
+    } else if (sub === "search") {
+      const query = argv[4];
+      if (!query || query.startsWith("--")) throw new Error("Usage: socmedia tiktok search QUERY [options]");
+      let type: "users" | "videos" = "users";
+      let limit = 20;
+      for (let i = 5; i < argv.length; i++) {
+        if (argv[i] === "--json" || argv[i] === "--text") continue;
+        if (argv[i] === "--type") {
+          const t = argv[++i];
+          if (t !== "users" && t !== "videos") throw new Error("Search type must be users or videos");
+          type = t;
+        } else if (argv[i] === "--limit") {
+          limit = parseInt(argv[++i], 10);
+        } else throw new Error(`Unknown tiktok search option: ${argv[i]}`);
+      }
+      const res = await runPageJob("tiktokSearch", { query, type, limit });
+      printOutput(res);
+    } else if (sub === "inbox") {
+      if (argv[4] !== "list") throw new Error("Usage: socmedia tiktok inbox list [options]");
+      let limit = 20;
+      for (let i = 5; i < argv.length; i++) {
+        if (argv[i] === "--json" || argv[i] === "--text") continue;
+        if (argv[i] === "--limit") {
+          limit = parseInt(argv[++i], 10);
+        } else throw new Error(`Unknown tiktok inbox option: ${argv[i]}`);
+      }
+      const res = await runPageJob("tiktokInbox", { limit });
+      printOutput(res);
+    } else if (sub === "upload") {
+      const file = argv[4];
+      if (!file || file.startsWith("--")) throw new Error("Usage: socmedia tiktok upload FILE [options]");
+      let caption = "";
+      let privacy: "public" | "friends" | "private" = "private";
+      let confirm = false;
+      for (let i = 5; i < argv.length; i++) {
+        if (argv[i] === "--json" || argv[i] === "--text") continue;
+        if (argv[i] === "--caption") {
+          caption = argv[++i] ?? "";
+          if (caption.length > 2200) throw new Error("Caption must be at most 2200 characters");
+        } else if (argv[i] === "--privacy") {
+          const p = argv[++i];
+          if (p !== "public" && p !== "friends" && p !== "private") {
+            throw new Error("--privacy must be public, friends or private");
+          }
+          privacy = p;
+        } else if (argv[i] === "--confirm") {
+          confirm = true;
+        } else throw new Error(`Unknown tiktok upload option: ${argv[i]}`);
+      }
+
+      const media = validateMediaFile(file, ["mp4", "mov", "webm"]);
+      if (!confirm) {
+        printOutput({
+          platform: "tt",
+          uploaded: false,
+          preview: {
+            file: media.path,
+            caption,
+            privacy,
+            size: media.size,
+          },
+          note: "Nothing uploaded. Pass --confirm to execute upload.",
+        });
+      } else {
+        const res = await runPageJob("tiktokUpload", {
+          file: media.path,
+          caption,
+          privacy,
+          sha256: media.sha256,
+        });
+        printOutput(res);
+      }
+    } else {
+      throw new Error(`Unknown tiktok command: ${sub ?? ""}`);
+    }
+  } catch (error) {
+    printError(error);
+  }
+}
+
+const command: Command = { ...meta, run };
+export default command;

@@ -8,13 +8,13 @@ socmedia (CLI)  --UNIX/HTTP+токен-->  локальний сервіс (Bun)
 
 Сервіс — єдиний власник SQLite-черги (`~/.socmedia-cli/state.sqlite`), стану зупинки (`HALT`), відновлення завдань та сполучення з розширенням.
 
-> **Статус реалізації (v0.16.1):**
-> - **Повний цикл реалізовано:** життєвий цикл сервісу, SQLite-черга з ідемпотентним відновленням незавершених завдань, HMAC-SHA256 сполучення розширення з закріпленим ID (`ingpbbhdgldgomideaihffffiinjgifj`), керування вкладками (`tabs list|use|clear`), читання сторінки й snapshot (`page read|snapshot`), скриншоти (`screenshot`), пошук на Instagram і Facebook (`search`), читання профілів (`profile get`), списку постів (`profile posts`), повне завантаження профілю з медіа (`profile download`), деталі постів (`post get`), коментарі (`post comments`), інбокс та треди (`inbox list|read`), прямі повідомлення з preview gate та лімітами (`message send`), YouTube Studio allowlist та завантаження (`youtube`), контакти (`contacts list|update|export|import`), кліки й скрол (`browser click|scroll`), самодіагностика (`doctor`), безпечне оновлення (`update`), та налаштування конфігурації порту (`config`).
+> **Статус реалізації (v0.17.0):**
+> - **Повний цикл реалізовано:** життєвий цикл сервісу, SQLite-черга з ідемпотентним відновленням незавершених завдань, HMAC-SHA256 сполучення розширення з закріпленим ID (`ingpbbhdgldgomideaihffffiinjgifj`), керування вкладками (`tabs list|use|clear`), читання сторінки й snapshot (`page read|snapshot`), скриншоти (`screenshot`), пошук на Instagram і Facebook (`search`), читання профілів (`profile get`), списку постів (`profile posts`), повне завантаження профілю з медіа (`profile download`), деталі постів (`post get`), коментарі (`post comments`), інбокс та треди (`inbox list|read`), контакти (`contacts list|update|export|import`), кліки й скрол (`browser click|scroll`), самодіагностика (`doctor`), безпечне оновлення (`update`), та налаштування конфігурації порту (`config`). Відправка прямих повідомлень (`message send --confirm`) та завантаження на YouTube Studio (`youtube upload --confirm`) наразі не реалізовані (повертають `NOT_IMPLEMENTED`), підтримується лише preview без `--confirm`.
 > - **Модульна архітектура:** кодова база декомпонована на ізольовані модулі: `src/output.ts` (форматування виводу, єдиний COMMAND_REGISTRY, TTY/JSON детекція), `src/media.ts` (захищене завантаження медіа без SSRF, magic-bytes, збереження профілів), `src/doctor.ts` (перевірка стану, прав, SQLite, порту з виявленням `PORT_IN_USE`), `src/update.ts` (безпечне оновлення з перевіркою черги, sha256 та відкатом через `.old`).
 > - **Безпека оновлень (Update Safety):** `socmedia update` читає `latest.json` (база: GitHub Releases, перевизначення `SOCMEDIA_CLI_UPDATE_URL`), відмовляється працювати за наявності завдання `running`, спершу завантажує й звіряє sha256 бінарника та розширення (за розбіжності нічого не змінюється), потім атомарно підміняє бінарник (попередній лишається як `<binary>.old`), оновлює `~/.socmedia-cli/extension` (попередня папка — `extension.bak`) і лише після успіху перезапускає сервіс та просить розширення перезавантажитись (`{type:"reload"}`; старі розширення це ігнорують). `--check` лише порівнює версії.
 > - **Автоматизація релізів:** `.githooks/pre-push` на пуш тегу `v*` перевіряє версії та чисте дерево, запускає тести й typecheck, будує (`bun scripts/build.ts`), звіряє sha256 з `dist/latest.json`, відмовляє, якщо реліз уже існує або `gh` відсутній, і публікує `gh release create <tag> --target <sha>` лише з файлами з `latest.json` (+ `latest.json`, `install.sh`). Див. розділ «Випуск релізу».
-> - **Перевірка наживо:** у цьому зрізі (0.16.1) автоматичні тести не торкаються справжнього Chrome. Чого не перевірено — див. розділ «Що не перевірено наживо».
-> - **Безпека та права Chrome MV3:** розширення використовує `host_permissions` для `instagram.com`, `facebook.com`, `fb.com`, `youtube.com` та дозвіл `debugger` (виключно для надійного розгортання вкладених коментарів без блокувань сайтом).
+> - **Перевірка наживо:** у цьому зрізі (0.17.0) автоматичні тести не торкаються справжнього Chrome. Чого не перевірено — див. розділ «Що не перевірено наживо».
+> - **Безпека та права Chrome MV3:** розширення використовує `host_permissions` для `instagram.com`, `facebook.com`, `fb.com`, `youtube.com`, `tiktok.com`, `web.telegram.org` та дозвіл `debugger` (виключно для надійного розгортання вкладених коментарів без блокувань сайтом).
 
 ## Швидкий старт
 
@@ -64,8 +64,8 @@ sh scripts/install.sh
 
 ## Захисні механізми (Safety Rails)
 
-- **Preview Gate**: дії із побічними ефектами (`message send`, `youtube upload`) без прапорця `--confirm` повертають безпечний preview-звіт (`preview: {...}, sent: false`). Для виконання операції агент чи користувач має явно передати `--confirm`.
-- **Захист від дублікатів та інтервали**: повідомлення захищені від повторної відправки одному отримувачу протягом 7 днів, діє ліміт `SOCMEDIA_MAX_MESSAGES_PER_DAY` (типово 20) та часові інтервали між слотами.
+- **Preview Gate**: дії із побічними ефектами (`message send`, `youtube upload`) без прапорця `--confirm` повертають безпечний preview-звіт (`preview: {...}, sent: false` або `{ preview: {...}, uploaded: false }`). Виконання `--confirm` для `message send` та `youtube upload` наразі не реалізовано (повертає `NOT_IMPLEMENTED`).
+- **Захист від дублікатів та інтервали**: коли відправка активна, повідомлення захищені від повторної відправки одному отримувачу протягом 7 днів, діє ліміт `SOCMEDIA_MAX_MESSAGES_PER_DAY` (типово 20) та часові інтервали між слотами. Невдалі завдання (`failed`) у ліміти не зараховуються.
 - **HALT захист**: при виявленні чекпоінту, капчі чи вимоги авторизації черга автоматично блокується. Після ручного проходження у Chrome виконайте:
   ```sh
   socmedia service resume
@@ -92,8 +92,10 @@ mkdir -p ~/.claude/skills/socmedia-cli-usage && cp skills/socmedia-cli-usage/SKI
 
 ## Що не перевірено наживо
 
-- Справжній Chrome із розширенням 0.16.1, у тому числі обробник `{type:"reload"}` у `extension/background.js` (покрито лише тестом коду та мок-сокетом).
-- Instagram, Facebook і YouTube Studio на живих сторінках у цьому зрізі.
+- Справжній Chrome із розширенням 0.17.0, у тому числі обробник `{type:"reload"}` у `extension/background.js` (покрито лише тестом коду та мок-сокетом).
+- Instagram, Facebook, YouTube Studio, TikTok (`www.tiktok.com`) та Telegram Web K (`web.telegram.org/k/`) на живих сторінках у цьому зрізі (включно з TikTok Studio upload, перевіркою публікацій, Telegram Web K сесією, читанням повідомлень, чанковим скачуванням медіа та створенням каналів).
+- **Усі DOM-селектори для TikTok та Telegram Web K написані з пам'яті та специфікацій і є неперевіреними наживо (unverified live) у Chrome.**
+- TikTok inbox підтримує лише читання (відправка повідомлень відсутня / no send).
 - Справжні `socmedia update` з GitHub і `gh release create` (усе перевірено на локальному http-сервері та заглушці `gh`).
 - Збірка x64 (`RELEASE_TARGETS=all`) та запуск бінарників на інших машинах.
 - Ліцензію не обрано; підпис і нотаризація відсутні (лише ad-hoc `codesign`).
@@ -120,8 +122,12 @@ mkdir -p ~/.claude/skills/socmedia-cli-usage && cp skills/socmedia-cli-usage/SKI
 - `socmedia inbox <list|read>` — перегляд діалогів або повідомлень інбоксу.
 - `socmedia message send --to <URL> --text <TEXT> [--confirm]` — відправка повідомлення з preview gate.
 - `socmedia youtube <channel|studio status|upload>` — робота з дозволеними каналами YouTube Studio.
+- `socmedia tiktok <profile|posts|video|comments|search|inbox|upload>` — робота з TikTok через браузерне розширення (preview gate на завантаження, ліміти).
+- `socmedia telegram <status|dialogs|messages|message|media|channel>` — робота з Telegram Web K через розширення (читання, завантаження медіа чанками, preview gate на відправку та канали).
 - `socmedia contacts <list|update|export|import>` — керування базою контактів, зміна статусу/нотаток, імпорт зі спадку та експорт у CSV/JSON/JSONL.
 - `socmedia browser <click|scroll>` — прямі взаємодії з сторінкою (клік по елементу чи скрол).
+
+> **Попередження щодо умов використання:** автоматизація цих платформ (TikTok, Telegram, Instagram, Facebook, YouTube) може порушувати їхні умови надання послуг (Terms of Service); жодні операції наживо на справжніх акаунтах не перевірялися і надійність живого виконання не гарантується.
 
 ## Розробка
 

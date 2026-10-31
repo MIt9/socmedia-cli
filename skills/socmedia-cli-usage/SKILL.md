@@ -42,24 +42,36 @@ The CLI's `--help` is the source of truth; this skill mirrors and summarizes its
 ## Critical Safety Rails for AI Agents
 
 1. **NEVER autonomously add `--confirm`**:
-   - Write/mutating operations (`socmedia message send`, `socmedia youtube upload`) enforce a strict **Preview Gate**.
-   - Running without `--confirm` returns a dry-run preview (`{ preview: {...}, sent: false }` or `{ preview: {...}, uploaded: false }`).
+   - Write/mutating operations (`socmedia message send`, `socmedia youtube upload`, `socmedia tiktok upload`, `socmedia telegram message send`, `socmedia telegram media send`, `socmedia telegram channel create`) enforce a strict **Preview Gate**.
+   - Running without `--confirm` returns a dry-run preview (`{ preview: {...}, sent: false }`, `{ preview: {...}, uploaded: false }`, or `{ preview: {...}, created: false }`).
    - The agent MUST show this preview to the user and await explicit confirmation. The agent must NEVER add `--confirm` without direct user request.
-2. **Handling `HALT` (Checkpoints, Captchas, Logins)**:
-   - When Instagram or Facebook displays an authentication challenge, captcha, or checkpoint, the daemon immediately enters `HALT` state and freezes queue execution.
+   - Note: execution with `--confirm` for `socmedia message send` and `socmedia youtube upload` is currently not implemented (`NOT_IMPLEMENTED`).
+2. **Handling `HALT` (Checkpoints, Captchas, Logins, FLOOD)**:
+   - When Instagram, Facebook, TikTok (login form or slider captcha), or Telegram (login/QR page, phone number prompt, or FLOOD/too-many-attempts notice) displays an authentication challenge, captcha, or checkpoint, the daemon immediately enters `HALT` state and freezes queue execution.
    - Do NOT retry in a loop! Automated retries during a challenge risk account lockouts.
    - Notify the user to open Google Chrome, complete the challenge manually in the tab, and then run:
      ```bash
      socmedia service resume
      ```
-3. **Daily Message Limits & Slot Spacing**:
-   - Outgoing DMs are bounded by `SOCMEDIA_MAX_MESSAGES_PER_DAY` (default: 20).
+3. **Daily Limits & Slot Spacing**:
+   - Outgoing DMs (Instagram, Facebook, Telegram) are bounded by `SOCMEDIA_MAX_MESSAGES_PER_DAY` (default: 20 per platform).
    - Identical messages to the same recipient within 7 days are rejected as duplicate spam prevention.
+   - TikTok video uploads are bounded by `SOCMEDIA_MAX_TIKTOK_UPLOADS_PER_DAY` (default: 5). Identical files (by sha256) within 7 days are rejected.
+   - Telegram private channel creation is bounded by `SOCMEDIA_MAX_TG_CHANNELS_PER_DAY` (default: 3).
    - Enforced slot pacing (90s + jitter) spaces out outgoing actions.
 4. **YouTube Channel Allowlist**:
    - YouTube Studio operations only permit uploads to channels defined with `"write": true` in `~/.socmedia-cli/youtube.json`.
-5. **Handling `unverified` Message Status**:
-   - If a message send returns `unverified`, it means DOM insertion succeeded but UI readback confirmation was ambiguous. Inspect the thread before attempting any repeat.
+5. **Handling `unverified` Action Status & Result Fields**:
+   - **Result fields**:
+     - `sent` (boolean): true if message or media send action was dispatched.
+     - `posted` (boolean): true if video upload was submitted past the point of no return.
+     - `created` (boolean): true if channel creation was submitted.
+     - `verified` (boolean): true ONLY if post-action verification succeeded (new video URL with matching caption, new outgoing bubble, or new dialog); false if interrupted or verification failed after the point of no return.
+     - `saved` (array of `[{ path, type, preview }]`): files actually validated and written to disk by the service.
+     - `skipped` (array of `[{ type, reason, preview }]`): media skipped during download with specific reason (e.g. `File exceeds 50 MB limit`, `Invalid or unsupported media format`).
+     - `preview` (boolean): true for media thumbnails/previews or dry-run preview responses without `--confirm`.
+   - Side-effect operations (`sendMessage`, `tiktokUpload`, `tgSendMessage`, `tgSendMedia`, `tgCreateChannel`) that encounter ambiguous UI readback, extension disconnect, restart, or timeout are recorded as `unverified` (`verified: false`) and NEVER automatically retried or requeued.
+   - Inspect the state via `socmedia queue get <JOB_ID>` and verify in the browser before taking any repeat action. Do not retry side effects blindly.
 
 ## Commands Reference
 
@@ -195,6 +207,67 @@ The CLI's `--help` is the source of truth; this skill mirrors and summarizes its
   ```
 - Same rule: re-run the identical upload with `--confirm` appended only after the user explicitly approves the preview.
 
+### TikTok Operations
+- **Read TikTok profile**:
+  ```bash
+  socmedia tiktok profile https://www.tiktok.com/@username [--json]
+  ```
+- **List TikTok posts**:
+  ```bash
+  socmedia tiktok posts https://www.tiktok.com/@username --limit 12 [--json]
+  ```
+- **Get video info and download**:
+  ```bash
+  socmedia tiktok video https://www.tiktok.com/@username/video/1234567890 --download [--json]
+  ```
+- **Read comments**:
+  ```bash
+  socmedia tiktok comments https://www.tiktok.com/@username/video/1234567890 --limit 20 [--json]
+  ```
+- **Search TikTok**:
+  ```bash
+  socmedia tiktok search "creator" --type users --limit 20 [--json]
+  ```
+- **List inbox messages (read-only; no send)**:
+  ```bash
+  socmedia tiktok inbox list [--limit 20] [--json]
+  ```
+  *(Note: TikTok inbox is strictly read-only; sending direct messages is not supported).*
+- **Upload video draft (preview, no `--confirm`)**:
+  ```bash
+  socmedia tiktok upload ~/Videos/clip.mp4 --caption "My video" --privacy private [--json]
+  ```
+
+### Telegram Web K Operations
+- **Check login status and account**:
+  ```bash
+  socmedia telegram status [--json]
+  ```
+- **List dialogs**:
+  ```bash
+  socmedia telegram dialogs list --limit 20 [--json]
+  ```
+- **Read messages from chat**:
+  ```bash
+  socmedia telegram messages read @username --limit 30 [--json]
+  ```
+- **Send text message (preview, no `--confirm`)**:
+  ```bash
+  socmedia telegram message send @username --text "Hello" [--json]
+  ```
+- **Download media from chat**:
+  ```bash
+  socmedia telegram media download @username --limit 10 --types photo,video [--dir ~/Downloads] [--json]
+  ```
+- **Send photo or video (preview, no `--confirm`)**:
+  ```bash
+  socmedia telegram media send @username ~/Photos/pic.jpg --caption "Photo" [--json]
+  ```
+- **Create private channel (preview, no `--confirm`)**:
+  ```bash
+  socmedia telegram channel create --title "My Channel" --description "Private channel" [--json]
+  ```
+
 ### Queue Management
 - **Inspect and cancel jobs**:
   ```bash
@@ -212,5 +285,7 @@ The CLI's `--help` is the source of truth; this skill mirrors and summarizes its
 
 ## Limitations
 
-- **DOM dependencies**: Web selectors depend on Instagram and Facebook DOM hierarchies. If a social platform updates their frontend, run `socmedia page snapshot` to identify updated selectors.
+- **Unverified live DOM selectors**: All DOM selectors for TikTok (`www.tiktok.com`) and Telegram Web K (`web.telegram.org/k/`) were written from specification and memory and are **unverified live** in real Chrome. Instagram and Facebook selectors depend on frontend hierarchies. If a platform changes markup, run `socmedia page snapshot` to identify updated elements.
+- **TikTok Inbox**: Read-only support. There is no direct message sending support (`no send`).
+- **Daily caps and duplicate rules**: Outgoing message caps (20/day per platform), upload caps (5/day), and channel creation caps (3/day) include active queued and running jobs. 7-day duplicate checks enforce uniqueness on message text and upload file SHA256. Telegram messages enforce a strict 90s + 0..60s slot gap.
 - **Live sessions required**: The extension runs in the user's Chrome instance; user must be logged in to target platforms.

@@ -1,11 +1,12 @@
 import type { Command } from "./types";
 import type { CommandMeta } from "../output";
 import { existsSync } from "node:fs";
-import { dirname } from "node:path";
+import { basename } from "node:path";
 import { printError } from "../output";
 import { resolveHomePath } from "../media";
 import { runPageJob } from "../lib/client";
 import { readYoutubeConfig, resolveChannel, studioUrl } from "../lib/config";
+import { CliError } from "../lib/state";
 
 // Help data (feeds --help, --help --json, skill parity and COMMANDS.md tests).
 export const meta: CommandMeta = {
@@ -113,7 +114,7 @@ async function run(argv: string[]): Promise<void> {
           uploaded: false,
           preview: {
             file: absFile,
-            title: title || dirname(absFile),
+            title: title || basename(absFile),
             description: description || null,
             privacy: privacy || "private",
             studioUrl: studioUrl(ch.id),
@@ -121,7 +122,7 @@ async function run(argv: string[]): Promise<void> {
           note: "Nothing uploaded. Pass --confirm to execute upload.",
         }));
       } else {
-        console.log(JSON.stringify({ channel: ch, uploaded: true, note: "Studio upload confirmed" }));
+        throw new CliError("YouTube upload is not implemented", undefined, "NOT_IMPLEMENTED", { uploaded: false });
       }
     } catch (error) { printError(error); }
   }

@@ -16,7 +16,7 @@
 | `social_download_profile` | `socmedia profile download URL` | `--limit`, `--details`, `--max-media`, `--dir`, `--background` | Реалізовано: збирання профілю, скриншота, постів, деталей і медіафайлів (до `--max-media`, без дублікатів) у `~/socmedia-data/<platform>/<username>/` разом із `profile.json`, `posts.json`, `profile.md`; опція `--background` для виконання через чергу сервісу. Наживо в Chrome не перевірено. |
 | `social_inbox` | `socmedia inbox list PLATFORM` | `--limit` | Реалізовано для Instagram і Facebook: список розмов, фрагмент повідомлення, час і стан непрочитаного (ліміт 1–100, дефолт 20). Наживо в Chrome не перевірено. |
 | `social_read_thread` | `socmedia inbox read` | `--url URL` або `--to PROFILE`, `--limit` | Реалізовано для Instagram і Facebook: повідомлення розмови у хронологічному порядку, тип і доступні медіа (ліміт 1–100, дефолт 30). Наживо в Chrome не перевірено. |
-| `social_send_message` | `socmedia message send` | `--to URL`, `--text TEXT`, `--confirm` | Реалізовано: dry-run preview без `--confirm`; із `--confirm` чергування повідомлення з лімітом на день (`SOCMEDIA_MAX_MESSAGES_PER_DAY`, дефолт 20), захистом від дублікатів за 7 днів та автоматичним інтервалом слотів (90с + 0..60с). Наживо в Chrome не перевірено. |
+| `social_send_message` | `socmedia message send` | `--to URL`, `--text TEXT`, `--confirm` | Реалізовано: dry-run preview без `--confirm`. Відправка повідомлень через розширення наразі НЕ реалізована (stub у extension повертає `NOT_IMPLEMENTED:`, завдання завершується як `failed`, у `messages` записується `failed` без врахування у ліміти чи дублікати). |
 | `social_contacts` | `socmedia contacts list` / `socmedia contacts update ID` / `socmedia contacts import` | `--status`, `--platform`; для update `--status`, `--note`; для import `--from DIR` | Реалізовано: список, фільтри, зміна статусу та нотаток; імпорт контактів і повідомлень із копії `~/.socmedia-mcp` (ідемпотентно без перезапису джерела). |
 | `social_export` | `socmedia contacts export` | `--status`, `--platform`, `--format csv\|json\|jsonl`, `--path`, `--json` | Реалізовано: шлях і кількість експортованих контактів; файл лише всередині home, символічні посилання на шляху відхиляються. |
 | `social_snapshot` | `socmedia page snapshot` | `--json` | Інтерактивні елементи вкладки з індексами; реалізовано, живий Chrome не перевірено. |
@@ -27,6 +27,8 @@
 | `social_use_tab` | `socmedia tabs use ID` / `socmedia tabs clear` | ID вкладки або clear | Вибір вкладки або повернення до робочої групи. |
 | `social_enqueue` | `socmedia queue enqueue ACTION` | `--args JSON`, `--not-before`, `--key` | ID і стан завдання; повідомлення, публікація коментарів і завантаження відео не обходять окремі перевірки. |
 | `social_queue` | `socmedia queue list` / `get ID` / `cancel ID` | `--status`, `--limit` для list | Завдання й результати, або стан скасування; виконуване завдання не скасовується як звичайне queued. |
+| `social_tiktok` | `socmedia tiktok` | `profile`, `posts`, `video`, `comments`, `search`, `inbox`, `upload` | Підтримка www.tiktok.com через Chrome extension. Читання профілів, постів, деталей відео, коментарів, пошуку та інбоксу (інбокс лише для читання, відправка повідомлень відсутня/no send). Завантаження відео (`upload`) з preview gate без `--confirm`; із `--confirm` виконання через TikTok Studio (`DOM.setFileInputFiles`), ліміт 5/день (`SOCMEDIA_MAX_TIKTOK_UPLOADS_PER_DAY`), заборона дублікатів файлу за 7 днів (sha256). Усі DOM-селектори написані з пам'яті та наживо в Chrome не перевірені (unverified live). |
+| `social_telegram` | `socmedia telegram` | `status`, `dialogs`, `messages`, `message`, `media`, `channel` | Підтримка https://web.telegram.org/k/ через Chrome extension. Перевірка статусу входу, діалогів, читання повідомлень, завантаження медіа чанками до 50 МБ. Відправка повідомлень (`message send`), медіа (`media send`) та створення приватних каналів (`channel create`) із preview gate; із `--confirm` ліміти (20 повідомлень/день `SOCMEDIA_MAX_MESSAGES_PER_DAY`, дублікати за 7 днів, інтервали `GAP_MS+JITTER_MS`, 3 канали/день `SOCMEDIA_MAX_TG_CHANNELS_PER_DAY`), звірка заголовка чату перед набором, повернення `unverified` при збої перевірки. Усі DOM-селектори написані з пам'яті та наживо в Chrome не перевірені (unverified live). |
 
 ## Системні команди, самодіагностика та конфігурація
 
@@ -48,8 +50,8 @@
 | `yt_auth_status` | `socmedia youtube status` | `--channel` | Стан розширення, сесії та перевірки дозволеного каналу; OAuth-токен і квота API не потрібні. |
 | `yt_auth_start` | Немає прямої команди | — | OAuth API усувається; користувач входить у YouTube через Chrome. |
 | `yt_channel` | `socmedia youtube channel` | `--channel` | Реалізовано: читання та перевірка каналу з локального allowlist `~/.socmedia-cli/youtube.json`. |
-| `yt_upload` | `socmedia youtube upload FILE` | `--title`, `--description`, `--privacy`, `--channel`, `--confirm` | Реалізовано preview gate: без `--confirm` повертає dry-run preview з деталями чернетки; вимагає `write: true` у allowlist. |
-| `yt_studio_upload` | `socmedia youtube upload FILE` | Також `--thumbnail` | Той самий UI-потік; перевірка каналу, збереження та метаданих через UI. Не повторювати сліпо при невизначеному результаті. |
+| `yt_upload` | `socmedia youtube upload FILE` | `--title`, `--description`, `--privacy`, `--channel`, `--confirm` | Реалізовано preview gate: без `--confirm` повертає dry-run preview з деталями чернетки (заголовок за замовчуванням — basename файлу). Виконання завантаження (`--confirm`) НЕ реалізовано (повертає помилку з кодом `NOT_IMPLEMENTED` та `uploaded: false`). |
+| `yt_studio_upload` | `socmedia youtube upload FILE` | Також `--thumbnail` | Той самий UI-потік; наразі виконання завантаження не реалізовано (`NOT_IMPLEMENTED`). |
 | `yt_update_video` | `socmedia youtube video update VIDEO` | `--title`, `--description`, `--privacy`, `--publish-at`, `--thumbnail`, `--channel`, `--confirm` | Preview змін або перевірений результат редагування. |
 | `yt_set_thumbnail` | `socmedia youtube video thumbnail VIDEO FILE` | `--channel`, `--confirm` | Preview або результат встановлення обкладинки. |
 | `yt_playlists` | `socmedia youtube playlists list` / `create` / `add` | `--title`, `--description`, `--privacy`, `--playlist`, `--video`, `--limit`, `--channel`, `--confirm` | Список плейлистів або preview/результат створення чи додавання. |
@@ -58,3 +60,27 @@
 | `yt_studio_read` | `socmedia youtube studio status` | `--open`, `--channel` | Реалізовано: перевірка поточної вкладки Studio проти дозволеного channelId, читання розділу та облікового запису. |
 
 **Невизначеність UI:** старий код реалізує прикріплення файлу та проходження Studio, але специфікація підтверджує живу перевірку лише для кнопки завантаження й поля файлу. Користувач повідомив, що повний сценарій працював; це потрібно повторно перевірити. Назва, опис, обкладинка й фінальна приватність у старому Studio-потоці встановлювалися API. Канал, редагування, плейлисти, коментарі, пагінація та API-еквівалентні поля через UI потребують реалізації і живої перевірки; відсутність надійного read-back має повертати явну невизначеність.
+
+## Специфікація полів результатів, лімітів та безпеки TikTok і Telegram
+
+### Поля результатів (Result Fields)
+- `sent` (boolean): `true`, якщо запит на відправку тексту чи медіа передано в UI Telegram.
+- `posted` (boolean): `true`, якщо запит на публікацію відео в TikTok Studio передано після перевірки налаштувань (точка неповернення).
+- `created` (boolean): `true`, якщо кроки створення приватного каналу в Telegram пройдені.
+- `verified` (boolean): `true` ТІЛЬКИ якщо дія надійно верифікована після виконання (наприклад, знайдено новий URL опублікованого відео з точним описом, новий вихідний бабл медіа/повідомлення в діалозі, або новий діалог створеного каналу). Якщо після точки неповернення виникає помилка, таймаут, відключення розширення або збій звірки, дія позначається `verified: false`, а саме завдання переводиться в статус `unverified` і НІКОЛИ не повторюється автоматично.
+- `saved` (масив об'єктів `[{ path: string, type?: string, preview?: boolean }]`): перелік медіафайлів Telegram, фактично записаних сервісом на диск (із валідацією розміру до 50 МБ, магічних байтів та унікальних імен без directory traversal).
+- `skipped` (масив об'єктів `[{ type?: string, reason: string, preview?: boolean }]`): файли, відхилені під час завантаження з точною причиною (наприклад, `"File exceeds 50 MB limit"` або `"Invalid or unsupported media format"`).
+- `preview` (boolean): `true` для завантажених медіа-прев'ю/мініатюр у Telegram, або у відповідях команд запису без прапорця `--confirm` (dry-run режим).
+
+### Денні ліміти та захист від дублікатів (Daily Limits & Safety Caps)
+- Усі ліміти перевіряються атомарно всередині SQLite-транзакції та враховують як виконані сьогодні записи, так і активні завдання в черзі (`queued` та `running`):
+  - **Telegram повідомлення (`tgSendMessage`, `tgSendMedia`)**: ліміт `SOCMEDIA_MAX_MESSAGES_PER_DAY` (за замовчуванням 20). Заборонено повтор ідентичного тексту повідомлення протягом 7 днів (враховуючи завдання в черзі). Інтервал між відправками суворо зафіксовано: мінімум `GAP_MS = 90000` (90 секунд) + випадковий джитер `JITTER_MS = 60000` (0..60 секунд). Перевизначення змінними оточення відключено, щоб виключити спам.
+  - **TikTok завантаження відео (`tiktokUpload`)**: ліміт `SOCMEDIA_MAX_TIKTOK_UPLOADS_PER_DAY` (за замовчуванням 5). Заборонено повторне завантаження ідентичного відео протягом 7 днів за SHA256 хешем (враховуючи завдання в черзі).
+  - **Telegram створення каналів (`tgCreateChannel`)**: ліміт `SOCMEDIA_MAX_TG_CHANNELS_PER_DAY` (за замовчуванням 3, враховуючи завдання в черзі).
+
+### Обмеження TikTok Inbox
+- Команда `socmedia tiktok inbox list` підтримує **виключно читання** списку розмов і повідомлень. Відправка повідомлень у TikTok відсутня (**no send**).
+
+### Статус живої перевірки (Unverified Live)
+- **Усі DOM-селектори для TikTok (`www.tiktok.com`) та Telegram Web K (`web.telegram.org/k/`) написані за специфікацією та структурою сторінок з пам'яті. Вони НЕ перевірялися наживо у реальному Google Chrome (all DOM selectors are unverified live).**
+

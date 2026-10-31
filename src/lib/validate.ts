@@ -1,6 +1,14 @@
-import { profileUrl, resolveHomePath } from "../media";
+import { closeSync, existsSync, lstatSync, openSync, readSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { NOT_VIDEO_BRANDS, profileUrl, resolveHomePath } from "../media";
 
-export const actions = new Set(["getProfile", "getPosts", "getPost", "getComments", "search", "screenshot", "readInbox", "readThread", "sendMessage", "readPage", "snapshot", "scroll", "listTabs", "useTab", "ytStudioRead", "click", "downloadProfile", "inertTask"]);
+export const actions = new Set([
+  "getProfile", "getPosts", "getPost", "getComments", "search", "screenshot",
+  "readInbox", "readThread", "sendMessage", "readPage", "snapshot", "scroll",
+  "listTabs", "useTab", "ytStudioRead", "click", "downloadProfile", "inertTask",
+  "tiktokProfile", "tiktokPosts", "tiktokVideo", "tiktokComments", "tiktokSearch", "tiktokInbox", "tiktokUpload",
+  "tgStatus", "tgDialogsList", "tgMessagesRead", "tgMediaDownload", "tgSendMessage", "tgSendMedia", "tgCreateChannel"
+]);
 export const contactStatuses = ["new", "messaged", "replied", "won", "rejected", "skip"];
 export const contactColumns = ["id", "platform", "username", "name", "status", "followers", "following", "postsCount", "verified", "private", "isBusiness", "category", "website", "email", "phone", "bio", "url", "note", "firstSeen", "lastSeen", "updatedAt"];
 
@@ -14,6 +22,132 @@ export function capFromEnv(v = process.env.SOCMEDIA_MAX_MESSAGES_PER_DAY) {
   if (v === undefined || v === null || String(v).trim() === "") return DEFAULT_CAP;
   const n = Number(v);
   return Number.isInteger(n) && n >= 0 ? n : DEFAULT_CAP;
+}
+
+export const DEFAULT_TIKTOK_UPLOADS_CAP = 5;
+export function tiktokUploadsCapFromEnv(v = process.env.SOCMEDIA_MAX_TIKTOK_UPLOADS_PER_DAY) {
+  if (v === undefined || v === null || String(v).trim() === "") return DEFAULT_TIKTOK_UPLOADS_CAP;
+  const n = Number(v);
+  return Number.isInteger(n) && n >= 0 ? n : DEFAULT_TIKTOK_UPLOADS_CAP;
+}
+
+export const DEFAULT_TG_CHANNELS_CAP = 3;
+export function tgChannelsCapFromEnv(v = process.env.SOCMEDIA_MAX_TG_CHANNELS_PER_DAY) {
+  if (v === undefined || v === null || String(v).trim() === "") return DEFAULT_TG_CHANNELS_CAP;
+  const n = Number(v);
+  return Number.isInteger(n) && n >= 0 ? n : DEFAULT_TG_CHANNELS_CAP;
+}
+
+export function tiktokProfileUrl(value: unknown): string {
+  if (typeof value !== "string") throw new Error("TikTok profile URL is required");
+  let u: URL;
+  try { u = new URL(value); } catch { throw new Error("Invalid TikTok profile URL"); }
+  if (u.protocol !== "https:" || u.hostname !== "www.tiktok.com" || u.username || u.password || u.port) {
+    throw new Error("Provide an HTTPS www.tiktok.com profile URL, for example https://www.tiktok.com/@user");
+  }
+  const parts = u.pathname.split("/").filter(Boolean);
+  if (parts.length !== 1 || !parts[0]!.startsWith("@")) {
+    throw new Error("Provide an HTTPS www.tiktok.com profile URL, for example https://www.tiktok.com/@user");
+  }
+  const username = parts[0]!.slice(1);
+  if (!/^[a-zA-Z0-9_.-]{1,50}$/.test(username)) {
+    throw new Error("Invalid TikTok username in URL");
+  }
+  return `https://www.tiktok.com/@${username}`;
+}
+
+export function tiktokVideoUrl(value: unknown): { url: string; author: string; id: string } {
+  if (typeof value !== "string") throw new Error("TikTok video URL is required");
+  let u: URL;
+  try { u = new URL(value); } catch { throw new Error("Invalid TikTok video URL"); }
+  if (u.protocol !== "https:" || u.hostname !== "www.tiktok.com" || u.username || u.password || u.port) {
+    throw new Error("Provide an HTTPS www.tiktok.com video URL, for example https://www.tiktok.com/@user/video/1234567890");
+  }
+  const parts = u.pathname.split("/").filter(Boolean);
+  if (parts.length !== 3 || !parts[0]!.startsWith("@") || parts[1] !== "video" || !/^\d+$/.test(parts[2]!)) {
+    throw new Error("Provide an HTTPS www.tiktok.com video URL, for example https://www.tiktok.com/@user/video/1234567890");
+  }
+  const author = parts[0]!.slice(1);
+  const id = parts[2]!;
+  return { url: `https://www.tiktok.com/@${author}/video/${id}`, author, id };
+}
+
+export function telegramChat(value: unknown): string {
+  if (typeof value !== "string" || !value.trim()) throw new Error("Telegram chat username or link is required");
+  const str = value.trim();
+  if (/t\.me\/\+|t\.me\/joinchat\//i.test(str) || str.startsWith("+")) {
+    throw new Error("Invite links (t.me/+...) are not supported");
+  }
+  let username = "";
+  if (/^https?:\/\//i.test(str)) {
+    let u: URL;
+    try { u = new URL(str); } catch { throw new Error("Invalid Telegram chat URL"); }
+    if (u.protocol !== "https:" || u.hostname !== "t.me" || u.username || u.password || u.port) {
+      throw new Error("Provide an HTTPS t.me URL or @username");
+    }
+    const parts = u.pathname.split("/").filter(Boolean);
+    if (parts.length !== 1) {
+      throw new Error("Provide a valid Telegram chat URL, for example https://t.me/username");
+    }
+    const raw = parts[0]!;
+    if (raw.startsWith("+") || raw === "joinchat") throw new Error("Invite links (t.me/+...) are not supported");
+    username = raw.startsWith("@") ? raw.slice(1) : raw;
+  } else if (str.startsWith("@")) {
+    username = str.slice(1);
+  } else {
+    username = str;
+  }
+  if (!/^[a-zA-Z0-9_]{5,32}$/.test(username)) {
+    throw new Error("Telegram chat username must be 5-32 characters of [a-zA-Z0-9_]");
+  }
+  return `@${username}`;
+}
+
+export function validateMediaFile(file: string, allowedTypes: ("mp4" | "mov" | "webm" | "jpg" | "png" | "webp")[]): { path: string; size: number; ext: string; sha256: string } {
+  const abs = resolveHomePath(file);
+  if (!existsSync(abs)) throw new Error(`File not found: ${abs}`);
+  const st = lstatSync(abs);
+  if (st.isSymbolicLink()) throw new Error(`Symlinks are not allowed: ${abs}`);
+  if (!st.isFile()) throw new Error(`Not a regular file: ${abs}`);
+  if (st.size > 4 * 1024 * 1024 * 1024) throw new Error("File exceeds 4 GB limit");
+  if (st.size < 12) throw new Error("File is too small to be valid media");
+
+  const fd = openSync(abs, "r");
+  const buf = Buffer.alloc(16);
+  readSync(fd, buf, 0, 16, 0);
+  closeSync(fd);
+
+  let ext: "mp4" | "mov" | "webm" | "jpg" | "png" | "webp" | null = null;
+  const hex = buf.toString("hex", 0, 4);
+  if (hex.startsWith("ffd8ff")) ext = "jpg";
+  else if (hex === "89504e47") ext = "png";
+  else if (buf.toString("latin1", 0, 4) === "RIFF" && buf.toString("latin1", 8, 12) === "WEBP") ext = "webp";
+  else if (hex === "1a45dfa3") ext = "webm";
+  else if (buf.toString("latin1", 4, 8) === "ftyp") {
+    const brand = buf.toString("latin1", 8, 12);
+    if (brand.startsWith("qt")) ext = "mov";
+    else if (!NOT_VIDEO_BRANDS.test(brand)) ext = "mp4";
+  } else if (buf.toString("latin1", 4, 8) === "moov" || buf.toString("latin1", 4, 8) === "mdat") {
+    ext = "mov";
+  }
+
+  if (!ext || !allowedTypes.includes(ext)) {
+    throw new Error(`File media type is not supported (expected ${allowedTypes.join(", ")})`);
+  }
+
+  const hash = createHash("sha256");
+  const streamFd = openSync(abs, "r");
+  const chunk = Buffer.alloc(64 * 1024);
+  let bytesRead = 0;
+  let pos = 0;
+  while ((bytesRead = readSync(streamFd, chunk, 0, chunk.length, pos)) > 0) {
+    hash.update(chunk.subarray(0, bytesRead));
+    pos += bytesRead;
+  }
+  closeSync(streamFd);
+  const sha256 = hash.digest("hex");
+
+  return { path: abs, size: st.size, ext, sha256 };
 }
 
 export function checkMessageText(text: unknown): string {
@@ -224,6 +358,121 @@ export function validateJob(value: unknown) {
     }
     if (args.selector !== undefined && (typeof args.selector !== "string" || !args.selector)) throw new Error("scroll selector must be a nonempty string");
     if (args.times !== undefined && (!Number.isInteger(args.times) || Number(args.times) < 1 || Number(args.times) > 20)) throw new Error("scroll times must be an integer from 1 to 20");
+  }
+  if (job.action === "tiktokProfile") {
+    const args = job.args as Record<string, unknown>;
+    if (Object.keys(args).some((k) => k !== "url")) throw new Error("tiktokProfile accepts only url");
+    args.url = tiktokProfileUrl(args.url);
+  }
+  if (job.action === "tiktokPosts") {
+    const args = job.args as Record<string, unknown>;
+    if (Object.keys(args).some((k) => k !== "url" && k !== "limit")) throw new Error("tiktokPosts accepts only url and limit");
+    args.url = tiktokProfileUrl(args.url);
+    if (args.limit !== undefined && (!Number.isInteger(args.limit) || Number(args.limit) < 1 || Number(args.limit) > 100)) throw new Error("Limit must be an integer from 1 to 100");
+  }
+  if (job.action === "tiktokVideo") {
+    const args = job.args as Record<string, unknown>;
+    if (Object.keys(args).some((k) => k !== "url" && k !== "download")) throw new Error("tiktokVideo accepts only url and download");
+    const parsed = tiktokVideoUrl(args.url);
+    args.url = parsed.url;
+    args.author = parsed.author;
+    args.id = parsed.id;
+    if (args.download !== undefined && typeof args.download !== "boolean") throw new Error("download must be a boolean");
+  }
+  if (job.action === "tiktokComments") {
+    const args = job.args as Record<string, unknown>;
+    if (Object.keys(args).some((k) => k !== "url" && k !== "limit")) throw new Error("tiktokComments accepts only url and limit");
+    args.url = tiktokVideoUrl(args.url).url;
+    if (args.limit !== undefined && (!Number.isInteger(args.limit) || Number(args.limit) < 1 || Number(args.limit) > 500)) throw new Error("Limit must be an integer from 1 to 500");
+  }
+  if (job.action === "tiktokSearch") {
+    const args = job.args as Record<string, unknown>;
+    for (const k of Object.keys(args)) {
+      if (!["query", "type", "limit"].includes(k)) throw new Error(`Unknown tiktokSearch option: ${k}`);
+    }
+    if (typeof args.query !== "string" || !args.query.trim() || args.query.length > 200) throw new Error("Search query must be between 1 and 200 characters");
+    if (args.type !== undefined && !["users", "videos"].includes(String(args.type))) throw new Error("Search type must be users or videos");
+    if (args.limit !== undefined && (!Number.isInteger(args.limit) || Number(args.limit) < 1 || Number(args.limit) > 50)) throw new Error("Limit must be an integer from 1 to 50");
+  }
+  if (job.action === "tiktokInbox") {
+    const args = job.args as Record<string, unknown>;
+    if (Object.keys(args).some((k) => k !== "limit")) throw new Error("tiktokInbox accepts only limit");
+    if (args.limit !== undefined && (!Number.isInteger(args.limit) || Number(args.limit) < 1 || Number(args.limit) > 100)) throw new Error("Limit must be an integer from 1 to 100");
+  }
+  if (job.action === "tiktokUpload") {
+    const args = job.args as Record<string, unknown>;
+    for (const k of Object.keys(args)) {
+      if (!["file", "caption", "privacy", "sha256"].includes(k)) throw new Error(`Unknown tiktokUpload option: ${k}`);
+    }
+    if (typeof args.file !== "string" || !args.file) throw new Error("file is required");
+    const v = validateMediaFile(args.file, ["mp4", "mov", "webm"]);
+    args.file = v.path;
+    args.sha256 = v.sha256;
+    if (args.caption !== undefined) {
+      if (typeof args.caption !== "string" || args.caption.length > 2200) throw new Error("Caption must be at most 2200 characters");
+    }
+    if (args.privacy !== undefined && !["public", "friends", "private"].includes(String(args.privacy))) {
+      throw new Error("privacy must be public, friends, or private");
+    }
+  }
+  if (job.action === "tgStatus" && Object.keys(job.args as object).length) throw new Error("tgStatus does not take arguments");
+  if (job.action === "tgDialogsList") {
+    const args = job.args as Record<string, unknown>;
+    if (Object.keys(args).some((k) => k !== "limit")) throw new Error("tgDialogsList accepts only limit");
+    if (args.limit !== undefined && (!Number.isInteger(args.limit) || Number(args.limit) < 1 || Number(args.limit) > 100)) throw new Error("Limit must be an integer from 1 to 100");
+  }
+  if (job.action === "tgMessagesRead") {
+    const args = job.args as Record<string, unknown>;
+    if (Object.keys(args).some((k) => k !== "chat" && k !== "limit")) throw new Error("tgMessagesRead accepts only chat and limit");
+    args.chat = telegramChat(args.chat);
+    if (args.limit !== undefined && (!Number.isInteger(args.limit) || Number(args.limit) < 1 || Number(args.limit) > 100)) throw new Error("Limit must be an integer from 1 to 100");
+  }
+  if (job.action === "tgMediaDownload") {
+    const args = job.args as Record<string, unknown>;
+    for (const k of Object.keys(args)) {
+      if (!["chat", "limit", "types", "dir"].includes(k)) throw new Error(`Unknown tgMediaDownload option: ${k}`);
+    }
+    args.chat = telegramChat(args.chat);
+    if (args.limit !== undefined && (!Number.isInteger(args.limit) || Number(args.limit) < 1 || Number(args.limit) > 50)) throw new Error("Limit must be an integer from 1 to 50");
+    if (args.types !== undefined) {
+      if (!Array.isArray(args.types) || args.types.some((t) => !["photo", "video"].includes(String(t)))) throw new Error("types must be an array of photo and/or video");
+    }
+    if (args.dir !== undefined) {
+      if (typeof args.dir !== "string" || !args.dir) throw new Error("dir must be a nonempty string");
+      resolveHomePath(args.dir);
+    }
+  }
+  if (job.action === "tgSendMessage") {
+    const args = job.args as Record<string, unknown>;
+    for (const k of Object.keys(args)) {
+      if (!["chat", "text"].includes(k)) throw new Error(`Unknown tgSendMessage option: ${k}`);
+    }
+    args.chat = telegramChat(args.chat);
+    if (typeof args.text !== "string" || !args.text.trim()) throw new Error("Message text is empty");
+    if (args.text.length > 4096) throw new Error(`Message is too long (${args.text.length} > 4096 characters)`);
+  }
+  if (job.action === "tgSendMedia") {
+    const args = job.args as Record<string, unknown>;
+    for (const k of Object.keys(args)) {
+      if (!["chat", "file", "caption"].includes(k)) throw new Error(`Unknown tgSendMedia option: ${k}`);
+    }
+    args.chat = telegramChat(args.chat);
+    if (typeof args.file !== "string" || !args.file) throw new Error("file is required");
+    const v = validateMediaFile(args.file, ["mp4", "mov", "webm", "jpg", "png", "webp"]);
+    args.file = v.path;
+    if (args.caption !== undefined) {
+      if (typeof args.caption !== "string" || args.caption.length > 4096) throw new Error("Caption must be at most 4096 characters");
+    }
+  }
+  if (job.action === "tgCreateChannel") {
+    const args = job.args as Record<string, unknown>;
+    for (const k of Object.keys(args)) {
+      if (!["title", "description"].includes(k)) throw new Error(`Unknown tgCreateChannel option: ${k}`);
+    }
+    if (typeof args.title !== "string" || !args.title.trim() || args.title.length > 128) throw new Error("Channel title must be between 1 and 128 characters");
+    if (args.description !== undefined && (typeof args.description !== "string" || args.description.length > 255)) {
+      throw new Error("Channel description must be at most 255 characters");
+    }
   }
   if (job.key !== undefined && (typeof job.key !== "string" || !job.key)) throw new Error("--key must be a nonempty string");
   if (job.notBefore !== undefined && (typeof job.notBefore !== "string" || !Number.isFinite(Date.parse(job.notBefore)))) throw new Error("--not-before must be a valid ISO date");

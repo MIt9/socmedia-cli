@@ -6,7 +6,7 @@ import { isAbsolute, join, relative, resolve, sep } from "node:path";
 export const isPrivateHost = (h: string) => /^(localhost|.*\.(local|internal|localdomain))$/i.test(h)
   || /^(127\.|10\.|0\.|169\.254\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/.test(h) || h.startsWith("[");
 
-export const isMediaHost = (h: string) => /\.(cdninstagram\.com|fbcdn\.net)$/i.test(String(h));
+export const isMediaHost = (h: string) => /\.(cdninstagram\.com|fbcdn\.net|tiktokcdn\.com|tiktokcdn-us\.com|byteoversea\.com|ibytedtos\.com)$/i.test(String(h));
 
 export const NOT_VIDEO_BRANDS = /^(avif|avis|heic|heix|hevc|hevx|mif1|msf1|M4A |M4B )$/;
 export function mediaExt(b: Buffer): "jpg" | "png" | "webp" | "mp4" | null {

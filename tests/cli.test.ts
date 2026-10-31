@@ -871,6 +871,17 @@ test("youtube commands enforce channel allowlist, confirm gate and inspect studi
     expect(parsedPreview.uploaded).toBe(false);
     expect(parsedPreview.preview.title).toBe("Test Video");
 
+    const defaultTitleRes = await run("youtube", "upload", testVideo, "--json");
+    expect(defaultTitleRes.exit).toBe(0);
+    const parsedDefault = JSON.parse(defaultTitleRes.stdout);
+    expect(parsedDefault.preview.title).toBe("test.mp4");
+
+    const confirmRes = await run("youtube", "upload", testVideo, "--confirm", "--json");
+    expect(confirmRes.exit).not.toBe(0);
+    const parsedConfirm = JSON.parse(confirmRes.stderr);
+    expect(parsedConfirm.code).toBe("NOT_IMPLEMENTED");
+    expect(parsedConfirm.uploaded).toBe(false);
+
     const id = "h".repeat(32);
     const pairing = JSON.parse((await run("extension", "pair", "--id", id, "--json")).stdout);
     const started = JSON.parse((await run("service", "start", "--json")).stdout);
@@ -2685,4 +2696,26 @@ test("service 'extension reload' command sends {type:'reload'} to the connected 
   // extension side (static check; real Chrome not exercised): handler exists, requires the verified server, calls chrome.runtime.reload
   const bg = await readFile(join(import.meta.dir, "../extension/background.js"), "utf8");
   expect(bg).toMatch(/verified && message\.type === "reload"[^}]*chrome\.runtime\.reload\(\)/s);
+});
+
+test("extension sendMessage throws NOT_IMPLEMENTED without touching the page", async () => {
+  const script = await Bun.file(new URL("../extension/background.js", import.meta.url)).text();
+  let touchedPage = false;
+  const chrome = {
+    tabs: {
+      get: async () => { touchedPage = true; return { id: 1, url: "https://www.instagram.com/" }; },
+      update: async () => { touchedPage = true; },
+      query: async () => [],
+    },
+    scripting: { executeScript: async () => { touchedPage = true; return []; } },
+    storage: { local: { get: async () => ({}), set: async () => {} }, onChanged: { addListener() {} } },
+    tabGroups: { query: async () => [] },
+    alarms: { create() {}, onAlarm: { addListener() {} } },
+    runtime: { onStartup: { addListener() {} } },
+  };
+  const context = { chrome, WebSocket, console, URL, setTimeout, clearTimeout, Date, Math };
+  runInNewContext(script, context);
+  await expect(runInNewContext('sendMessage({ to: "https://instagram.com/user", text: "hello" })', context))
+    .rejects.toThrow(/^NOT_IMPLEMENTED:/);
+  expect(touchedPage).toBe(false);
 });
