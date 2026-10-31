@@ -8,10 +8,10 @@ socmedia (CLI)  --HTTP+токен-->  локальний сервіс (Bun)  --W
 
 Сервіс — єдиний власник черги (SQLite), стану зупинки (HALT), відновлення завдань та з'єднання з розширенням.
 
-> **Статус реалізації (v0.10.0):**
-> - Реалізовано й перевірено автоматичними тестами: життєвий цикл сервісу, SQLite-черга з відновленням незавершених завдань після перезапуску та обриву WebSocket, сполучення розширення (HMAC-SHA256, фіксований ID), керування вкладками (`tabs list|use|clear`), читання сторінки й snapshot (`page read|snapshot`), скриншоти сторінки, постів, профілів та елементів (`screenshot`), пошук на Instagram і Facebook (`search`), читання профілів Instagram і Facebook (`profile get`), читання списку постів профілю (`profile posts`), завантаження повного профілю з медіа та markdown-звітом (`profile download`), деталі постів Instagram і Facebook із завантаженням медіа (`post get` з `--download`/`--slides`), локальні контакти (`contacts list|update|export`), коментарі до постів Instagram та Facebook (`post comments`).
+> **Статус реалізації (v0.12.0):**
+> - Реалізовано й перевірено автоматичними тестами: життєвий цикл сервісу, SQLite-черга з відновленням незавершених завдань після перезапуску та обриву WebSocket, сполучення розширення (HMAC-SHA256, фіксований ID), керування вкладками (`tabs list|use|clear`), читання сторінки й snapshot (`page read|snapshot`), скриншоти сторінки, постів, профілів та елементів (`screenshot`), пошук на Instagram і Facebook (`search`), читання профілів Instagram і Facebook (`profile get`), читання списку постів профілю (`profile posts`), завантаження повного профілю з медіа та markdown-звітом (`profile download`), деталі постів Instagram і Facebook із завантаженням медіа (`post get` з `--download`/`--slides`), локальні контакти (`contacts list|update|export`), коментарі до постів Instagram та Facebook (`post comments`), читання розмов та інбоксу (`inbox list|read`), прямі повідомлення із захисними рейками (`message send` з preview gate, добовим лімітом, захистом від дублікатів за 7 днів та інтервалами слотів), інтеграція YouTube Studio (`youtube channel`, `youtube studio status`, `youtube upload` з allowlist каналів та preview gate), збірка автономного бінарника (`bun run build`).
 > - **Не перевірено наживо:** живий Chrome, реальні сайти Instagram, Facebook та YouTube ще не перевірялися.
-> - **Ще не реалізовано:** повідомлення inbox (`inbox list|read`, `message send`), YouTube через Studio UI.
+> - **У розробці:** імпорт старих контактів та історії повідомлень зі старого проєкту (`contacts import`), прямі команди кліку та скролу браузера (`browser click|scroll`).
 
 ## Швидкий старт
 
@@ -43,4 +43,9 @@ socmedia (CLI)  --HTTP+токен-->  локальний сервіс (Bun)  --W
 - `socmedia profile get <url>` — читання профілю Instagram або Facebook та збереження у контакти.
 - `socmedia profile posts <url> [--limit N]` — читання списку постів профілю Instagram або Facebook.
 - `socmedia post comments <url> [--limit N]` — читання коментарів поста, відео або reel Instagram та Facebook (розгортання через Chrome debugger).
+- `socmedia search <platform> <query> [options]` — пошук профілів, сторінок або хештегів на Instagram та Facebook.
+- `socmedia screenshot [options]` — створення скриншота viewport, поста, профілю або довільного елемента.
+- `socmedia inbox <list|read>` — перегляд списку розмов або читання повідомлень інбоксу Instagram/Facebook.
+- `socmedia message send --to <URL> --text <TEXT> [--confirm]` — відправка прямого повідомлення з лімітами безпеки та dry-run preview.
+- `socmedia youtube <channel|studio status|upload>` — робота з YouTube Studio, перевірка каналів проти allowlist та завантаження чернеток відео.
 - `socmedia contacts <list|update|export>` — перегляд, оновлення нотаток/статусів та експорт контактів у CSV/JSON/JSONL.
