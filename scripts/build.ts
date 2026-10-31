@@ -51,6 +51,7 @@ try {
     const bin = join(stage, arch, "socmedia");
     mkdirSync(join(stage, arch));
     run(["bun", "build", "--compile", `--target=bun-darwin-${arch}`, "--define", `EXT_BUNDLE_JSON=${JSON.stringify(bundle)}`, "src/cli.ts", "--outfile", bin]);
+    if (process.platform === "darwin") run(["codesign", "-s", "-", "-f", bin]);
     chmodSync(bin, 0o755);
     const name = `socmedia-${pkg.version}-darwin-${arch}.tar.gz`;
     run(["tar", "-czf", join(dist, name), "-C", join(stage, arch), "socmedia"]);

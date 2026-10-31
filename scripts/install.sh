@@ -75,6 +75,7 @@ if [ -e "$TARGET" ]; then # keep the previous binary for rollback
 fi
 mv -f "$TARGET.new.$$" "$TARGET"
 xattr -d com.apple.quarantine "$TARGET" 2>/dev/null || true # unsigned binary: harmless if the attribute is absent
+codesign -s - -f "$TARGET" 2>/dev/null || true
 
 echo
 "$TARGET" extension install
