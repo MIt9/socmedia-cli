@@ -666,6 +666,166 @@ test("profile download orchestrates profile, screenshot, posts and saves markdow
   }
 });
 
+test("inbox and thread extraction parses messages and threads with HALT checks", async () => {
+  const script = await Bun.file(new URL("../extension/background.js", import.meta.url)).text();
+  const tab = { id: 42, windowId: 4, active: true, status: "complete", url: "https://www.instagram.com/direct/inbox/" };
+  const location = { href: tab.url, pathname: "/direct/inbox/", hostname: "www.instagram.com" };
+
+  const igThreadEl = {
+    innerText: "Alex Smith\nHello there · 2h\nUnread",
+    querySelector: (sel: string) => sel.includes("/direct/t/") ? { href: "https://www.instagram.com/direct/t/123456789/" } : null,
+  };
+
+  const composerEl = {
+    getAttribute: () => "Message...",
+    closest: () => null,
+    parentElement: null,
+  };
+
+  const msgBubble = {
+    tagName: "DIV",
+    innerText: "Hi from user",
+    textContent: "Hi from user",
+    clientHeight: 20,
+    closest: () => null,
+    querySelector: () => null,
+    querySelectorAll: () => [],
+    getBoundingClientRect: () => ({ left: 200, width: 100 }),
+  };
+
+  const chatRoot: any = {
+    getAttribute: () => "Alex Smith",
+    getBoundingClientRect: () => ({ left: 0, width: 600 }),
+    querySelectorAll: () => [msgBubble],
+  };
+  composerEl.parentElement = chatRoot;
+
+  const documentIg = {
+    body: { innerText: "" },
+    querySelector: () => null,
+    querySelectorAll: (sel: string) => {
+      if (sel.includes("[role=button]")) return [igThreadEl];
+      if (sel.includes("contenteditable") || sel.includes("textarea")) return [composerEl];
+      return [];
+    },
+  };
+
+  const ignore = { addListener() {} };
+  const chrome = {
+    storage: { local: { get: async () => ({ cliSelectedTab: 42 }), set: async () => {} }, onChanged: ignore },
+    tabs: { get: async () => tab, query: async () => [tab], update: async (_: any, u: any) => Object.assign(tab, u) },
+    tabGroups: { query: async () => [] },
+    scripting: { executeScript: async () => [] },
+    alarms: { create: () => {}, onAlarm: ignore },
+    runtime: { onStartup: ignore },
+  };
+
+  const contextIg = { chrome, WebSocket, console, URL, document: documentIg, location, window: { devicePixelRatio: 1 } };
+  runInNewContext(script, contextIg);
+
+  const inbox = runInNewContext('pgScrapeInbox("ig", 10)', contextIg);
+  expect(inbox).toEqual([
+    { name: "Alex Smith", url: "https://www.instagram.com/direct/t/123456789/", snippet: "Hello there", time: "2h", unread: true },
+  ]);
+
+  const thread = runInNewContext('pgScrapeThread(10)', contextIg);
+  expect(thread).toEqual([
+    { from: "them", type: "text", text: "Hi from user", time: null },
+  ]);
+
+  tab.url = "https://www.instagram.com/checkpoint/";
+  await expect(runInNewContext('readInbox({platform:"ig"})', contextIg)).rejects.toMatchObject({ code: "HALT" });
+});
+
+test("inbox and message commands enforce safeguards, confirm gate and slot spacing", async () => {
+  const fakeHome = await mkdtemp(join(tmpdir(), "socmedia-inbox-home-"));
+  const stateDir = await mkdtemp(join(tmpdir(), "socmedia-inbox-state-"));
+  const run = async (...args: string[]) => {
+    const cli = Bun.spawn(["bun", "run", "src/cli.ts", ...args], {
+      cwd: import.meta.dir + "/..",
+      env: { ...process.env, HOME: fakeHome, SOCMEDIA_STATE_DIR: stateDir, SOCMEDIA_EXTENSION_PORT: "0" },
+      stdout: "pipe", stderr: "pipe",
+    });
+    const [stdout, stderr, exit] = await Promise.all([new Response(cli.stdout).text(), new Response(cli.stderr).text(), cli.exited]);
+    return { stdout, stderr, exit };
+  };
+  let pid: number | undefined;
+  let ws: WebSocket | undefined;
+  try {
+    const inboxHelp = await run("inbox", "--help");
+    expect(inboxHelp.stdout).toContain("list <platform>");
+    expect(inboxHelp.stdout).toContain("read");
+
+    const msgHelp = await run("message", "--help");
+    expect(msgHelp.stdout).toContain("send");
+    expect(msgHelp.stdout).toContain("--confirm");
+
+    const preview = await run("message", "send", "--to", "https://instagram.com/nasa/", "--text", "Hello NASA", "--json");
+    expect(preview.exit).toBe(0);
+    const parsedPreview = JSON.parse(preview.stdout);
+    expect(parsedPreview.sent).toBe(false);
+    expect(parsedPreview.preview).toMatchObject({ platform: "ig", to: "https://www.instagram.com/nasa/", text: "Hello NASA" });
+
+    expect((await run("message", "send", "--to", "https://instagram.com/nasa/", "--text", "", "--confirm", "--json")).exit).not.toBe(0);
+    expect((await run("message", "send", "--to", "https://instagram.com/nasa/", "--text", "x".repeat(1001), "--confirm", "--json")).exit).not.toBe(0);
+
+    const id = "g".repeat(32);
+    const pairing = JSON.parse((await run("extension", "pair", "--id", id, "--json")).stdout);
+    const started = JSON.parse((await run("service", "start", "--json")).stdout);
+    pid = started.pid;
+    ws = new WebSocket(`ws://127.0.0.1:${started.extension.port}/extension`, { headers: { Origin: `chrome-extension://${id}` } } as unknown as string[]);
+    await authenticateMock(ws, pairing.token);
+
+    ws.onmessage = (event) => {
+      const request = JSON.parse(String(event.data));
+      if (request.action === "readInbox") {
+        ws!.send(JSON.stringify({
+          type: "result", id: request.id,
+          result: { platform: "ig", threads: [{ name: "NASA", url: "https://instagram.com/direct/t/123/", snippet: "Hello", time: "1h", unread: false }] },
+        }));
+      } else if (request.action === "readThread") {
+        ws!.send(JSON.stringify({
+          type: "result", id: request.id,
+          result: { platform: "ig", url: "https://instagram.com/direct/t/123/", messages: [{ from: "them", type: "text", text: "Welcome", time: "2026-10-31" }] },
+        }));
+      } else if (request.action === "sendMessage") {
+        ws!.send(JSON.stringify({
+          type: "result", id: request.id,
+          result: { sent: true, verified: true, to: request.args?.to, threadUrl: "https://instagram.com/direct/t/123/" },
+        }));
+      }
+    };
+
+    const listRes = await run("inbox", "list", "ig", "--json");
+    expect(listRes.exit).toBe(0);
+    expect(JSON.parse(listRes.stdout).threads.length).toBe(1);
+
+    const readRes = await run("inbox", "read", "--to", "https://instagram.com/nasa/", "--json");
+    expect(readRes.exit).toBe(0);
+    expect(JSON.parse(readRes.stdout).messages[0].text).toBe("Welcome");
+
+    const sendRes = await run("message", "send", "--to", "https://instagram.com/nasa/", "--text", "Hello NASA", "--confirm", "--json");
+    expect(sendRes.exit).toBe(0);
+    const sentParsed = JSON.parse(sendRes.stdout);
+    expect(sentParsed.sent).toBe(true);
+
+    const dupRes = await run("message", "send", "--to", "https://instagram.com/nasa/", "--text", "Hello NASA", "--confirm", "--json");
+    expect(dupRes.exit).not.toBe(0);
+    expect(dupRes.stderr).toContain("7-day rule");
+  } finally {
+    ws?.close();
+    if (pid) {
+      try { process.kill(pid, "SIGTERM"); } catch {}
+      for (let i = 0; i < 100; i++) {
+        try { process.kill(pid, 0); } catch { break; }
+        await Bun.sleep(20);
+      }
+    }
+    await rm(stateDir, { recursive: true, force: true });
+    await rm(fakeHome, { recursive: true, force: true });
+  }
+});
+
 test("screenshot command validates arguments, writes PNG file inside home, and records queued job", async () => {
   const fakeHome = await mkdtemp(join(tmpdir(), "socmedia-screenshot-home-"));
   const stateDir = await mkdtemp(join(tmpdir(), "socmedia-screenshot-state-"));

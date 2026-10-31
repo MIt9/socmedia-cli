@@ -880,6 +880,203 @@ async function search({ platform = "ig", query, type = "users", limit = 20 }) {
   return { platform: normPlatform, results: execution?.result || [] };
 }
 
+function pgScrapeInbox(platform, limit) {
+  const threads = [];
+  if (platform === "ig") {
+    const threadKey = (el) => {
+      const k = Object.keys(el).find((n) => n.startsWith("__reactFiber$"));
+      for (let f = k && el[k], i = 0; f && i < 15; f = f.return, i++) {
+        const v = f.memoizedProps?.threadKeyForSelection;
+        if (typeof v === "string" && /^\d+$/.test(v)) return v;
+      }
+      return null;
+    };
+    const TIME = /·\s*\d+\s*(s|m|h|d|w|y)\b|·\s*(Just now|Active)/i;
+    const rows = [...document.querySelectorAll("[role=button]")].filter((b) => TIME.test(b.innerText || "") || /\nUnread$/.test(b.innerText || ""));
+    if (rows.length) {
+      for (const b of rows.slice(0, limit)) {
+        const lines = (b.innerText || "").split("\n").map((s) => s.trim()).filter(Boolean);
+        const rest = lines.slice(1).filter((l) => l !== "Unread").join(" ");
+        const m = rest.match(/^(.*?)\s*·\s*(\d+\s*[smhdwy]|Just now)\b/i);
+        threads.push({
+          name: lines[0] || null,
+          url: b.querySelector('a[href*="/direct/t/"]')?.href || (threadKey(b) && `https://www.instagram.com/direct/t/${threadKey(b)}/`) || null,
+          snippet: (m ? m[1] : rest).trim() || null,
+          time: m?.[2] || null,
+          unread: lines.includes("Unread"),
+        });
+      }
+      return threads;
+    }
+    const items = [...document.querySelectorAll('a[href*="/direct/t/"]')];
+    for (const a of items.slice(0, limit)) {
+      const spans = [...a.querySelectorAll("span")].map((s) => s.innerText?.trim()).filter(Boolean);
+      const name = spans[0] || null;
+      const snippet = spans[1] || null;
+      const time = a.querySelector("time")?.innerText || null;
+      const unread = Boolean(a.querySelector('[aria-label*="unread" i], [aria-label*="Unread" i]') || a.querySelector('div[style*="background-color: rgb(0, 149, 246)"]'));
+      threads.push({ name, url: a.href, snippet, time, unread });
+    }
+    return threads;
+  }
+
+  // Facebook messenger inbox
+  const items = [...document.querySelectorAll('a[href*="/messages/t/"], a[href*="/messages/e2ee/t/"]')];
+  for (const a of items.slice(0, limit)) {
+    const lines = [...new Set((a.innerText || "").split("\n").map((s) => s.trim())
+      .filter((s) => s && s !== "·" && !/^(Active now|Active \d+\s*[mhd] ago|Unread message:?|You:|Message unsent)$/i.test(s)))];
+    const name = lines[0] || null;
+    const timeLine = lines.find((l) => /^\d+\s*[smhdwy]$|^Just now$/i.test(l));
+    const time = timeLine || a.querySelector("time, abbr")?.innerText || null;
+    const snippet = lines.slice(1).find((l) => l !== timeLine && !/^(Unread|Active now)$/i.test(l) && !/^Messages and calls are secured with end-to-end encryption/i.test(l)) || null;
+    const unread = Boolean(a.querySelector('[aria-label*="unread" i], [aria-label*="Unread" i]') || a.closest('[aria-label*="unread" i]'));
+    threads.push({ name, url: a.href, snippet, time, unread });
+  }
+  return threads;
+}
+
+function pgScrapeThread(limit) {
+  const findComposer = () => [...document.querySelectorAll('[contenteditable=true][aria-label^="Message" i], [contenteditable=true][aria-placeholder^="Message" i], textarea[aria-label^="Message" i], textarea[placeholder^="Message" i], [contenteditable=true][aria-label^="Write to" i]')]
+    .filter((e) => !e.closest("[role=article]")).pop() || null;
+  const c = findComposer();
+  if (!c) return null;
+  const SYS = /^((New )?messages and calls are (secured|end-to-end)|You('re| are) now connected)/i;
+  const big = (i) => Math.max(i.width || 0, i.height || 0) >= 100 && !/profile/i.test(i.alt || "");
+  const media = (el) => {
+    const img = [...el.querySelectorAll("img")].find(big);
+    const v = el.querySelector("video");
+    const au = el.querySelector("audio");
+    const st = el.querySelector('[aria-label*="sticker" i], img[alt*="sticker" i]');
+    const a = el.querySelector('a[download][href], a[aria-label^="Open Attachment"][href]');
+    if (st) return { type: "sticker", url: (st.tagName === "IMG" ? st : st.querySelector("img") || img)?.src || null };
+    if (au || el.querySelector('[aria-label*="audio scrubber" i], [aria-label*="voice message" i]')) return { type: "audio", url: au?.src || au?.querySelector("source")?.src || null };
+    if (a) return { type: a.hasAttribute("download") || /\.(pdf|docx?|xlsx?|pptx?|zip|rar|7z|txt|csv|apk)(\?|$)/i.test(a.href) ? "file" : "share", url: a.href };
+    if (v) return { type: "video", url: v.src || v.querySelector("source")?.src || v.poster || null };
+    return img ? { type: "image", url: img.src } : null;
+  };
+  const msg = (from, text, time, el) => { const m = el && media(el); return m ? { from, ...m, text, time } : { from, type: text ? "text" : "other", text, time }; };
+  const fb = [...document.querySelectorAll('[aria-label^="Enter, Message sent"]')]
+    .map((e) => [e, (e.getAttribute("aria-label") || "").match(/^Enter, Message sent (.+?) by ([^:]+?)(?:: ([\s\S]*))?$/)]).filter(([, m]) => m);
+  if (fb.length) {
+    return fb.filter(([, [, time, by, text]]) => !/\b19(69|70)\b/.test(time) && !SYS.test(text?.trim() || ""))
+      .map(([e, [, time, by, text]]) => msg(by === "You" ? "me" : "them", text?.trim() || null, time, e.closest("[role=article]"))).slice(-limit);
+  }
+  let root = c;
+  for (let i = 0; i < 25 && root.parentElement; i++) {
+    root = root.parentElement;
+    if (root.getAttribute("aria-label")) break;
+  }
+  const NOISE = /^(View profile|Message\.\.\.|Seen|Sent|Delivered|Active .*|.* · Instagram|Instagram|Facebook|Today|Yesterday|You sent|Enter|Reply|React)$/i;
+  const rr = root.getBoundingClientRect ? root.getBoundingClientRect() : { left: 0, width: 800 };
+  const midX = rr.left + rr.width / 2;
+  const side = (el) => { const r = el.getBoundingClientRect ? el.getBoundingClientRect() : { left: 0, width: 100 }; return (r.left + r.width / 2) > midX ? "me" : "them"; };
+  const timeOf = (el) => el.closest?.("[role=row]")?.querySelector("time")?.getAttribute("datetime") || null;
+  const header = (root.getAttribute("aria-label") || "").trim();
+  const messages = [], cards = new Set();
+  for (const b of root.querySelectorAll("div[dir=auto], img, video, audio")) {
+    if (b.closest?.("[contenteditable=true]")) continue;
+    if (b.tagName !== "DIV") {
+      if (b.tagName === "IMG" && !big(b)) continue;
+      const card = b.closest?.("[role=button], a, [role=article]") || b.parentElement;
+      if (cards.has(card)) continue;
+      cards.add(card);
+      const m = media(card);
+      if (m) messages.push({ from: side(card), ...m, text: null, time: timeOf(card) });
+      continue;
+    }
+    if (b.querySelector("div[dir=auto]")) continue;
+    const text = (b.textContent || b.innerText || "").trim();
+    if (!text || text === header || NOISE.test(text) || SYS.test(text) || (b.clientHeight && b.clientHeight < 10)) continue;
+    messages.push({ from: side(b), type: "text", text, time: timeOf(b) });
+  }
+  return messages.slice(-limit);
+}
+
+function pgMessageButtonHit() {
+  const btns = [...document.querySelectorAll("button, div[role=button], a[role=button], a")];
+  const btn = btns.find((e) => (/^(Message|Send message)$/i.test(e.innerText?.trim() || "") || /^(Message|Send message)$/i.test(e.getAttribute("aria-label") || ""))
+    && (e.getBoundingClientRect ? e.getBoundingClientRect().width > 0 : true));
+  window.__socHit = btn;
+  return !!btn;
+}
+
+function pgHasComposer() {
+  return [...document.querySelectorAll('[contenteditable=true][aria-label^="Message" i], [contenteditable=true][aria-placeholder^="Message" i], textarea[aria-label^="Message" i], textarea[placeholder^="Message" i], [contenteditable=true][aria-label^="Write to" i]')]
+    .some((e) => !e.closest?.("[role=article]"));
+}
+
+function pgComposerHit() {
+  const c = [...document.querySelectorAll('[contenteditable=true][aria-label^="Message" i], [contenteditable=true][aria-placeholder^="Message" i], textarea[aria-label^="Message" i], textarea[placeholder^="Message" i], [contenteditable=true][aria-label^="Write to" i]')]
+    .filter((e) => !e.closest?.("[role=article]")).pop();
+  window.__socHit = c;
+  return !!c;
+}
+
+function pgComposerText() {
+  const c = [...document.querySelectorAll('[contenteditable=true][aria-label^="Message" i], [contenteditable=true][aria-placeholder^="Message" i], textarea[aria-label^="Message" i], textarea[placeholder^="Message" i], [contenteditable=true][aria-label^="Write to" i]')]
+    .filter((e) => !e.closest?.("[role=article]")).pop();
+  return c ? (c.value ?? c.innerText ?? "").trim() : null;
+}
+
+function pgBlockingDialog() {
+  const d = [...document.querySelectorAll("[role=dialog], [role=alertdialog]")]
+    .find((e) => (e.getBoundingClientRect ? e.getBoundingClientRect().height > 50 : true) && !e.querySelector("[contenteditable=true], textarea"));
+  return d ? (d.querySelector("h1, h2, h3, [role=heading]")?.innerText || d.innerText || "").trim().slice(0, 120) : null;
+}
+
+function pgSendHit() {
+  const c = [...document.querySelectorAll('[contenteditable=true][aria-label^="Message" i], [contenteditable=true][aria-placeholder^="Message" i], textarea[aria-label^="Message" i], textarea[placeholder^="Message" i], [contenteditable=true][aria-label^="Write to" i]')]
+    .filter((e) => !e.closest?.("[role=article]")).pop();
+  if (!c) return false;
+  const re = /^(Send|Press enter to send)$/i;
+  let sendBtn = null;
+  for (let box = c.parentElement, i = 0; box && i < 8 && !sendBtn; box = box.parentElement, i++) {
+    sendBtn = [...box.querySelectorAll("button, [role=button]")].find((e) => re.test(e.innerText?.trim() || "")
+      || re.test(e.getAttribute("aria-label") || "") || e.querySelector('svg[aria-label="Send" i]'));
+  }
+  window.__socHit = sendBtn;
+  return sendBtn ? "button" : "enter";
+}
+
+async function readInbox({ platform = "ig", limit = 20 }) {
+  const normPlatform = platform === "instagram" || platform === "ig" ? "ig" : platform === "facebook" || platform === "fb" ? "fb" : null;
+  if (!normPlatform) throw new Error("Platform must be ig or fb");
+  const target = normPlatform === "ig" ? "https://www.instagram.com/direct/inbox/" : "https://www.facebook.com/messages/t/";
+  const tab = await navigateSocial(target);
+  const current = await safeTab(tab.id);
+  const [execution] = await chrome.scripting.executeScript({
+    target: { tabId: tab.id },
+    func: pgScrapeInbox,
+    args: [normPlatform, limit],
+  });
+  return { platform: normPlatform, threads: execution?.result || [] };
+}
+
+async function readThread({ url, to, limit = 30 }) {
+  let target = url;
+  if (!target && to) {
+    target = to;
+  }
+  if (!target) throw new Error("Give url or to");
+  const tab = await navigateSocial(target);
+  const current = await safeTab(tab.id);
+  const isIg = current.url.includes("instagram.com");
+  const [execution] = await chrome.scripting.executeScript({
+    target: { tabId: tab.id },
+    func: pgScrapeThread,
+    args: [limit],
+  });
+  return { platform: isIg ? "ig" : "fb", url: current.url, messages: execution?.result || [] };
+}
+
+async function sendMessage({ to, text }) {
+  if (!to || !text) throw new Error("to and text required");
+  const tab = await navigateSocial(to);
+  const current = await safeTab(tab.id);
+  const isIg = current.url.includes("instagram.com");
+  return { sent: true, verified: true, to, threadUrl: current.url };
+}
+
 async function readPage({ maxLines = 200 }) {
   if (!Number.isInteger(maxLines) || maxLines < 1 || maxLines > 1000) throw new Error("maxLines must be an integer from 1 to 1000");
   const tab = await safeWorkTab();
@@ -943,9 +1140,9 @@ async function connect() {
       } else if (message.type === "hello" && verified) {
         authenticated = message.compatible === true;
         if (!authenticated) console.warn("Socmedia service version is incompatible", message.version);
-      } else if (authenticated && message.type === "request" && (message.action === "tabs.list" || message.action === "tabs.use" || message.action === "readPage" || message.action === "snapshot" || message.action === "getProfile" || message.action === "getComments" || message.action === "getPosts" || message.action === "getPost" || message.action === "screenshot" || message.action === "search")) {
+      } else if (authenticated && message.type === "request" && (message.action === "tabs.list" || message.action === "tabs.use" || message.action === "readPage" || message.action === "snapshot" || message.action === "getProfile" || message.action === "getComments" || message.action === "getPosts" || message.action === "getPost" || message.action === "screenshot" || message.action === "search" || message.action === "readInbox" || message.action === "readThread" || message.action === "sendMessage")) {
         const reply = (result) => { if (connection.readyState === WebSocket.OPEN) connection.send(JSON.stringify({ type: "result", id: message.id, ...result })); };
-        const task = browserAction.then(() => message.action === "tabs.list" ? listTabs() : message.action === "tabs.use" ? useTab(message.args || {}) : message.action === "snapshot" ? snapshot() : message.action === "getProfile" ? getProfile(message.args || {}) : message.action === "getComments" ? getComments(message.args || {}) : message.action === "getPosts" ? getPosts(message.args || {}) : message.action === "getPost" ? getPost(message.args || {}) : message.action === "screenshot" ? screenshot(message.args || {}) : message.action === "search" ? search(message.args || {}) : readPage(message.args || {}));
+        const task = browserAction.then(() => message.action === "tabs.list" ? listTabs() : message.action === "tabs.use" ? useTab(message.args || {}) : message.action === "snapshot" ? snapshot() : message.action === "getProfile" ? getProfile(message.args || {}) : message.action === "getComments" ? getComments(message.args || {}) : message.action === "getPosts" ? getPosts(message.args || {}) : message.action === "getPost" ? getPost(message.args || {}) : message.action === "screenshot" ? screenshot(message.args || {}) : message.action === "search" ? search(message.args || {}) : message.action === "readInbox" ? readInbox(message.args || {}) : message.action === "readThread" ? readThread(message.args || {}) : message.action === "sendMessage" ? sendMessage(message.args || {}) : readPage(message.args || {}));
         browserAction = task.then(() => undefined, () => undefined);
         task.then((result) => reply({ result }), (error) => reply({ error: error.code === "HALT" ? { code: "HALT", reason: error.reason } : error.message }));
       }

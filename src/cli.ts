@@ -73,9 +73,48 @@ const compatibleVersion = (version: string) => {
   const current = /^(\d+)\.(\d+)\.(\d+)$/.exec(extensionVersion);
   return !!requested && !!current && requested[1] === current[1] && requested[2] === current[2];
 };
-const actions = new Set(["getProfile", "getPosts", "getPost", "getComments", "search", "screenshot", "readInbox", "readThread", "readPage", "snapshot", "scroll", "listTabs", "useTab", "ytStudioRead", "click", "downloadProfile"]);
+const actions = new Set(["getProfile", "getPosts", "getPost", "getComments", "search", "screenshot", "readInbox", "readThread", "sendMessage", "readPage", "snapshot", "scroll", "listTabs", "useTab", "ytStudioRead", "click", "downloadProfile"]);
 const contactStatuses = ["new", "messaged", "replied", "won", "rejected", "skip"];
 const contactColumns = ["id", "platform", "username", "name", "status", "followers", "following", "postsCount", "verified", "private", "isBusiness", "category", "website", "email", "phone", "bio", "url", "note", "firstSeen", "lastSeen", "updatedAt"];
+
+const MAX_LEN = 1000;
+const GAP_MS = 90e3;
+const JITTER_MS = 60e3;
+const DUP_MS = 7 * 24 * 3600e3;
+const DEFAULT_CAP = 20;
+
+function capFromEnv(v = process.env.SOCMEDIA_MAX_MESSAGES_PER_DAY) {
+  if (v === undefined || v === null || String(v).trim() === "") return DEFAULT_CAP;
+  const n = Number(v);
+  return Number.isInteger(n) && n >= 0 ? n : DEFAULT_CAP;
+}
+
+function checkMessageText(text: unknown): string {
+  const t = typeof text === "string" ? text.trim() : "";
+  if (!t) throw new Error("Message text is empty");
+  const len = [...t].length;
+  if (len > MAX_LEN) throw new Error(`Message is too long (${len} > ${MAX_LEN} characters)`);
+  return t;
+}
+
+function parseMessageTarget(to: unknown): { platform: "ig" | "fb"; url: string } {
+  if (typeof to !== "string") throw new Error("Message recipient is required");
+  let u: URL;
+  try { u = new URL(to); } catch { throw new Error("Invalid recipient URL"); }
+  const host = u.hostname.toLowerCase();
+  const isIg = host.includes("instagram.com");
+  const isFb = host.includes("facebook.com") || host.includes("fb.com");
+  if (!isIg && !isFb) throw new Error("Provide an Instagram or Facebook recipient URL");
+  const isThread = to.includes("/direct/t/") || /\/messages\/(e2ee\/)?t\//.test(to);
+  if (isThread) return { platform: isIg ? "ig" : "fb", url: to };
+  return { platform: isIg ? "ig" : "fb", url: profileUrl(to) };
+}
+
+function previewUnlessConfirmed({ to, text, confirm }: { to: unknown; text: unknown; confirm?: boolean }) {
+  const { platform, url } = parseMessageTarget(to);
+  const t = checkMessageText(text);
+  return confirm === true ? null : { preview: { platform, to: url, text: t }, sent: false };
+}
 
 function csvCell(value: unknown) {
   let text = value == null ? "" : String(value);
@@ -586,6 +625,36 @@ function validateJob(value: unknown) {
       resolveHomePath(args.dir);
     }
   }
+  if (job.action === "readInbox") {
+    const args = job.args as Record<string, unknown>;
+    for (const key of Object.keys(args)) {
+      if (!["platform", "limit"].includes(key)) throw new Error(`Unknown readInbox option: ${key}`);
+    }
+    if (typeof args.platform !== "string") throw new Error("Platform is required");
+    const norm = { ig: "ig", instagram: "ig", fb: "fb", facebook: "fb" }[args.platform.toLowerCase()];
+    if (!norm) throw new Error("Platform must be ig or fb");
+    args.platform = norm;
+    if (args.limit !== undefined && (!Number.isInteger(args.limit) || Number(args.limit) < 1 || Number(args.limit) > 100)) throw new Error("Limit must be an integer from 1 to 100");
+  }
+  if (job.action === "readThread") {
+    const args = job.args as Record<string, unknown>;
+    for (const key of Object.keys(args)) {
+      if (!["url", "to", "limit"].includes(key)) throw new Error(`Unknown readThread option: ${key}`);
+    }
+    if (!args.url && !args.to) throw new Error("Give url or to");
+    if (args.url !== undefined && typeof args.url !== "string") throw new Error("url must be a string");
+    if (args.to !== undefined && typeof args.to !== "string") throw new Error("to must be a string");
+    if (args.limit !== undefined && (!Number.isInteger(args.limit) || Number(args.limit) < 1 || Number(args.limit) > 100)) throw new Error("Limit must be an integer from 1 to 100");
+  }
+  if (job.action === "sendMessage") {
+    const args = job.args as Record<string, unknown>;
+    for (const key of Object.keys(args)) {
+      if (!["to", "text"].includes(key)) throw new Error(`Unknown sendMessage option: ${key}`);
+    }
+    const parsed = parseMessageTarget(args.to);
+    args.to = parsed.url;
+    args.text = checkMessageText(args.text);
+  }
   if (job.key !== undefined && (typeof job.key !== "string" || !job.key)) throw new Error("--key must be a nonempty string");
   if (job.notBefore !== undefined && (typeof job.notBefore !== "string" || !Number.isFinite(Date.parse(job.notBefore)))) throw new Error("--not-before must be a valid ISO date");
   return job;
@@ -687,7 +756,7 @@ async function queueRequest(command: string): Promise<unknown> {
   });
 }
 
-async function runPageJob(action: "snapshot" | "readPage" | "getProfile" | "getComments" | "getPosts" | "getPost" | "screenshot" | "search", args: Record<string, unknown>): Promise<unknown> {
+async function runPageJob(action: "snapshot" | "readPage" | "getProfile" | "getComments" | "getPosts" | "getPost" | "screenshot" | "search" | "readInbox" | "readThread" | "sendMessage", args: Record<string, unknown>): Promise<unknown> {
   const current = await status();
   if (!current.running) throw new Error("Service not running");
   if (current.halted) {
@@ -746,9 +815,10 @@ if (Bun.argv[2] === "--service-daemon") {
   db.run("CREATE TABLE IF NOT EXISTS jobs (id INTEGER PRIMARY KEY, data TEXT NOT NULL)");
   db.run("CREATE TABLE IF NOT EXISTS contacts (id TEXT PRIMARY KEY, data TEXT NOT NULL)");
   db.run("CREATE TABLE IF NOT EXISTS service_state (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+  db.run("CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY, at TEXT NOT NULL, platform TEXT NOT NULL, toUrl TEXT NOT NULL, text TEXT NOT NULL, status TEXT NOT NULL, error TEXT, jobId INTEGER)");
   const haltRow = db.query("SELECT value FROM service_state WHERE key = 'halted'").get() as { value: string } | null;
   let halted: { code: string; reason: string } | null = haltRow ? JSON.parse(haltRow.value) : null;
-  db.run("UPDATE jobs SET data = json_set(data, '$.status', 'queued') WHERE json_extract(data, '$.action') IN ('readPage','snapshot','getProfile','getComments','getPosts','getPost','screenshot','search','downloadProfile') AND json_extract(data, '$.status') = 'running'");
+  db.run("UPDATE jobs SET data = json_set(data, '$.status', 'queued') WHERE json_extract(data, '$.action') IN ('readPage','snapshot','getProfile','getComments','getPosts','getPost','screenshot','search','downloadProfile','readInbox','readThread','sendMessage') AND json_extract(data, '$.status') = 'running'");
   type ExtensionData = { token: string; challenge?: { clientNonce: string; serverNonce: string; version: string } };
   let extensionSocket: Bun.ServerWebSocket<ExtensionData> | null = null;
   let connectedVersion: string | null = null;
@@ -853,7 +923,7 @@ if (Bun.argv[2] === "--service-daemon") {
       })();
     }
     if (browserBusy) return;
-    const rows = db.query("SELECT id, data FROM jobs WHERE json_extract(data, '$.action') IN ('readPage','snapshot','getProfile','getComments','getPosts','getPost','screenshot','search') AND json_extract(data, '$.status') = 'queued' ORDER BY id").all() as { id: number; data: string }[];
+    const rows = db.query("SELECT id, data FROM jobs WHERE json_extract(data, '$.action') IN ('readPage','snapshot','getProfile','getComments','getPosts','getPost','screenshot','search','readInbox','readThread','sendMessage') AND json_extract(data, '$.status') = 'queued' ORDER BY id").all() as { id: number; data: string }[];
     const row = rows.find((candidate) => {
       const job = JSON.parse(candidate.data);
       const at = job.notBefore ? Date.parse(job.notBefore) : 0;
@@ -918,6 +988,40 @@ if (Bun.argv[2] === "--service-daemon") {
         db.transaction(() => {
           if (halt) db.query("INSERT INTO service_state (key, value) VALUES ('halted', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").run(JSON.stringify(halt));
           if (job.status === "done" && job.action === "getProfile") upsertProfileContact(db, reply, job.args.url);
+          if (job.action === "sendMessage") {
+            const nowIso = new Date().toISOString();
+            const parsedTarget = parseMessageTarget(job.args.to);
+            let sendStatus = "failed";
+            let sendError: string | null = job.error ? (typeof job.error === "object" ? job.error.reason : String(job.error)) : null;
+            if (job.status === "done") {
+              const res = reply as { sent?: boolean; verified?: boolean };
+              if (res.sent && res.verified) sendStatus = "sent";
+              else if (res.sent) { sendStatus = "unverified"; sendError = "sent, but unverified"; }
+              else sendStatus = "failed";
+            }
+            db.query("INSERT INTO messages (at, platform, toUrl, text, status, error, jobId) VALUES (?, ?, ?, ?, ?, ?, ?)").run(
+              nowIso, parsedTarget.platform, parsedTarget.url, job.args.text, sendStatus, sendError, row.id
+            );
+            if (sendStatus === "sent" || sendStatus === "unverified") {
+              try {
+                const canonical = profileUrl(parsedTarget.url);
+                const u = new URL(canonical);
+                const p = u.hostname.includes("instagram.com") ? "ig" : "fb";
+                const path = u.pathname.replace(/^\/+|\/+$/g, "");
+                const rel = p === "fb" && path.toLowerCase() === "profile.php" ? `${path}?id=${u.searchParams.get("id")}` : path;
+                const contactId = `${p}:${rel.toLowerCase()}`;
+                const contactRow = db.query("SELECT data FROM contacts WHERE id = ?").get(contactId) as { data: string } | null;
+                if (contactRow) {
+                  const c = JSON.parse(contactRow.data);
+                  if (c.status === "new") {
+                    c.status = "messaged";
+                    c.updatedAt = nowIso;
+                    db.query("UPDATE contacts SET data = ? WHERE id = ?").run(JSON.stringify(c), contactId);
+                  }
+                }
+              } catch {}
+            }
+          }
           db.query("UPDATE jobs SET data = ? WHERE id = ?").run(JSON.stringify(job), row.id);
         })();
       } catch (error) {
@@ -1016,6 +1120,40 @@ if (Bun.argv[2] === "--service-daemon") {
         try {
           const job = validateJob(JSON.parse(command.slice("queue enqueue ".length)));
           const create = db.transaction(() => {
+            if (job.action === "sendMessage") {
+              const msgArgs = job.args as Record<string, unknown>;
+              const parsedTarget = parseMessageTarget(msgArgs.to);
+              const text = checkMessageText(msgArgs.text);
+              const now = Date.now();
+              const cap = capFromEnv();
+              const startOfToday = new Date(new Date().getFullYear(), new Date().getMonth(), new Date().getDate()).toISOString();
+              const usedToday = db.query("SELECT COUNT(*) as count FROM messages WHERE platform = ? AND status IN ('sent', 'unverified') AND at >= ?").get(parsedTarget.platform, startOfToday) as { count: number };
+              if (usedToday.count >= cap) throw new Error(`Daily cap reached: ${usedToday.count} of ${cap} messages on ${parsedTarget.platform} today (SOCMEDIA_MAX_MESSAGES_PER_DAY). Try again tomorrow.`);
+              const sevenDaysAgo = new Date(now - DUP_MS).toISOString();
+              const normInput = text.replace(/\s+/g, " ").trim().toLowerCase();
+              const recent = db.query("SELECT at, toUrl, text FROM messages WHERE platform = ? AND status IN ('sent', 'unverified') AND at >= ?").all(parsedTarget.platform, sevenDaysAgo) as { at: string; toUrl: string; text: string }[];
+              const dup = recent.find((r) => {
+                try {
+                  return parseMessageTarget(r.toUrl).url.toLowerCase() === parsedTarget.url.toLowerCase() && r.text.replace(/\s+/g, " ").trim().toLowerCase() === normInput;
+                } catch { return false; }
+              });
+              if (dup) throw new Error(`Refused: identical text was already sent to this recipient on ${dup.at} (7-day rule). Change the text or wait.`);
+              if (!job.notBefore) {
+                let anchor = 0;
+                const activeJobs = db.query("SELECT data FROM jobs WHERE json_extract(data, '$.action') = 'sendMessage' AND json_extract(data, '$.status') IN ('queued', 'running')").all() as { data: string }[];
+                for (const row of activeJobs) {
+                  const j = JSON.parse(row.data);
+                  const at = j.notBefore ? Date.parse(j.notBefore) : 0;
+                  anchor = Math.max(anchor, at);
+                }
+                const lastMsg = db.query("SELECT at FROM messages WHERE status IN ('sent', 'unverified') ORDER BY id DESC LIMIT 1").get() as { at: string } | null;
+                if (lastMsg) anchor = Math.max(anchor, Date.parse(lastMsg.at) || 0);
+                if (anchor > 0) {
+                  const planned = Math.max(now, anchor + GAP_MS + Math.floor(Math.random() * JITTER_MS));
+                  job.notBefore = new Date(planned).toISOString();
+                }
+              }
+            }
             if (job.key) {
               const existing = db.query("SELECT id, data FROM jobs WHERE json_extract(data, '$.key') = ? ORDER BY id DESC LIMIT 1").get(job.key as string) as { id: number; data: string } | null;
               if (existing) {
@@ -1089,8 +1227,12 @@ if (Bun.argv[2] === "--service-daemon") {
     console.log("Usage: socmedia config <get|set|unset> port [value] [--json]\n\nCommands:\n  get port          Show the effective port and configuration source\n  set port <value>  Save a port from 1 to 65535\n  unset port        Remove the saved port\n\nOptions:\n  --json            Print the result as JSON\n  --help            Show this help message\n\nSOCMEDIA_EXTENSION_PORT overrides the saved port; changes apply when the service restarts.");
   } else if (Bun.argv[2] === "extension") {
     console.log("Usage: socmedia extension <install|path|pair> [options]\n\nCommands:\n  install    Copy the extension to its stable state directory and show Chrome setup steps\n  path       Show the stable extension directory\n  pair       Generate a pairing secret for the Chrome extension\n\nOptions:\n  --open     With install, open chrome://extensions in Google Chrome\n  --id ID    With pair, set the Chrome extension ID\n  --json     Print the result as JSON; pairing output contains a sensitive secret\n  --help     Show this help message\n\nPairing replaces any previous pairing; restart the service to disconnect existing clients.");
+  } else if (Bun.argv[2] === "inbox") {
+    console.log("Usage: socmedia inbox <list|read> [options]\n\nCommands:\n  list <platform>   List conversation threads from Instagram or Facebook\n  read              Read messages from a thread by URL or recipient profile\n\nOptions:\n  --url URL         Thread URL on Instagram or Facebook\n  --to PROFILE      Recipient profile URL to open thread\n  --limit N         Maximum threads or messages to fetch (default: 20 for list, 30 for read)\n  --json            Print the result as JSON\n  --help            Show this help message");
+  } else if (Bun.argv[2] === "message") {
+    console.log("Usage: socmedia message send --to URL --text TEXT [--confirm] [--json]\n\nCommands:\n  send              Send a direct message via Instagram or Facebook\n\nOptions:\n  --to URL          Recipient profile or direct thread URL\n  --text TEXT       Message content (max 1000 characters)\n  --confirm         Confirm send; without this flag, returns a dry-run preview\n  --json            Print the result as JSON\n  --help            Show this help message\n\nDirect messaging enforces daily caps (SOCMEDIA_MAX_MESSAGES_PER_DAY), 7-day duplicate protection, and automated slot pacing.");
   } else {
-    console.log("Usage: socmedia [options]\n\nCommands:\n  service    Start or inspect the local service\n  queue      Inspect the service queue\n  extension  Pair the Chrome extension\n  tabs       Inspect extension work tabs\n  page       Inspect the work page\n  screenshot Take a screenshot of the work page\n  search     Search on Instagram or Facebook\n  post       Inspect a social post\n  profile    Read a social profile\n  contacts   List local contacts\n  config     Configure the service\n\nOptions:\n  --version  Show the CLI version\n  --help     Show this help message");
+    console.log("Usage: socmedia [options]\n\nCommands:\n  service    Start or inspect the local service\n  queue      Inspect the service queue\n  extension  Pair the Chrome extension\n  tabs       Inspect extension work tabs\n  page       Inspect the work page\n  screenshot Take a screenshot of the work page\n  search     Search on Instagram or Facebook\n  post       Inspect a social post\n  profile    Read a social profile\n  contacts   List local contacts\n  inbox      List and read inbox threads\n  message    Send direct messages\n  config     Configure the service\n\nOptions:\n  --version  Show the CLI version\n  --help     Show this help message");
   }
 } else if (Bun.argv[2] === "post" && Bun.argv[3] === "get") {
   try {
@@ -1377,6 +1519,76 @@ if (Bun.argv[2] === "--service-daemon") {
       } else throw new Error(`Unknown search option: ${option}`);
     }
     console.log(JSON.stringify(await runPageJob("search", args)));
+  } catch (error) { console.error(error instanceof Error ? error.message : String(error)); process.exitCode = 1; }
+} else if (Bun.argv[2] === "inbox" && Bun.argv[3] === "list") {
+  try {
+    const platform = Bun.argv[4];
+    if (!platform || platform.startsWith("--")) throw new Error("Usage: socmedia inbox list <platform> [--limit N] [--json]");
+    const norm = { ig: "ig", instagram: "ig", fb: "fb", facebook: "fb" }[platform.toLowerCase()];
+    if (!norm) throw new Error("Platform must be ig or fb");
+    const args: { platform: string; limit?: number } = { platform: norm, limit: 20 };
+    for (let i = 5; i < Bun.argv.length; i++) {
+      const option = Bun.argv[i];
+      if (option === "--json") continue;
+      if (option === "--limit") {
+        const val = Bun.argv[++i];
+        if (!val || !/^[1-9]\d*$/.test(val) || Number(val) > 100) throw new Error("--limit must be an integer from 1 to 100");
+        args.limit = Number(val);
+      } else throw new Error(`Unknown inbox option: ${option}`);
+    }
+    console.log(JSON.stringify(await runPageJob("readInbox", args)));
+  } catch (error) { console.error(error instanceof Error ? error.message : String(error)); process.exitCode = 1; }
+} else if (Bun.argv[2] === "inbox" && Bun.argv[3] === "read") {
+  try {
+    const args: { url?: string; to?: string; limit?: number } = { limit: 30 };
+    for (let i = 4; i < Bun.argv.length; i++) {
+      const option = Bun.argv[i];
+      if (option === "--json") continue;
+      if (option === "--url") {
+        const val = Bun.argv[++i];
+        if (!val) throw new Error("Missing value for --url");
+        args.url = val;
+      } else if (option === "--to") {
+        const val = Bun.argv[++i];
+        if (!val) throw new Error("Missing value for --to");
+        args.to = val;
+      } else if (option === "--limit") {
+        const val = Bun.argv[++i];
+        if (!val || !/^[1-9]\d*$/.test(val) || Number(val) > 100) throw new Error("--limit must be an integer from 1 to 100");
+        args.limit = Number(val);
+      } else throw new Error(`Unknown inbox read option: ${option}`);
+    }
+    if (!args.url && !args.to) throw new Error("Provide --url or --to");
+    console.log(JSON.stringify(await runPageJob("readThread", args)));
+  } catch (error) { console.error(error instanceof Error ? error.message : String(error)); process.exitCode = 1; }
+} else if (Bun.argv[2] === "message" && Bun.argv[3] === "send") {
+  try {
+    let to: string | undefined;
+    let text: string | undefined;
+    let confirm = false;
+    for (let i = 4; i < Bun.argv.length; i++) {
+      const option = Bun.argv[i];
+      if (option === "--json") continue;
+      if (option === "--to") {
+        to = Bun.argv[++i];
+        if (!to) throw new Error("Missing value for --to");
+      } else if (option === "--text") {
+        text = Bun.argv[++i];
+        if (text === undefined) throw new Error("Missing value for --text");
+      } else if (option === "--confirm") {
+        confirm = true;
+      } else throw new Error(`Unknown message option: ${option}`);
+    }
+    if (!to) throw new Error("Missing recipient (--to URL)");
+    if (text === undefined) throw new Error("Missing message text (--text TEXT)");
+    const preview = previewUnlessConfirmed({ to, text, confirm });
+    if (preview) {
+      console.log(JSON.stringify(preview));
+    } else {
+      const parsed = parseMessageTarget(to);
+      const cleanText = checkMessageText(text);
+      console.log(JSON.stringify(await runPageJob("sendMessage", { to: parsed.url, text: cleanText })));
+    }
   } catch (error) { console.error(error instanceof Error ? error.message : String(error)); process.exitCode = 1; }
 } else if (Bun.argv[2] === "queue" && (Bun.argv[3] === "get" || Bun.argv[3] === "cancel")) {
   try {
