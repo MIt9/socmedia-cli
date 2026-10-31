@@ -720,7 +720,7 @@ async function screenshot({ url, selector, target = "viewport" } = {}) {
     const tab = await navigateSocial(url);
     tabId = tab.id;
   } else {
-    const active = await getSelectedTab();
+    const active = await safeWorkTab();
     tabId = active.id;
   }
   const current = await safeTab(tabId);
