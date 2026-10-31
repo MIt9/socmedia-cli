@@ -242,6 +242,12 @@ function validateJob(value: unknown) {
     if (Object.keys(args).some((key) => key !== "url")) throw new Error("getProfile accepts only a profile URL");
     args.url = profileUrl(args.url);
   }
+  if (job.action === "getPosts") {
+    const args = job.args as Record<string, unknown>;
+    if (Object.keys(args).some((key) => key !== "url" && key !== "limit")) throw new Error("getPosts accepts only url and limit");
+    args.url = profileUrl(args.url);
+    if (args.limit !== undefined && (!Number.isInteger(args.limit) || Number(args.limit) < 1 || Number(args.limit) > 100)) throw new Error("Post limit must be an integer from 1 to 100");
+  }
   if (job.action === "getComments") {
     const args = job.args as Record<string, unknown>;
     if (Object.keys(args).some((key) => key !== "url" && key !== "limit")) throw new Error("getComments accepts only url and limit");
@@ -349,7 +355,7 @@ async function queueRequest(command: string): Promise<unknown> {
   });
 }
 
-async function runPageJob(action: "snapshot" | "readPage" | "getProfile" | "getComments", args: Record<string, unknown>): Promise<unknown> {
+async function runPageJob(action: "snapshot" | "readPage" | "getProfile" | "getComments" | "getPosts", args: Record<string, unknown>): Promise<unknown> {
   const current = await status();
   if (!current.running) throw new Error("Service not running");
   if (current.halted) {
@@ -360,7 +366,7 @@ async function runPageJob(action: "snapshot" | "readPage" | "getProfile" | "getC
   if (!extension?.connected) throw new Error("Extension not connected");
   if (!extension.compatible) throw new Error("Extension version incompatible");
   const created = await queueRequest(`queue enqueue ${JSON.stringify({ action, args })}`) as { id: number };
-  const deadline = Date.now() + (action === "getComments" ? 75000 : action === "getProfile" ? 60000 : 30000);
+  const deadline = Date.now() + (action === "getComments" || action === "getPosts" ? 75000 : action === "getProfile" ? 60000 : 30000);
   while (Date.now() < deadline) {
     let job = await queueRequest(`queue get ${created.id}`) as { status: string; result?: unknown; error?: string | { code?: string; reason?: string } };
     if (!["done", "failed", "cancelled"].includes(job.status)) {
@@ -410,7 +416,7 @@ if (Bun.argv[2] === "--service-daemon") {
   db.run("CREATE TABLE IF NOT EXISTS service_state (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
   const haltRow = db.query("SELECT value FROM service_state WHERE key = 'halted'").get() as { value: string } | null;
   let halted: { code: string; reason: string } | null = haltRow ? JSON.parse(haltRow.value) : null;
-  db.run("UPDATE jobs SET data = json_set(data, '$.status', 'queued') WHERE json_extract(data, '$.action') IN ('readPage','snapshot','getProfile','getComments') AND json_extract(data, '$.status') = 'running'");
+  db.run("UPDATE jobs SET data = json_set(data, '$.status', 'queued') WHERE json_extract(data, '$.action') IN ('readPage','snapshot','getProfile','getComments','getPosts') AND json_extract(data, '$.status') = 'running'");
   type ExtensionData = { token: string; challenge?: { clientNonce: string; serverNonce: string; version: string } };
   let extensionSocket: Bun.ServerWebSocket<ExtensionData> | null = null;
   let connectedVersion: string | null = null;
@@ -473,7 +479,7 @@ if (Bun.argv[2] === "--service-daemon") {
   function pump() {
     if (workerWake) { clearTimeout(workerWake); workerWake = undefined; }
     if (halted || browserBusy || !extensionSocket || !connectedVersion || !compatibleVersion(connectedVersion)) return;
-    const rows = db.query("SELECT id, data FROM jobs WHERE json_extract(data, '$.action') IN ('readPage','snapshot','getProfile','getComments') AND json_extract(data, '$.status') = 'queued' ORDER BY id").all() as { id: number; data: string }[];
+    const rows = db.query("SELECT id, data FROM jobs WHERE json_extract(data, '$.action') IN ('readPage','snapshot','getProfile','getComments','getPosts') AND json_extract(data, '$.status') = 'queued' ORDER BY id").all() as { id: number; data: string }[];
     const now = Date.now();
     let wakeAt = Infinity;
     const row = rows.find((candidate) => {
@@ -659,7 +665,7 @@ if (Bun.argv[2] === "--service-daemon") {
   } else if (Bun.argv[2] === "tabs") {
     console.log("Usage: socmedia tabs <list|use|clear> [options]\n\nCommands:\n  list         List Socmedia CLI group tabs and the selected tab\n  use <tabId>  Select an open Instagram, Facebook or YouTube tab by its numeric ID\n  clear        Clear the selected tab and return to the Socmedia CLI group\n\nOptions:\n  --json       Print the result as JSON\n  --help       Show this help message");
   } else if (Bun.argv[2] === "profile") {
-    console.log("Usage: socmedia profile get <url> [--json]\n\nCommands:\n  get <url>  Read an Instagram or Facebook profile/page via its HTTPS URL\n\nOptions:\n  --json     Print the result as JSON\n  --help     Show this help message\n\nSuccessful reads update local contacts. Fields may be null or incomplete.");
+    console.log("Usage: socmedia profile <get|posts> <url> [options]\n\nCommands:\n  get <url>        Read an Instagram or Facebook profile/page via its HTTPS URL\n  posts <url>      List posts from an Instagram or Facebook profile/page\n\nOptions:\n  --limit N        With posts, maximum posts from 1 to 100 (default: 12)\n  --json           Print the result as JSON\n  --help           Show this help message\n\nSuccessful profile reads update local contacts. Fields may be null or incomplete.");
   } else if (Bun.argv[2] === "contacts") {
     console.log("Usage: socmedia contacts <list|update|export> [options]\n\nCommands:\n  list              List locally stored contacts\n  update <id>       Update a contact by its ID; provide --status and/or --note\n  export            Export filtered contacts to a file inside home\n\nOptions:\n  --status STATUS   Filter list/export or set status: new, messaged, replied, won, rejected, skip\n  --platform NAME   Filter list/export by ig or fb\n  --note TEXT       Set note on update (maximum 2000 characters; empty clears it)\n  --format FORMAT   Export as csv, json or jsonl (default: csv)\n  --path PATH       Export destination inside home (default: ~/socmedia-data/contacts-<date>.<format>)\n  --json            Print the command result as JSON\n  --help            Show this help message\n\nInstagram and Facebook profile reads populate contacts; import is not implemented yet.");
   } else if (Bun.argv[2] === "post") {
@@ -748,6 +754,20 @@ if (Bun.argv[2] === "--service-daemon") {
     if (Bun.argv.slice(5).some((option) => option !== "--json")) throw new Error("Unknown profile option");
     const url = profileUrl(Bun.argv[4]);
     console.log(JSON.stringify(await runPageJob("getProfile", { url })));
+  } catch (error) { console.error(error instanceof Error ? error.message : String(error)); process.exitCode = 1; }
+} else if (Bun.argv[2] === "profile" && Bun.argv[3] === "posts") {
+  try {
+    const url = profileUrl(Bun.argv[4]);
+    const args: { url: string; limit?: number } = { url, limit: 12 };
+    for (let i = 5; i < Bun.argv.length; i++) {
+      const option = Bun.argv[i];
+      if (option === "--json") continue;
+      if (option !== "--limit") throw new Error(`Unknown profile option: ${option}`);
+      const value = Bun.argv[++i];
+      if (!value || !/^[1-9]\d*$/.test(value) || Number(value) > 100) throw new Error("--limit must be an integer from 1 to 100");
+      args.limit = Number(value);
+    }
+    console.log(JSON.stringify(await runPageJob("getPosts", args)));
   } catch (error) { console.error(error instanceof Error ? error.message : String(error)); process.exitCode = 1; }
 } else if (Bun.argv[2] === "page" && (Bun.argv[3] === "snapshot" || Bun.argv[3] === "read")) {
   try {

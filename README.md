@@ -8,10 +8,10 @@ socmedia (CLI)  --HTTP+токен-->  локальний сервіс (Bun)  --W
 
 Сервіс — єдиний власник черги (SQLite), стану зупинки (HALT), відновлення завдань та з'єднання з розширенням.
 
-> **Статус реалізації (v0.5.1):**
-> - Реалізовано й перевірено автоматичними тестами: життєвий цикл сервісу, SQLite-черга з відновленням незавершених завдань після перезапуску та обриву WebSocket, сполучення розширення (HMAC-SHA256, фіксований ID), керування вкладками (`tabs list|use|clear`), читання сторінки й snapshot (`page read|snapshot`), читання профілів Instagram і Facebook (`profile get`), локальні контакти (`contacts list|update|export`), коментарі до постів Instagram та Facebook (`post comments`).
+> **Статус реалізації (v0.6.0):**
+> - Реалізовано й перевірено автоматичними тестами: життєвий цикл сервісу, SQLite-черга з відновленням незавершених завдань після перезапуску та обриву WebSocket, сполучення розширення (HMAC-SHA256, фіксований ID), керування вкладками (`tabs list|use|clear`), читання сторінки й snapshot (`page read|snapshot`), читання профілів Instagram і Facebook (`profile get`), читання списку постів профілю (`profile posts`), локальні контакти (`contacts list|update|export`), коментарі до постів Instagram та Facebook (`post comments`).
 > - **Не перевірено наживо:** живий Chrome, реальні сайти Instagram, Facebook та YouTube ще не перевірялися.
-> - **Ще не реалізовано:** завантаження постів/медіа, скриншоти, повідомлення inbox, YouTube через Studio UI.
+> - **Ще не реалізовано:** завантаження постів/медіа (`post get --download`), скриншоти, повідомлення inbox, YouTube через Studio UI.
 
 ## Швидкий старт
 
@@ -41,5 +41,6 @@ socmedia (CLI)  --HTTP+токен-->  локальний сервіс (Bun)  --W
 - `socmedia tabs <list|use|clear>` — робоча група вкладок розширення.
 - `socmedia page <read|snapshot>` — читання тексту та інтерактивних елементів поточної робочої вкладки.
 - `socmedia profile get <url>` — читання профілю Instagram або Facebook та збереження у контакти.
+- `socmedia profile posts <url> [--limit N]` — читання списку постів профілю Instagram або Facebook.
 - `socmedia post comments <url> [--limit N]` — читання коментарів поста, відео або reel Instagram та Facebook (розгортання через Chrome debugger).
 - `socmedia contacts <list|update|export>` — перегляд, оновлення нотаток/статусів та експорт контактів у CSV/JSON/JSONL.

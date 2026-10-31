@@ -94,6 +94,118 @@ test("Facebook comments use real extension extraction with HALT checks", async (
   await expect(runInNewContext('getComments({url:"https://www.facebook.com/samplepage/posts/123456789"})', context)).rejects.toMatchObject({ code: "HALT" });
 });
 
+test("profile posts extraction uses real extension DOM logic with HALT checks", async () => {
+  const script = await Bun.file(new URL("../extension/background.js", import.meta.url)).text();
+  const stored: Record<string, unknown> = { cliSelectedTab: 42 };
+  const tab = { id: 42, windowId: 4, active: true, status: "complete", url: "https://www.instagram.com/previous/" };
+  const location = { href: tab.url, pathname: "/previous/", hostname: "www.instagram.com" };
+
+  const igImg = { src: "https://cdn.example/thumb.jpg", alt: "Sunset view" };
+  const igTile = {
+    href: "https://www.instagram.com/p/Post123/",
+    querySelector: (sel: string) => sel === "img" ? igImg : sel.includes("Carousel") ? { tagName: "svg" } : null,
+    parentElement: null,
+    __socStats: ["100", "15"],
+  };
+  const igReel = {
+    href: "https://www.instagram.com/reel/Reel456/",
+    querySelector: (sel: string) => sel === "img" ? { src: "https://cdn.example/reel.jpg", alt: "Reel caption" } : null,
+    parentElement: null,
+    __socStats: ["200"],
+  };
+
+  const documentIg = {
+    body: { innerText: "" },
+    querySelector: () => null,
+    querySelectorAll: (sel: string) => sel.includes("/p/") ? [igTile, igReel] : [],
+  };
+
+  const ignore = { addListener() {} };
+  const chrome = {
+    storage: { local: { get: async (keys: string | string[]) => Object.fromEntries((Array.isArray(keys) ? keys : [keys]).map((key) => [key, stored[key]])), set: async (values: Record<string, unknown>) => Object.assign(stored, values) }, onChanged: ignore },
+    tabs: { get: async () => tab, query: async () => [], update: async (_id: number, values: { url?: string }) => { if (values.url) { tab.url = values.url; location.href = values.url; location.pathname = new URL(values.url).pathname; } } },
+    tabGroups: { query: async () => [] }, windows: { get: async () => ({ state: "normal" }) },
+    scripting: { executeScript: async ({ func, args = [] }: any) => [{ result: func(...args) }] },
+    alarms: { create() {}, onAlarm: ignore }, runtime: { onStartup: ignore },
+  };
+
+  const contextIg = { chrome, WebSocket, console, URL, document: documentIg, location, setTimeout: (fn: () => void, ms?: number) => { if ((ms ?? 0) < 10000) { fn(); return 0; } return setTimeout(fn, ms); }, clearTimeout: (id: any) => clearTimeout(id), Date, Math };
+  runInNewContext(script, contextIg);
+  const resultIg = await runInNewContext('getPosts({url:"https://www.instagram.com/sampleuser/",limit:10})', contextIg);
+  expect(resultIg).toEqual({
+    platform: "ig",
+    url: "https://www.instagram.com/sampleuser/",
+    posts: [
+      { url: "https://www.instagram.com/p/Post123/", shortcode: "Post123", type: "carousel", thumbUrl: "https://cdn.example/thumb.jpg", caption: "Sunset view", date: null, likes: 100, comments: 15 },
+      { url: "https://www.instagram.com/reel/Reel456/", shortcode: "Reel456", type: "reel", thumbUrl: "https://cdn.example/reel.jpg", caption: "Reel caption", date: null, likes: null, comments: 200 },
+    ],
+  });
+
+  const fbPerma = { href: "https://www.facebook.com/samplepage/posts/123456", closest: () => null, getAttribute: () => null, __socTip: null };
+  const fbImg = { width: 200, src: "https://cdn.example/fbthumb.jpg", closest: () => null };
+  const fbMsg = { innerText: "Hello Facebook world" };
+  const fbLike = { innerText: "42", closest: () => null };
+  const fbCommentBtn: any = { innerText: "10", querySelector: () => null, closest: () => null };
+  const fbArt: any = {
+    querySelector: (sel: string) => sel.includes("message") ? fbMsg : sel.includes("Actions for this post") ? { tagName: "div" } : null,
+    querySelectorAll: (sel: string) => sel.includes("Leave a comment") ? [fbCommentBtn] : sel === "a[href]" ? [fbPerma] : sel === "a" ? [fbPerma] : sel === "img" ? [fbImg] : sel === '[aria-label="Like"]' ? [fbLike] : sel === "span" ? [] : [],
+    parentElement: null,
+  };
+  fbArt.parentElement = { querySelector: () => null, querySelectorAll: () => [fbCommentBtn], parentElement: null };
+
+  const documentFb = {
+    body: { innerText: "" },
+    querySelector: () => null,
+    querySelectorAll: (sel: string) => sel === '[aria-label="Leave a comment"]' ? [fbCommentBtn] : [],
+    getElementById: () => null,
+  };
+  fbCommentBtn.parentElement = fbArt;
+
+  const contextFb = { chrome, WebSocket, console, URL, document: documentFb, location, setTimeout: (fn: () => void, ms?: number) => { if ((ms ?? 0) < 10000) { fn(); return 0; } return setTimeout(fn, ms); }, clearTimeout: (id: any) => clearTimeout(id), Date, Math };
+  tab.url = "https://www.facebook.com/samplepage/";
+  runInNewContext(script, contextFb);
+  const resultFb = await runInNewContext('getPosts({url:"https://www.facebook.com/samplepage/",limit:10})', contextFb);
+  expect(resultFb).toMatchObject({
+    platform: "fb",
+    url: "https://www.facebook.com/samplepage",
+    posts: [
+      { url: "https://www.facebook.com/samplepage/posts/123456", shortcode: "123456", type: "photo", thumbUrl: "https://cdn.example/fbthumb.jpg", caption: "Hello Facebook world", likes: 42, comments: 10 },
+    ],
+  });
+
+  tab.url = "https://www.facebook.com/checkpoint/";
+  await expect(runInNewContext('getPosts({url:"https://www.facebook.com/samplepage/"})', contextFb)).rejects.toMatchObject({ code: "HALT" });
+});
+
+test("profile posts validates profile URL and limit and returns queued result", async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), "socmedia-posts-"));
+  const run = async (...args: string[]) => {
+    const cli = Bun.spawn(["bun", "run", "src/cli.ts", ...args], { cwd: import.meta.dir + "/..", env: { ...process.env, SOCMEDIA_STATE_DIR: stateDir, SOCMEDIA_EXTENSION_PORT: "0" }, stdout: "pipe", stderr: "pipe" });
+    const [stdout, stderr, exit] = await Promise.all([new Response(cli.stdout).text(), new Response(cli.stderr).text(), cli.exited]); return { stdout, stderr, exit };
+  };
+  let pid: number | undefined; let ws: WebSocket | undefined;
+  try {
+    const help = await run("profile", "--help"); expect(help.stdout).toContain("posts <url>"); expect(help.stdout).toContain("--limit"); expect(help.stdout).toContain("--json");
+    for (const args of [["https://instagram.com/"], ["https://facebook.com/posts/123"], ["https://instagram.com.evil.test/sample/"], ["https://instagram.com/sample/", "--limit", "101"], ["https://instagram.com/sample/", "--limit", "0"]]) {
+      expect((await run("profile", "posts", ...args, "--json")).exit).not.toBe(0);
+    }
+    const id = "p".repeat(32);
+    const pairing = JSON.parse((await run("extension", "pair", "--id", id, "--json")).stdout);
+    const started = JSON.parse((await run("service", "start", "--json")).stdout); pid = started.pid;
+    ws = new WebSocket(`ws://127.0.0.1:${started.extension.port}/extension`, { headers: { Origin: `chrome-extension://${id}` } } as unknown as string[]);
+    await authenticateMock(ws, pairing.token);
+    const expected = { platform: "ig", url: "https://www.instagram.com/sample/", posts: [{ url: "https://www.instagram.com/p/123/", shortcode: "123", type: "photo", thumbUrl: null, caption: null, date: null, likes: 5, comments: 2 }] };
+    ws.onmessage = (event) => { const request = JSON.parse(String(event.data)); expect(request).toMatchObject({ action: "getPosts", args: { url: "https://www.instagram.com/sample/", limit: 12 } }); ws!.send(JSON.stringify({ type: "result", id: request.id, result: expected })); };
+    const result = await run("profile", "posts", "https://instagram.com/sample/?ignored=yes", "--json");
+    expect(result.exit).toBe(0); expect(JSON.parse(result.stdout)).toEqual(expected);
+    const jobs = JSON.parse((await run("queue", "list", "--json")).stdout).jobs;
+    expect(jobs[0]).toMatchObject({ action: "getPosts", status: "done", result: expected });
+  } finally {
+    ws?.close(); if (pid) { try { process.kill(pid, "SIGTERM"); } catch {} for (let i = 0; i < 100; i++) { try { process.kill(pid, 0); } catch { break; } await Bun.sleep(20); } }
+    await rm(stateDir, { recursive: true, force: true });
+  }
+});
+
 test("post comments validates Instagram and Facebook URLs and limit and returns queued result", async () => {
   const stateDir = await mkdtemp(join(tmpdir(), "socmedia-comments-"));
   const run = async (...args: string[]) => {
@@ -919,7 +1031,7 @@ test("an interrupted readPage recovers on service restart and persists extension
       await authenticateMock(socket, pairing.token); return { socket, request };
     };
     let link = await connect(); ws = link.socket;
-    const inert = await run("queue", "enqueue", "getPosts", "--args", "{}", "--json");
+    const inert = await run("queue", "enqueue", "getPost", "--args", "{}", "--json");
     const job = await run("queue", "enqueue", "readPage", "--json");
     await Promise.race([link.request, Bun.sleep(1500).then(() => { throw new Error("request timeout"); })]);
     expect((await run("queue", "get", String(inert.id), "--json")).status).toBe("queued");
