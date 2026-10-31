@@ -27,6 +27,34 @@ while read local_ref local_sha remote_ref remote_sha; do
   echo "Running pre-release tests and typecheck..."
   bun test || exit 1
   bun run typecheck || exit 1
+
+  echo "Building release artifacts..."
+  bun scripts/build.ts --all || exit 1
+
+  echo "Verifying build sha256 checksums..."
+  bun -e '
+    const fs = require("node:fs");
+    const crypto = require("node:crypto");
+    const path = require("node:path");
+    const latest = JSON.parse(fs.readFileSync("dist/latest.json", "utf8"));
+    for (const [arch, info] of Object.entries(latest.binaries)) {
+      const file = path.join("dist", info.url);
+      const sum = crypto.createHash("sha256").update(fs.readFileSync(file)).digest("hex");
+      if (sum !== info.sha256) throw new Error(`SHA256 mismatch for ${file}: expected ${info.sha256}, got ${sum}`);
+    }
+    const extFile = path.join("dist", latest.extension.url);
+    const extSum = crypto.createHash("sha256").update(fs.readFileSync(extFile)).digest("hex");
+    if (extSum !== latest.extension.sha256) throw new Error(`SHA256 mismatch for ${extFile}: expected ${latest.extension.sha256}, got ${extSum}`);
+  ' || exit 1
+
+  if command -v gh >/dev/null 2>&1; then
+    if gh release view "v$TAG" >/dev/null 2>&1; then
+      echo "Release v$TAG already exists on GitHub."
+    else
+      echo "Creating GitHub release v$TAG..."
+      gh release create "v$TAG" dist/* --title "v$TAG" --generate-notes || exit 1
+    fi
+  fi
 done
 
 exit 0

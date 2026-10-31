@@ -3,8 +3,12 @@ import { readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { COMMAND_REGISTRY } from "../src/cli";
 
-test("SKILL.md covers all commands in COMMAND_REGISTRY and documents safety rules", () => {
-  const skillPath = join(import.meta.dir, "../skills/socmedia-cli/SKILL.md");
+test("only socmedia-cli-usage skill exists and covers all commands and safety rules", () => {
+  // Ensure duplicate skill is removed
+  const deprecatedPath = join(import.meta.dir, "../skills/socmedia-cli");
+  expect(existsSync(deprecatedPath)).toBe(false);
+
+  const skillPath = join(import.meta.dir, "../skills/socmedia-cli-usage/SKILL.md");
   expect(existsSync(skillPath)).toBe(true);
 
   const content = readFileSync(skillPath, "utf8");
@@ -21,12 +25,6 @@ test("SKILL.md covers all commands in COMMAND_REGISTRY and documents safety rule
   expect(content).toContain("socmedia doctor");
   expect(content).toContain("socmedia update");
   expect(content).toContain("SOCMEDIA_CLI_FORMAT");
-
-  // Parity check for socmedia-cli-usage as well
-  const altSkillPath = join(import.meta.dir, "../skills/socmedia-cli-usage/SKILL.md");
-  expect(existsSync(altSkillPath)).toBe(true);
-  const altContent = readFileSync(altSkillPath, "utf8");
-  for (const cmd of COMMAND_REGISTRY) {
-    expect(altContent).toContain(`socmedia ${cmd.name}`);
-  }
+  expect(content).toContain("PORT_IN_USE");
+  expect(content).toContain("unverified");
 });
