@@ -561,6 +561,111 @@ test("search command validates platform and query and returns queued results", a
   }
 });
 
+test("profile download orchestrates profile, screenshot, posts and saves markdown summary", async () => {
+  const fakeHome = await mkdtemp(join(tmpdir(), "socmedia-dlprof-home-"));
+  const stateDir = await mkdtemp(join(tmpdir(), "socmedia-dlprof-state-"));
+  const run = async (...args: string[]) => {
+    const cli = Bun.spawn(["bun", "run", "src/cli.ts", ...args], {
+      cwd: import.meta.dir + "/..",
+      env: { ...process.env, HOME: fakeHome, SOCMEDIA_STATE_DIR: stateDir, SOCMEDIA_EXTENSION_PORT: "0" },
+      stdout: "pipe", stderr: "pipe",
+    });
+    const [stdout, stderr, exit] = await Promise.all([new Response(cli.stdout).text(), new Response(cli.stderr).text(), cli.exited]);
+    return { stdout, stderr, exit };
+  };
+  let pid: number | undefined;
+  let ws: WebSocket | undefined;
+  try {
+    const help = await run("profile", "--help");
+    expect(help.stdout).toContain("download <url>");
+    expect(help.stdout).toContain("--limit");
+    expect(help.stdout).toContain("--details");
+    expect(help.stdout).toContain("--max-media");
+    expect(help.stdout).toContain("--background");
+
+    expect((await run("profile", "download", "--json")).exit).not.toBe(0);
+    expect((await run("profile", "download", "https://evil.com/fake", "--json")).exit).not.toBe(0);
+    expect((await run("profile", "download", "https://instagram.com/nasa/", "--limit", "101", "--json")).exit).not.toBe(0);
+    expect((await run("profile", "download", "https://instagram.com/nasa/", "--max-media", "301", "--json")).exit).not.toBe(0);
+    expect((await run("profile", "download", "https://instagram.com/nasa/", "--dir", "/etc/outside", "--json")).exit).not.toBe(0);
+
+    const id = "g".repeat(32);
+    const pairing = JSON.parse((await run("extension", "pair", "--id", id, "--json")).stdout);
+    const started = JSON.parse((await run("service", "start", "--json")).stdout);
+    pid = started.pid;
+    ws = new WebSocket(`ws://127.0.0.1:${started.extension.port}/extension`, { headers: { Origin: `chrome-extension://${id}` } } as unknown as string[]);
+    await authenticateMock(ws, pairing.token);
+
+    const minimalPng = Buffer.from("89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4890000000a49444154789c63000100000500010d0a2db40000000049454e44ae426082", "hex");
+    const shotDataUrl = `data:image/png;base64,${minimalPng.toString("base64")}`;
+
+    ws.onmessage = (event) => {
+      const request = JSON.parse(String(event.data));
+      if (request.action === "getProfile") {
+        ws!.send(JSON.stringify({
+          type: "result", id: request.id,
+          result: { platform: "ig", url: "https://www.instagram.com/nasa/", username: "nasa", name: "NASA", bio: "Exploring space", followers: 104000000 },
+        }));
+      } else if (request.action === "screenshot") {
+        ws!.send(JSON.stringify({
+          type: "result", id: request.id,
+          result: { dataUrl: shotDataUrl, width: 800, height: 600, url: request.args?.url },
+        }));
+      } else if (request.action === "getPosts") {
+        ws!.send(JSON.stringify({
+          type: "result", id: request.id,
+          result: {
+            platform: "ig",
+            url: request.args?.url,
+            posts: [
+              { url: "https://www.instagram.com/p/Post1/", caption: "Mars exploration", likes: 100, comments: 20 },
+            ],
+          },
+        }));
+      } else {
+        ws!.send(JSON.stringify({ type: "result", id: request.id, result: {} }));
+      }
+    };
+
+    const result = await run("profile", "download", "https://instagram.com/nasa/", "--limit", "1", "--no-details", "--json");
+    expect(result.exit).toBe(0);
+    const parsed = JSON.parse(result.stdout);
+    expect(parsed.posts).toBe(1);
+    expect(parsed.screenshot).toBe(true);
+
+    const folder = parsed.folder;
+    expect(folder).toContain(join(fakeHome, "socmedia-data", "ig", "nasa"));
+    const files = await readdir(folder);
+    expect(files).toContain("profile.json");
+    expect(files).toContain("posts.json");
+    expect(files).toContain("profile.md");
+    expect(files).toContain("screenshot.png");
+    expect(files).toContain("media");
+
+    const md = await Bun.file(join(folder, "profile.md")).text();
+    expect(md).toContain("# NASA");
+    expect(md).toContain("Mars exploration");
+
+    // Also test --background option returns { queued: true, id: number }
+    const bg = await run("profile", "download", "https://instagram.com/nasa/", "--background", "--json");
+    expect(bg.exit).toBe(0);
+    const bgParsed = JSON.parse(bg.stdout);
+    expect(bgParsed.queued).toBe(true);
+    expect(typeof bgParsed.id).toBe("number");
+  } finally {
+    ws?.close();
+    if (pid) {
+      try { process.kill(pid, "SIGTERM"); } catch {}
+      for (let i = 0; i < 100; i++) {
+        try { process.kill(pid, 0); } catch { break; }
+        await Bun.sleep(20);
+      }
+    }
+    await rm(stateDir, { recursive: true, force: true });
+    await rm(fakeHome, { recursive: true, force: true });
+  }
+});
+
 test("screenshot command validates arguments, writes PNG file inside home, and records queued job", async () => {
   const fakeHome = await mkdtemp(join(tmpdir(), "socmedia-screenshot-home-"));
   const stateDir = await mkdtemp(join(tmpdir(), "socmedia-screenshot-state-"));

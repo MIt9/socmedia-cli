@@ -294,6 +294,118 @@ function screenshotPath(platform: string, url?: string, now = new Date()): strin
   return file;
 }
 
+function profileDir(platform: string, username: string, baseDir?: string): string {
+  const home = resolve(homedir());
+  const root = baseDir ? resolveHomePath(baseDir) : join(home, "socmedia-data");
+  const p = safeSeg(platform) || "_unknown";
+  const u = safeSeg(username) || "_unknown";
+  const target = resolve(root, p, u);
+  const rel = relative(home, target);
+  if (!rel || rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) throw new Error("Path must be inside home");
+  return target;
+}
+
+function profileMarkdown(p: any, posts: any[]): string {
+  const L = [`# ${p.name || p.username || "Profile"}`, ""];
+  const kv = (k: string, v: unknown) => { if (v != null && v !== "") L.push(`- **${k}:** ${v}`); };
+  kv("Platform", p.platform);
+  kv("Username", p.username);
+  kv("URL", p.url);
+  kv("Category", p.category);
+  kv("Followers", p.followers);
+  kv("Following", p.following);
+  kv("Posts", p.postsCount);
+  kv("Verified", p.verified == null ? null : p.verified ? "yes" : "no");
+  kv("Private", p.private == null ? null : p.private ? "yes" : "no");
+  kv("Business", p.isBusiness == null ? null : p.isBusiness ? "yes" : "no");
+  kv("Website", p.website);
+  kv("Email", p.contact?.email || p.email);
+  kv("Phone", p.contact?.phone || p.phone);
+  kv("Address", p.contact?.address || p.address);
+  if (p.bio) L.push("", "## Bio", p.bio);
+  if (p.links?.length) L.push("", "## Links", ...p.links.map((l: string) => `- ${l}`));
+  if (posts.length) {
+    L.push("", "## Posts");
+    for (const x of posts) {
+      const d = x.detail || {};
+      const cap = String(d.caption ?? x.caption ?? "").replace(/\s+/g, " ").trim();
+      const stats = [x.type, d.date || x.date, (d.likes ?? x.likes) != null ? `${d.likes ?? x.likes} likes` : null, (d.commentsCount ?? x.comments) != null ? `${d.commentsCount ?? x.comments} comments` : null].filter(Boolean).join(", ");
+      L.push(`- ${x.url}${stats ? ` (${stats})` : ""}${cap ? `: ${cap.length > 200 ? `${cap.slice(0, 199)}…` : cap}` : ""}${x.files?.length ? ` [${x.files.join(", ")}]` : ""}`);
+    }
+  }
+  return L.join("\n") + "\n";
+}
+
+async function downloadProfile({ url, limit = 12, details = true, maxMedia = 50, dir }: { url: string; limit?: number; details?: boolean; maxMedia?: number; dir?: string }, step: (action: any, args: any) => Promise<any>) {
+  const normUrl = profileUrl(url);
+  const u = new URL(normUrl);
+  const platform = u.hostname.includes("instagram.com") ? "ig" : "fb";
+  const urlPath = u.pathname.replace(/^\/+|\/+$/g, "");
+  const warnings: string[] = [];
+  const warn = (what: string) => (e: any) => { warnings.push(`${what}: ${e?.message || String(e)}`); return null; };
+  const soft = async <T>(fn: () => Promise<T>, onError: (e: any) => T | null): Promise<T | null> => {
+    try { return await fn(); } catch (e: any) {
+      if (String(e?.message).startsWith("HALT")) throw e;
+      return onError(e);
+    }
+  };
+
+  const profile = await step("getProfile", { url: normUrl }) as any;
+  const username = profile?.username || urlPath.split("/")[0];
+  const folder = profileDir(platform, username, dir);
+  mkdirSync(join(folder, "media"), { recursive: true, mode: 0o700 });
+
+  const shotFile = join(folder, "screenshot.png");
+  const shot = await soft(() => step("screenshot", { url: normUrl, target: "profile", path: shotFile }), warn("screenshot"));
+  const list = await soft(() => step("getPosts", { url: normUrl, limit }), warn("posts")) as any;
+  const posts = (list?.posts || []).slice(0, limit) as any[];
+  if (details) {
+    for (const p of posts) {
+      if (p.url) {
+        const d = await soft(() => step("getPost", { url: p.url }), warn(`post ${p.url}`));
+        if (d) p.detail = d;
+      }
+    }
+  }
+
+  let n = 0;
+  let skipped = 0;
+  const hashes = new Set<string>();
+  const grab = async (mediaUrl: string): Promise<string | null> => {
+    try {
+      const r = await fetchBody(mediaUrl, { max: MAX_MEDIA_BYTES, timeout: 60000, allow: isMediaHost });
+      const e = r.status === 200 && !r.truncated ? mediaExt(r.body) : null;
+      if (!e) throw new Error("not jpg/png/webp/mp4, or over 15 MB");
+      const sha = createHash("sha1").update(r.body).digest("hex");
+      if (hashes.has(sha)) throw new Error("duplicate");
+      hashes.add(sha);
+      const fileName = `${String(++n).padStart(2, "0")}.${e}`;
+      writeFileSync(join(folder, "media", fileName), r.body);
+      return `media/${fileName}`;
+    } catch (e: any) {
+      skipped++;
+      warnings.push(`media skipped (${e?.message || String(e)}): ${mediaUrl}`);
+      return null;
+    }
+  };
+
+  for (const p of posts) {
+    p.files = [];
+    const urls = (p.detail?.media?.length ? p.detail.media.map((m: any) => m.url) : [p.thumbUrl]).filter(Boolean) as string[];
+    for (const mediaUrl of urls) {
+      if (n >= maxMedia) break;
+      const f = await grab(mediaUrl);
+      if (f) p.files.push(f);
+    }
+  }
+
+  const savedAt = new Date().toISOString();
+  writeFileSync(join(folder, "profile.json"), JSON.stringify({ ...profile, savedAt }, null, 2));
+  writeFileSync(join(folder, "posts.json"), JSON.stringify(posts, null, 2));
+  writeFileSync(join(folder, "profile.md"), profileMarkdown(profile, posts));
+  return { folder, posts: posts.length, media: n, mediaSkipped: skipped, screenshot: !!shot, warnings };
+}
+
 function instagramProfileUrl(value: unknown): string {
   if (typeof value !== "string") throw new Error("Instagram profile URL is required");
   let url: URL;
@@ -459,6 +571,21 @@ function validateJob(value: unknown) {
     if (args.type !== undefined && !["users", "hashtag", "pages", "places"].includes(String(args.type))) throw new Error("Search type must be users, hashtag, pages or places");
     if (args.limit !== undefined && (!Number.isInteger(args.limit) || Number(args.limit) < 1 || Number(args.limit) > 50)) throw new Error("Search limit must be an integer from 1 to 50");
   }
+  if (job.action === "downloadProfile") {
+    const args = job.args as Record<string, unknown>;
+    for (const key of Object.keys(args)) {
+      if (!["url", "limit", "details", "maxMedia", "dir"].includes(key)) throw new Error(`Unknown downloadProfile option: ${key}`);
+    }
+    if (typeof args.url !== "string") throw new Error("Profile URL is required");
+    args.url = profileUrl(args.url);
+    if (args.limit !== undefined && (!Number.isInteger(args.limit) || Number(args.limit) < 1 || Number(args.limit) > 100)) throw new Error("Limit must be an integer from 1 to 100");
+    if (args.maxMedia !== undefined && (!Number.isInteger(args.maxMedia) || Number(args.maxMedia) < 0 || Number(args.maxMedia) > 300)) throw new Error("maxMedia must be an integer from 0 to 300");
+    if (args.details !== undefined && typeof args.details !== "boolean") throw new Error("details must be a boolean");
+    if (args.dir !== undefined) {
+      if (typeof args.dir !== "string" || !args.dir) throw new Error("dir must be a nonempty string");
+      resolveHomePath(args.dir);
+    }
+  }
   if (job.key !== undefined && (typeof job.key !== "string" || !job.key)) throw new Error("--key must be a nonempty string");
   if (job.notBefore !== undefined && (typeof job.notBefore !== "string" || !Number.isFinite(Date.parse(job.notBefore)))) throw new Error("--not-before must be a valid ISO date");
   return job;
@@ -621,7 +748,7 @@ if (Bun.argv[2] === "--service-daemon") {
   db.run("CREATE TABLE IF NOT EXISTS service_state (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
   const haltRow = db.query("SELECT value FROM service_state WHERE key = 'halted'").get() as { value: string } | null;
   let halted: { code: string; reason: string } | null = haltRow ? JSON.parse(haltRow.value) : null;
-  db.run("UPDATE jobs SET data = json_set(data, '$.status', 'queued') WHERE json_extract(data, '$.action') IN ('readPage','snapshot','getProfile','getComments','getPosts','getPost','screenshot','search') AND json_extract(data, '$.status') = 'running'");
+  db.run("UPDATE jobs SET data = json_set(data, '$.status', 'queued') WHERE json_extract(data, '$.action') IN ('readPage','snapshot','getProfile','getComments','getPosts','getPost','screenshot','search','downloadProfile') AND json_extract(data, '$.status') = 'running'");
   type ExtensionData = { token: string; challenge?: { clientNonce: string; serverNonce: string; version: string } };
   let extensionSocket: Bun.ServerWebSocket<ExtensionData> | null = null;
   let connectedVersion: string | null = null;
@@ -683,10 +810,50 @@ if (Bun.argv[2] === "--service-daemon") {
   });
   function pump() {
     if (workerWake) { clearTimeout(workerWake); workerWake = undefined; }
-    if (halted || browserBusy || !extensionSocket || !connectedVersion || !compatibleVersion(connectedVersion)) return;
-    const rows = db.query("SELECT id, data FROM jobs WHERE json_extract(data, '$.action') IN ('readPage','snapshot','getProfile','getComments','getPosts','getPost','screenshot','search') AND json_extract(data, '$.status') = 'queued' ORDER BY id").all() as { id: number; data: string }[];
+    if (halted || !extensionSocket || !connectedVersion || !compatibleVersion(connectedVersion)) return;
     const now = Date.now();
     let wakeAt = Infinity;
+    const compRow = (db.query("SELECT id, data FROM jobs WHERE json_extract(data, '$.action') = 'downloadProfile' AND json_extract(data, '$.status') = 'queued' ORDER BY id").all() as { id: number; data: string }[]).find((candidate) => {
+      const job = JSON.parse(candidate.data);
+      const at = job.notBefore ? Date.parse(job.notBefore) : 0;
+      if (at > now) { wakeAt = Math.min(wakeAt, at); return false; }
+      return true;
+    });
+    if (compRow) {
+      const compJob = JSON.parse(compRow.data);
+      compJob.status = "running";
+      db.query("UPDATE jobs SET data = ? WHERE id = ?").run(JSON.stringify(compJob), compRow.id);
+      (async () => {
+        try {
+          const step = async (action: string, args: Record<string, unknown>) => {
+            const sub = validateJob({ action, args });
+            const subRow = db.query("INSERT INTO jobs (data) VALUES (?) RETURNING id").get(JSON.stringify({ ...sub, status: "queued", parent: compRow.id })) as { id: number };
+            queueMicrotask(pump);
+            const deadline = Date.now() + 75000;
+            while (Date.now() < deadline) {
+              const check = db.query("SELECT data FROM jobs WHERE id = ?").get(subRow.id) as { data: string };
+              const current = JSON.parse(check.data);
+              if (current.status === "done") return current.result;
+              if (current.status === "failed") {
+                if (current.error?.code === "HALT") throw new Error(`HALT: ${current.error.reason}`);
+                throw new Error(typeof current.error === "object" ? current.error?.reason : current.error);
+              }
+              await Bun.sleep(50);
+            }
+            throw new Error(`Subtask ${action} timed out`);
+          };
+          const res = await downloadProfile(compJob.args, step);
+          compJob.status = "done"; compJob.result = res;
+        } catch (e: any) {
+          compJob.status = "failed"; compJob.error = e?.message || String(e);
+        } finally {
+          db.query("UPDATE jobs SET data = ? WHERE id = ?").run(JSON.stringify(compJob), compRow.id);
+          queueMicrotask(pump);
+        }
+      })();
+    }
+    if (browserBusy) return;
+    const rows = db.query("SELECT id, data FROM jobs WHERE json_extract(data, '$.action') IN ('readPage','snapshot','getProfile','getComments','getPosts','getPost','screenshot','search') AND json_extract(data, '$.status') = 'queued' ORDER BY id").all() as { id: number; data: string }[];
     const row = rows.find((candidate) => {
       const job = JSON.parse(candidate.data);
       const at = job.notBefore ? Date.parse(job.notBefore) : 0;
@@ -907,7 +1074,7 @@ if (Bun.argv[2] === "--service-daemon") {
   } else if (Bun.argv[2] === "tabs") {
     console.log("Usage: socmedia tabs <list|use|clear> [options]\n\nCommands:\n  list         List Socmedia CLI group tabs and the selected tab\n  use <tabId>  Select an open Instagram, Facebook or YouTube tab by its numeric ID\n  clear        Clear the selected tab and return to the Socmedia CLI group\n\nOptions:\n  --json       Print the result as JSON\n  --help       Show this help message");
   } else if (Bun.argv[2] === "profile") {
-    console.log("Usage: socmedia profile <get|posts> <url> [options]\n\nCommands:\n  get <url>        Read an Instagram or Facebook profile/page via its HTTPS URL\n  posts <url>      List posts from an Instagram or Facebook profile/page\n\nOptions:\n  --limit N        With posts, maximum posts from 1 to 100 (default: 12)\n  --json           Print the result as JSON\n  --help           Show this help message\n\nSuccessful profile reads update local contacts. Fields may be null or incomplete.");
+    console.log("Usage: socmedia profile <get|posts|download> <url> [options]\n\nCommands:\n  get <url>         Read an Instagram or Facebook profile/page via its HTTPS URL\n  posts <url>       List posts from an Instagram or Facebook profile/page\n  download <url>    Collect profile, screenshot, posts and media into ~/socmedia-data\n\nOptions:\n  --limit N         With posts or download, maximum posts from 1 to 100 (default: 12)\n  --details         With download, fetch details of each post (default: true)\n  --no-details      With download, skip post detail fetch\n  --max-media N     With download, maximum media files from 0 to 300 (default: 50)\n  --dir PATH        With download, custom destination inside home\n  --background      With download, run in background via service queue\n  --json            Print the result as JSON\n  --help            Show this help message\n\nSuccessful profile reads update local contacts. Fields may be null or incomplete.");
   } else if (Bun.argv[2] === "contacts") {
     console.log("Usage: socmedia contacts <list|update|export> [options]\n\nCommands:\n  list              List locally stored contacts\n  update <id>       Update a contact by its ID; provide --status and/or --note\n  export            Export filtered contacts to a file inside home\n\nOptions:\n  --status STATUS   Filter list/export or set status: new, messaged, replied, won, rejected, skip\n  --platform NAME   Filter list/export by ig or fb\n  --note TEXT       Set note on update (maximum 2000 characters; empty clears it)\n  --format FORMAT   Export as csv, json or jsonl (default: csv)\n  --path PATH       Export destination inside home (default: ~/socmedia-data/contacts-<date>.<format>)\n  --json            Print the command result as JSON\n  --help            Show this help message\n\nInstagram and Facebook profile reads populate contacts; import is not implemented yet.");
   } else if (Bun.argv[2] === "post") {
@@ -1026,6 +1193,43 @@ if (Bun.argv[2] === "--service-daemon") {
       args.limit = Number(value);
     }
     console.log(JSON.stringify(await runPageJob("getPosts", args)));
+  } catch (error) { console.error(error instanceof Error ? error.message : String(error)); process.exitCode = 1; }
+} else if (Bun.argv[2] === "profile" && Bun.argv[3] === "download") {
+  try {
+    const url = profileUrl(Bun.argv[4]);
+    const args: { url: string; limit?: number; details?: boolean; maxMedia?: number; dir?: string } = { url, limit: 12, details: true, maxMedia: 50 };
+    let background = false;
+    for (let i = 5; i < Bun.argv.length; i++) {
+      const option = Bun.argv[i];
+      if (option === "--json") continue;
+      if (option === "--background") {
+        background = true;
+      } else if (option === "--details") {
+        args.details = true;
+      } else if (option === "--no-details") {
+        args.details = false;
+      } else if (option === "--limit") {
+        const val = Bun.argv[++i];
+        if (!val || !/^[1-9]\d*$/.test(val) || Number(val) > 100) throw new Error("--limit must be an integer from 1 to 100");
+        args.limit = Number(val);
+      } else if (option === "--max-media") {
+        const val = Bun.argv[++i];
+        if (!val || !/^(0|[1-9]\d*)$/.test(val) || Number(val) > 300) throw new Error("--max-media must be an integer from 0 to 300");
+        args.maxMedia = Number(val);
+      } else if (option === "--dir") {
+        const val = Bun.argv[++i];
+        if (!val) throw new Error("Missing value for --dir");
+        resolveHomePath(val);
+        args.dir = val;
+      } else throw new Error(`Unknown profile option: ${option}`);
+    }
+    if (background) {
+      const job = validateJob({ action: "downloadProfile", args });
+      const queued = await queueRequest(`queue enqueue ${JSON.stringify(job)}`) as { id: number };
+      console.log(JSON.stringify({ queued: true, id: queued.id }));
+    } else {
+      console.log(JSON.stringify(await downloadProfile(args, (act, a) => runPageJob(act, a))));
+    }
   } catch (error) { console.error(error instanceof Error ? error.message : String(error)); process.exitCode = 1; }
 } else if (Bun.argv[2] === "page" && (Bun.argv[3] === "snapshot" || Bun.argv[3] === "read")) {
   try {
@@ -1183,4 +1387,4 @@ if (Bun.argv[2] === "--service-daemon") {
   catch (error) { console.error(error instanceof Error ? error.message : String(error)); process.exitCode = 1; }
 }
 
-export { isPrivateHost, isMediaHost, mediaExt, safeSeg, postId, postDir, downloadPostMedia, parseDataUrl, screenshotPath, resolveHomePath };
+export { isPrivateHost, isMediaHost, mediaExt, safeSeg, postId, postDir, downloadPostMedia, parseDataUrl, screenshotPath, resolveHomePath, profileDir, downloadProfile, profileMarkdown };

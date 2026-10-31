@@ -8,10 +8,10 @@ socmedia (CLI)  --HTTP+токен-->  локальний сервіс (Bun)  --W
 
 Сервіс — єдиний власник черги (SQLite), стану зупинки (HALT), відновлення завдань та з'єднання з розширенням.
 
-> **Статус реалізації (v0.9.0):**
-> - Реалізовано й перевірено автоматичними тестами: життєвий цикл сервісу, SQLite-черга з відновленням незавершених завдань після перезапуску та обриву WebSocket, сполучення розширення (HMAC-SHA256, фіксований ID), керування вкладками (`tabs list|use|clear`), читання сторінки й snapshot (`page read|snapshot`), скриншоти сторінки, постів, профілів та елементів (`screenshot`), пошук на Instagram і Facebook (`search`), читання профілів Instagram і Facebook (`profile get`), читання списку постів профілю (`profile posts`), деталі постів Instagram і Facebook із завантаженням медіа (`post get` з `--download`/`--slides`), локальні контакти (`contacts list|update|export`), коментарі до постів Instagram та Facebook (`post comments`).
+> **Статус реалізації (v0.10.0):**
+> - Реалізовано й перевірено автоматичними тестами: життєвий цикл сервісу, SQLite-черга з відновленням незавершених завдань після перезапуску та обриву WebSocket, сполучення розширення (HMAC-SHA256, фіксований ID), керування вкладками (`tabs list|use|clear`), читання сторінки й snapshot (`page read|snapshot`), скриншоти сторінки, постів, профілів та елементів (`screenshot`), пошук на Instagram і Facebook (`search`), читання профілів Instagram і Facebook (`profile get`), читання списку постів профілю (`profile posts`), завантаження повного профілю з медіа та markdown-звітом (`profile download`), деталі постів Instagram і Facebook із завантаженням медіа (`post get` з `--download`/`--slides`), локальні контакти (`contacts list|update|export`), коментарі до постів Instagram та Facebook (`post comments`).
 > - **Не перевірено наживо:** живий Chrome, реальні сайти Instagram, Facebook та YouTube ще не перевірялися.
-> - **Ще не реалізовано:** завантаження повного профілю (`profile download`), повідомлення inbox, YouTube через Studio UI.
+> - **Ще не реалізовано:** повідомлення inbox (`inbox list|read`, `message send`), YouTube через Studio UI.
 
 ## Швидкий старт
 
