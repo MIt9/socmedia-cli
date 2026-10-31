@@ -1,18 +1,78 @@
-import { closeSync, lstatSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
-import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
+import { closeSync, cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { createConnection, createServer } from "node:net";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import { dlopen, FFIType } from "bun:ffi";
 import { Database } from "bun:sqlite";
+import packageInfo from "../package.json";
 
 const stateDir = process.env.SOCMEDIA_STATE_DIR ?? join(homedir(), ".socmedia-cli");
 const socketPath = join(stateDir, "service.sock");
 const lockPath = join(stateDir, "service.lock");
 const identity = "socmedia-service-v1";
 const pairingPath = join(stateDir, "extension-pairing.json");
-const extensionVersion = "0.1.0";
+const configPath = join(stateDir, "config.json");
+const extensionVersion = packageInfo.version;
+const extensionPath = join(stateDir, "extension");
+
+function readConfig(): Record<string, unknown> {
+  try {
+    const config = JSON.parse(readFileSync(configPath, "utf8"));
+    if (!config || typeof config !== "object" || Array.isArray(config)) throw new Error("Config must be an object");
+    return config;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return {};
+    throw error;
+  }
+}
+
+function effectivePort() {
+  const config = readConfig();
+  const env = process.env.SOCMEDIA_EXTENSION_PORT;
+  if (env !== undefined) {
+    if (!/^\d+$/.test(env) || Number(env) > 65535) throw new Error("SOCMEDIA_EXTENSION_PORT must be 0-65535");
+    return { port: Number(env), source: "environment", configuredPort: config.port ?? null };
+  }
+  if (config.port !== undefined && (!Number.isInteger(config.port) || Number(config.port) < 1 || Number(config.port) > 65535)) throw new Error("Configured port must be an integer from 1 to 65535");
+  return config.port === undefined ? { port: 47842, source: "default", configuredPort: null } : { port: Number(config.port), source: "config", configuredPort: config.port };
+}
+
+function writeConfig(config: Record<string, unknown>) {
+  mkdirSync(stateDir, { recursive: true, mode: 0o700 });
+  const temporary = join(stateDir, `.config-${randomBytes(8).toString("hex")}`);
+  try { writeFileSync(temporary, JSON.stringify(config), { mode: 0o600, flag: "wx" }); renameSync(temporary, configPath); }
+  finally { rmSync(temporary, { force: true }); }
+}
+
+function installExtension() {
+  const source = fileURLToPath(new URL("../extension/", import.meta.url));
+  const manifest = JSON.parse(readFileSync(join(source, "manifest.json"), "utf8"));
+  if (manifest.version !== extensionVersion || typeof manifest.key !== "string" || !manifest.key) throw new Error("Extension manifest version or public key is invalid");
+  const hash = createHash("sha256").update(Buffer.from(manifest.key, "base64")).digest("hex").slice(0, 32);
+  const id = [...hash].map((nibble) => String.fromCharCode(97 + parseInt(nibble, 16))).join("");
+  mkdirSync(stateDir, { recursive: true, mode: 0o700 });
+  if (existsSync(extensionPath) && !lstatSync(extensionPath).isDirectory()) throw new Error("Extension path exists and is not a directory");
+  const staged = mkdtempSync(join(stateDir, ".extension-install-"));
+  const backup = `${staged}-previous`;
+  let movedPrevious = false;
+  try {
+    for (const file of ["manifest.json", "background.js", "popup.html", "popup.js", "README.md"]) cpSync(join(source, file), join(staged, file));
+    cpSync(join(source, "icons"), join(staged, "icons"), { recursive: true });
+    if (existsSync(extensionPath)) { renameSync(extensionPath, backup); movedPrevious = true; }
+    try { renameSync(staged, extensionPath); }
+    catch (error) { if (movedPrevious) renameSync(backup, extensionPath); throw error; }
+    if (movedPrevious) rmSync(backup, { recursive: true, force: true });
+  } finally { rmSync(staged, { recursive: true, force: true }); }
+  return { path: extensionPath, id, steps: ["Open chrome://extensions and enable Developer mode", "Choose Load unpacked", `Select ${extensionPath}`] };
+}
+const compatibleVersion = (version: string) => {
+  const requested = /^(\d+)\.(\d+)\.(\d+)$/.exec(version);
+  const current = /^(\d+)\.(\d+)\.(\d+)$/.exec(extensionVersion);
+  return !!requested && !!current && requested[1] === current[1] && requested[2] === current[2];
+};
 const actions = new Set(["getProfile", "getPosts", "getPost", "getComments", "search", "screenshot", "readInbox", "readThread", "readPage", "snapshot", "scroll", "listTabs", "useTab", "ytStudioRead", "click", "downloadProfile"]);
 
 function validateJob(value: unknown) {
@@ -20,12 +80,16 @@ function validateJob(value: unknown) {
   const job = value as { action?: unknown; args?: unknown; key?: unknown; notBefore?: unknown };
   if (typeof job.action !== "string" || !actions.has(job.action)) throw new Error("Unknown or restricted action");
   if (!job.args || typeof job.args !== "object" || Array.isArray(job.args)) throw new Error("--args must be a JSON object");
+  if (job.action === "readPage") {
+    const args = job.args as Record<string, unknown>;
+    if (Object.keys(args).some((key) => key !== "maxLines") || (args.maxLines !== undefined && (!Number.isInteger(args.maxLines) || Number(args.maxLines) < 1 || Number(args.maxLines) > 1000))) throw new Error("readPage maxLines must be an integer from 1 to 1000");
+  }
   if (job.key !== undefined && (typeof job.key !== "string" || !job.key)) throw new Error("--key must be a nonempty string");
   if (job.notBefore !== undefined && (typeof job.notBefore !== "string" || !Number.isFinite(Date.parse(job.notBefore)))) throw new Error("--not-before must be a valid ISO date");
   return job;
 }
 
-async function status(): Promise<{ running: boolean; pid?: number; extension?: unknown }> {
+async function status(): Promise<{ running: boolean; pid?: number; version?: string; extension?: unknown; halted?: unknown; extensionUrl?: string; portSource?: string }> {
   return new Promise((resolve) => {
     const socket = createConnection(socketPath);
     let data = "";
@@ -39,7 +103,7 @@ async function status(): Promise<{ running: boolean; pid?: number; extension?: u
       try {
         const response = JSON.parse(data.split("\n")[0]!);
         if (response.identity === identity && Number.isInteger(response.pid) && response.pid > 0) {
-          resolve({ running: true, pid: response.pid, extension: response.extension });
+          resolve({ running: true, pid: response.pid, version: response.version, extension: response.extension, halted: response.halted, extensionUrl: response.extensionUrl, portSource: response.portSource });
           return;
         }
       } catch { /* not a socmedia response */ }
@@ -111,7 +175,7 @@ async function queueRequest(command: string): Promise<unknown> {
             socket.write(command + "\n");
           } else {
             clearTimeout(timer); socket.destroy();
-            if (message.error) reject(new Error(message.error)); else resolve(message);
+            if (message.error && !message.status) reject(new Error(message.error)); else resolve(message);
             return;
           }
         } catch (error) { clearTimeout(timer); socket.destroy(); reject(error); return; }
@@ -144,14 +208,20 @@ if (Bun.argv[2] === "--service-daemon") {
   }
   const db = new Database(join(stateDir, "state.sqlite"));
   db.run("CREATE TABLE IF NOT EXISTS jobs (id INTEGER PRIMARY KEY, data TEXT NOT NULL)");
+  db.run("CREATE TABLE IF NOT EXISTS service_state (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+  const haltRow = db.query("SELECT value FROM service_state WHERE key = 'halted'").get() as { value: string } | null;
+  let halted: { code: string; reason: string } | null = haltRow ? JSON.parse(haltRow.value) : null;
+  db.run("UPDATE jobs SET data = json_set(data, '$.status', 'queued') WHERE json_extract(data, '$.action') = 'readPage' AND json_extract(data, '$.status') = 'running'");
   type ExtensionData = { token: string; challenge?: { clientNonce: string; serverNonce: string; version: string } };
   let extensionSocket: Bun.ServerWebSocket<ExtensionData> | null = null;
   let connectedVersion: string | null = null;
   const pending = new Map<string, { ws: Bun.ServerWebSocket<ExtensionData>; finish: (reply: unknown) => void; timer: ReturnType<typeof setTimeout> }>();
+  let browserBusy = false;
+  let workerWake: ReturnType<typeof setTimeout> | undefined;
   const extensionTimeout = Number(process.env.SOCMEDIA_EXTENSION_TIMEOUT_MS ?? "10000");
   if (!Number.isInteger(extensionTimeout) || extensionTimeout < 1 || extensionTimeout > 12000) throw new Error("SOCMEDIA_EXTENSION_TIMEOUT_MS must be 1-12000");
-  const port = Number(process.env.SOCMEDIA_EXTENSION_PORT ?? "47842");
-  if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error("SOCMEDIA_EXTENSION_PORT must be 0-65535");
+  const portConfig = effectivePort();
+  const port = portConfig.port;
   const extensionServer = Bun.serve<ExtensionData>({
     hostname: "127.0.0.1", port,
     fetch(request, server) {
@@ -170,7 +240,8 @@ if (Bun.argv[2] === "--service-daemon") {
             const request = pending.get(hello.id);
             if (!request || request.ws !== ws) return;
             pending.delete(hello.id); clearTimeout(request.timer);
-            request.finish(hello.error ? { error: String(hello.error) } : hello.result);
+            if (hello.error?.code === "HALT" && typeof hello.error.reason === "string" && hello.error.reason.length > 0 && hello.error.reason.length <= 500) request.finish({ halt: { code: "HALT", reason: hello.error.reason } });
+            else request.finish(hello.error ? { error: String(hello.error) } : hello.result);
             return;
           }
           if (hello.type === "hello" && !ws.data.challenge && typeof hello.version === "string" && /^[a-f0-9]{64}$/.test(hello.clientNonce)) {
@@ -188,7 +259,8 @@ if (Bun.argv[2] === "--service-daemon") {
           if (extensionSocket && extensionSocket !== ws) extensionSocket.close(1000, "Replaced");
           extensionSocket = ws;
           connectedVersion = challenge.version;
-          ws.send(JSON.stringify({ type: "hello", version: extensionVersion, compatible: challenge.version === extensionVersion }));
+          ws.send(JSON.stringify({ type: "hello", version: extensionVersion, compatible: compatibleVersion(challenge.version) }));
+          queueMicrotask(pump);
         } catch { ws.close(1008, "Invalid hello"); }
       },
       close(ws) {
@@ -199,24 +271,78 @@ if (Bun.argv[2] === "--service-daemon") {
       },
     },
   });
-  const extensionStatus = () => ({ connected: extensionSocket !== null, version: connectedVersion, compatible: connectedVersion === null ? null : connectedVersion === extensionVersion, port: extensionServer.port });
+  function pump() {
+    if (workerWake) { clearTimeout(workerWake); workerWake = undefined; }
+    if (halted || browserBusy || !extensionSocket || !connectedVersion || !compatibleVersion(connectedVersion)) return;
+    const rows = db.query("SELECT id, data FROM jobs WHERE json_extract(data, '$.action') = 'readPage' AND json_extract(data, '$.status') = 'queued' ORDER BY id").all() as { id: number; data: string }[];
+    const now = Date.now();
+    let wakeAt = Infinity;
+    const row = rows.find((candidate) => {
+      const job = JSON.parse(candidate.data);
+      const at = job.notBefore ? Date.parse(job.notBefore) : 0;
+      if (at > now) { wakeAt = Math.min(wakeAt, at); return false; }
+      return true;
+    });
+    if (!row) {
+      if (Number.isFinite(wakeAt)) workerWake = setTimeout(pump, Math.min(wakeAt - now, 2 ** 31 - 1));
+      return;
+    }
+    const job = JSON.parse(row.data);
+    job.status = "running";
+    db.query("UPDATE jobs SET data = ? WHERE id = ?").run(JSON.stringify(job), row.id);
+    browserBusy = true;
+    const ws = extensionSocket;
+    const id = randomBytes(16).toString("hex");
+    const finish = (reply: unknown) => {
+      const halt = reply && typeof reply === "object" && "halt" in reply ? (reply as { halt: { code: string; reason: string } }).halt : null;
+      const error = reply && typeof reply === "object" && "error" in reply ? String((reply as { error: unknown }).error) : null;
+      if (halt) { halted = halt; job.status = "failed"; job.error = halt; }
+      else if (error === "Extension disconnected") { job.status = "queued"; }
+      else if (error) { job.status = "failed"; job.error = error; }
+      else { job.status = "done"; job.result = reply; }
+      db.transaction(() => {
+        if (halt) db.query("INSERT INTO service_state (key, value) VALUES ('halted', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").run(JSON.stringify(halt));
+        db.query("UPDATE jobs SET data = ? WHERE id = ?").run(JSON.stringify(job), row.id);
+      })();
+      browserBusy = false;
+      queueMicrotask(pump);
+    };
+    const timer = setTimeout(() => { pending.delete(id); finish({ error: "Extension request timed out" }); }, extensionTimeout);
+    pending.set(id, { ws, finish, timer });
+    ws.send(JSON.stringify({ type: "request", id, action: "readPage", args: job.args }));
+  }
+  const extensionStatus = () => ({ connected: extensionSocket !== null, version: connectedVersion, compatible: connectedVersion === null ? null : compatibleVersion(connectedVersion), port: extensionServer.port });
   const server = createServer((socket) => {
-    socket.write(JSON.stringify({ identity, pid: process.pid, extension: extensionStatus() }) + "\n");
+    socket.write(JSON.stringify({ identity, pid: process.pid, version: extensionVersion, extension: extensionStatus(), halted, extensionUrl: `ws://127.0.0.1:${extensionServer.port}/extension`, portSource: portConfig.source }) + "\n");
     let input = "";
     socket.on("data", (data) => {
       input += data.toString();
       if (!input.includes("\n")) return;
       const command = input.split("\n")[0];
       if (command === "stop") { socket.end(); shutdown(); }
-      else if (command === "tabs list") {
+      else if (command === "service resume") {
+        db.query("DELETE FROM service_state WHERE key = 'halted'").run();
+        halted = null;
+        socket.end(JSON.stringify({ halted: null }) + "\n");
+        queueMicrotask(pump);
+      }
+      else if (command === "tabs list" || command === "tabs clear" || command?.startsWith("tabs use ")) {
+        if (browserBusy) { socket.end(JSON.stringify({ error: "Browser worker is busy" }) + "\n"); return; }
+        let tabId: number | null = null;
+        if (command.startsWith("tabs use ")) {
+          const rawId = command.slice("tabs use ".length);
+          tabId = Number(rawId);
+          if (!/^(0|[1-9]\d*)$/.test(rawId) || !Number.isSafeInteger(tabId)) { socket.end(JSON.stringify({ error: "Tab ID must be a non-negative integer" }) + "\n"); return; }
+        }
         if (!extensionSocket) { socket.end(JSON.stringify({ error: "Extension not connected" }) + "\n"); return; }
-        if (connectedVersion !== extensionVersion) { socket.end(JSON.stringify({ error: "Extension version incompatible" }) + "\n"); return; }
+        if (!connectedVersion || !compatibleVersion(connectedVersion)) { socket.end(JSON.stringify({ error: "Extension version incompatible" }) + "\n"); return; }
         const id = randomBytes(16).toString("hex");
         const ws = extensionSocket;
-        const finish = (reply: unknown) => socket.end(JSON.stringify(reply) + "\n");
+        browserBusy = true;
+        const finish = (reply: unknown) => { browserBusy = false; socket.end(JSON.stringify(reply) + "\n"); queueMicrotask(pump); };
         const timer = setTimeout(() => { pending.delete(id); finish({ error: "Extension request timed out" }); }, extensionTimeout);
         pending.set(id, { ws, finish, timer });
-        ws.send(JSON.stringify({ type: "request", id, action: "tabs.list" }));
+        ws.send(JSON.stringify(command === "tabs list" ? { type: "request", id, action: "tabs.list" } : { type: "request", id, action: "tabs.use", args: { tabId } }));
       }
       else if (command === "queue list") {
         const rows = db.query("SELECT id, data FROM jobs ORDER BY id DESC").all() as { id: number; data: string }[];
@@ -248,6 +374,7 @@ if (Bun.argv[2] === "--service-daemon") {
             return { id: Number(inserted.lastInsertRowid), ...JSON.parse(data) };
           });
           socket.end(JSON.stringify(create()) + "\n");
+          queueMicrotask(pump);
         } catch (error) { socket.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }) + "\n"); }
       } else if (command?.startsWith("queue cancel ")) {
         const id = Number(command.slice("queue cancel ".length));
@@ -280,18 +407,50 @@ if (Bun.argv[2] === "--service-daemon") {
   });
   process.on("SIGTERM", shutdown);
   process.on("SIGINT", shutdown);
+} else if (Bun.argv[2] === "--version") {
+  console.log(extensionVersion);
 } else if (Bun.argv.includes("--help")) {
   if (Bun.argv[2] === "service") {
-    console.log("Usage: socmedia service <start|status|stop> [--json]\n\nCommands:\n  start   Start the local service or return the running service\n  status  Show service and extension connection status\n  stop    Stop the local service; succeed if already stopped\n\nOptions:\n  --json  Print the result as JSON\n  --help  Show this help message\n\nEnvironment:\n  SOCMEDIA_STATE_DIR             Service data directory\n  SOCMEDIA_EXTENSION_PORT        Extension WebSocket port (default: 47842; 0 selects an available port)\n  SOCMEDIA_EXTENSION_TIMEOUT_MS  Extension request timeout in milliseconds (default: 10000, range: 1-12000)");
+    console.log("Usage: socmedia service <start|status|stop|resume> [--json]\n\nCommands:\n  start   Start the local service or return the running service\n  status  Show service, halted state and extension connection status\n  stop    Stop the local service; succeed if already stopped\n  resume  Resume the queue after manually resolving a login or security challenge\n\nOptions:\n  --json  Print the result as JSON\n  --help  Show this help message\n\nEnvironment:\n  SOCMEDIA_STATE_DIR             Service data directory\n  SOCMEDIA_EXTENSION_PORT        Overrides saved config port (default: 47842; 0 selects an available port)\n  SOCMEDIA_EXTENSION_TIMEOUT_MS  Extension request timeout in milliseconds (default: 10000, range: 1-12000)\n\nPort changes apply after the service restarts.");
   } else if (Bun.argv[2] === "queue") {
-    console.log("Usage: socmedia queue <list|get|cancel|enqueue> [options]\n\nCommands:\n  list              List saved queue jobs\n  get <id>          Show a job by its positive numeric ID\n  cancel <id>       Cancel a queued job by ID; cancelling twice returns the same job\n  enqueue <action>  Queue a supported action without executing it\n\nOptions:\n  --args JSON       Action arguments as a JSON object (default: {})\n  --not-before TIME Earliest run time as an ISO date\n  --key KEY         Reuse the same job; changed action, args or time causes a key conflict\n  --json            Print the result as JSON\n  --help            Show this help message");
+    console.log("Usage: socmedia queue <list|get|cancel|enqueue> [options]\n\nCommands:\n  list              List saved queue jobs\n  get <id>          Show a job by its positive numeric ID\n  cancel <id>       Cancel a queued job by ID; cancelling twice returns the same job\n  enqueue <action>  Queue an action; only readPage currently executes (args: maxLines 1-1000, default 200)\n\nOptions:\n  --args JSON       Action arguments as a JSON object (default: {})\n  --not-before TIME Earliest run time as an ISO date\n  --key KEY         Reuse the same job; changed action, args or time causes a key conflict\n  --json            Print the result as JSON\n  --help            Show this help message");
   } else if (Bun.argv[2] === "tabs") {
-    console.log("Usage: socmedia tabs list [--json]\n\nCommands:\n  list    List Social bot group tabs and the selected tab\n\nOptions:\n  --json  Print the result as JSON\n  --help  Show this help message");
+    console.log("Usage: socmedia tabs <list|use|clear> [options]\n\nCommands:\n  list         List Socmedia CLI group tabs and the selected tab\n  use <tabId>  Select an open Instagram, Facebook or YouTube tab by its numeric ID\n  clear        Clear the selected tab and return to the Socmedia CLI group\n\nOptions:\n  --json       Print the result as JSON\n  --help       Show this help message");
+  } else if (Bun.argv[2] === "config") {
+    console.log("Usage: socmedia config <get|set|unset> port [value] [--json]\n\nCommands:\n  get port          Show the effective port and configuration source\n  set port <value>  Save a port from 1 to 65535\n  unset port        Remove the saved port\n\nOptions:\n  --json            Print the result as JSON\n  --help            Show this help message\n\nSOCMEDIA_EXTENSION_PORT overrides the saved port; changes apply when the service restarts.");
   } else if (Bun.argv[2] === "extension") {
-    console.log("Usage: socmedia extension pair --id ID [--json]\n\nCommands:\n  pair       Generate a pairing secret for the Chrome extension\n\nOptions:\n  --id ID    Chrome extension ID shown in chrome://extensions\n  --json     Print pairing details as JSON; secret is sensitive\n  --help     Show this help message\n\nPairing replaces any previous pairing; restart the service to disconnect existing clients.");
+    console.log("Usage: socmedia extension <install|path|pair> [options]\n\nCommands:\n  install    Copy the extension to its stable state directory and show Chrome setup steps\n  path       Show the stable extension directory\n  pair       Generate a pairing secret for the Chrome extension\n\nOptions:\n  --open     With install, open chrome://extensions in Google Chrome\n  --id ID    With pair, set the Chrome extension ID\n  --json     Print the result as JSON; pairing output contains a sensitive secret\n  --help     Show this help message\n\nPairing replaces any previous pairing; restart the service to disconnect existing clients.");
   } else {
-    console.log("Usage: socmedia [options]\n\nCommands:\n  service    Start or inspect the local service\n  queue      Inspect the service queue\n  extension  Pair the Chrome extension\n  tabs       Inspect extension work tabs\n\nOptions:\n  --help     Show this help message");
+    console.log("Usage: socmedia [options]\n\nCommands:\n  service    Start or inspect the local service\n  queue      Inspect the service queue\n  extension  Pair the Chrome extension\n  tabs       Inspect extension work tabs\n  config     Configure the service\n\nOptions:\n  --version  Show the CLI version\n  --help     Show this help message");
   }
+} else if (Bun.argv[2] === "config") {
+  try {
+    const action = Bun.argv[3];
+    if (Bun.argv[4] !== "port" || !["get", "set", "unset"].includes(action ?? "")) throw new Error("Use config get|set|unset port");
+    const rest = Bun.argv.slice(action === "set" ? 6 : 5);
+    if (rest.some((option) => option !== "--json")) throw new Error("Unknown config option");
+    if (action === "set") {
+      const value = Bun.argv[5];
+      if (!value || !/^[1-9]\d*$/.test(value) || Number(value) > 65535) throw new Error("Port must be an integer from 1 to 65535");
+      writeConfig({ ...readConfig(), port: Number(value) });
+    } else if (action === "unset") {
+      const config = readConfig(); delete config.port; writeConfig(config);
+    }
+    console.log(JSON.stringify({ ...effectivePort(), ...(action !== "get" && { note: "Changes apply after the service restarts" }) }));
+  } catch (error) { console.error(error instanceof Error ? error.message : String(error)); process.exitCode = 1; }
+} else if (Bun.argv[2] === "extension" && (Bun.argv[3] === "install" || Bun.argv[3] === "path")) {
+  try {
+    const options = Bun.argv.slice(4);
+    const install = Bun.argv[3] === "install";
+    if (options.some((option) => option !== "--json" && !(install && option === "--open"))) throw new Error("Unknown extension option");
+    const result = install ? installExtension() : { path: extensionPath };
+    if (install && options.includes("--open")) {
+      if (process.platform !== "darwin") throw new Error("--open is currently supported on macOS only");
+      const opened = spawnSync("open", ["-a", "Google Chrome", "chrome://extensions"]);
+      if (opened.error || opened.status !== 0) throw new Error("Extension copied, but Chrome could not be opened; open chrome://extensions manually");
+    }
+    console.log(JSON.stringify(result));
+  } catch (error) { console.error(error instanceof Error ? error.message : String(error)); process.exitCode = 1; }
 } else if (Bun.argv[2] === "extension" && Bun.argv[3] === "pair") {
   try {
     if (Bun.argv[4] !== "--id" || !/^[a-p]{32}$/.test(Bun.argv[5] ?? "") || Bun.argv.slice(6).some((arg) => arg !== "--json")) throw new Error("Provide --id followed by the 32-character Chrome extension ID");
@@ -312,9 +471,20 @@ if (Bun.argv[2] === "--service-daemon") {
 } else if (Bun.argv[2] === "service" && Bun.argv[3] === "stop") {
   try { console.log(JSON.stringify(await stop())); }
   catch (error) { console.error(error instanceof Error ? error.message : String(error)); process.exitCode = 1; }
+} else if (Bun.argv[2] === "service" && Bun.argv[3] === "resume") {
+  try { console.log(JSON.stringify(await queueRequest("service resume"))); }
+  catch (error) { console.error(error instanceof Error ? error.message : String(error)); process.exitCode = 1; }
 } else if (Bun.argv[2] === "tabs" && Bun.argv[3] === "list") {
   try { console.log(JSON.stringify(await queueRequest("tabs list"))); }
   catch (error) { console.error(error instanceof Error ? error.message : String(error)); process.exitCode = 1; }
+} else if (Bun.argv[2] === "tabs" && (Bun.argv[3] === "use" || Bun.argv[3] === "clear")) {
+  try {
+    const rawId = Bun.argv[4];
+    if (Bun.argv[3] === "use" && (!rawId || !/^(0|[1-9]\d*)$/.test(rawId) || !Number.isSafeInteger(Number(rawId)))) throw new Error("Tab ID must be a non-negative integer");
+    const rest = Bun.argv.slice(Bun.argv[3] === "use" ? 5 : 4);
+    if (rest.some((arg) => arg !== "--json")) throw new Error("Unknown tabs option");
+    console.log(JSON.stringify(await queueRequest(Bun.argv[3] === "use" ? `tabs use ${rawId}` : "tabs clear")));
+  } catch (error) { console.error(error instanceof Error ? error.message : String(error)); process.exitCode = 1; }
 } else if (Bun.argv[2] === "queue" && Bun.argv[3] === "list") {
   try { console.log(JSON.stringify(await queueRequest("queue list"))); }
   catch (error) { console.error(error instanceof Error ? error.message : String(error)); process.exitCode = 1; }
