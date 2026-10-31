@@ -1145,6 +1145,52 @@ if (Bun.argv[2] === "--service-daemon") {
           const contacts = rows.map((row) => JSON.parse(row.data)).filter((contact) => (!filters.status || contact.status === filters.status) && (!filters.platform || contact.platform === filters.platform));
           socket.end(JSON.stringify({ count: contacts.length, file: join(stateDir, "state.sqlite"), contacts }) + "\n");
         } catch (error) { socket.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }) + "\n"); }
+      } else if (command?.startsWith("contacts import ")) {
+        try {
+          const { from } = JSON.parse(command.slice("contacts import ".length));
+          const sourceDir = from ? resolveHomePath(from) : join(homedir(), ".socmedia-mcp");
+          let contactsImported = 0;
+          let messagesImported = 0;
+          const contactsFile = join(sourceDir, "contacts.jsonl");
+          if (existsSync(contactsFile)) {
+            const lines = readFileSync(contactsFile, "utf8").split("\n").filter((l) => l.trim());
+            db.transaction(() => {
+              for (const line of lines) {
+                try {
+                  const c = JSON.parse(line);
+                  if (c && typeof c.id === "string") {
+                    const existing = db.query("SELECT data FROM contacts WHERE id = ?").get(c.id);
+                    if (!existing) {
+                      db.query("INSERT INTO contacts (id, data) VALUES (?, ?)").run(c.id, JSON.stringify(c));
+                      contactsImported++;
+                    }
+                  }
+                } catch {}
+              }
+            })();
+          }
+          const messagesFile = join(sourceDir, "messages.jsonl");
+          if (existsSync(messagesFile)) {
+            const lines = readFileSync(messagesFile, "utf8").split("\n").filter((l) => l.trim());
+            db.transaction(() => {
+              for (const line of lines) {
+                try {
+                  const m = JSON.parse(line);
+                  if (m && m.at && m.to && m.text) {
+                    const existing = db.query("SELECT id FROM messages WHERE at = ? AND toUrl = ? AND text = ?").get(m.at, m.to, m.text);
+                    if (!existing) {
+                      db.query("INSERT INTO messages (at, platform, toUrl, text, status, error, jobId) VALUES (?, ?, ?, ?, ?, ?, ?)").run(
+                        m.at, m.platform || "ig", m.to, m.text, m.status || "sent", m.error || null, m.jobId || null
+                      );
+                      messagesImported++;
+                    }
+                  }
+                } catch {}
+              }
+            })();
+          }
+          socket.end(JSON.stringify({ contactsImported, messagesImported, source: sourceDir }) + "\n");
+        } catch (error) { socket.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }) + "\n"); }
       } else if (command?.startsWith("contacts export ")) {
         try {
           const args = JSON.parse(command.slice("contacts export ".length));
@@ -1278,7 +1324,7 @@ if (Bun.argv[2] === "--service-daemon") {
   } else if (Bun.argv[2] === "profile") {
     console.log("Usage: socmedia profile <get|posts|download> <url> [options]\n\nCommands:\n  get <url>         Read an Instagram or Facebook profile/page via its HTTPS URL\n  posts <url>       List posts from an Instagram or Facebook profile/page\n  download <url>    Collect profile, screenshot, posts and media into ~/socmedia-data\n\nOptions:\n  --limit N         With posts or download, maximum posts from 1 to 100 (default: 12)\n  --details         With download, fetch details of each post (default: true)\n  --no-details      With download, skip post detail fetch\n  --max-media N     With download, maximum media files from 0 to 300 (default: 50)\n  --dir PATH        With download, custom destination inside home\n  --background      With download, run in background via service queue\n  --json            Print the result as JSON\n  --help            Show this help message\n\nSuccessful profile reads update local contacts. Fields may be null or incomplete.");
   } else if (Bun.argv[2] === "contacts") {
-    console.log("Usage: socmedia contacts <list|update|export> [options]\n\nCommands:\n  list              List locally stored contacts\n  update <id>       Update a contact by its ID; provide --status and/or --note\n  export            Export filtered contacts to a file inside home\n\nOptions:\n  --status STATUS   Filter list/export or set status: new, messaged, replied, won, rejected, skip\n  --platform NAME   Filter list/export by ig or fb\n  --note TEXT       Set note on update (maximum 2000 characters; empty clears it)\n  --format FORMAT   Export as csv, json or jsonl (default: csv)\n  --path PATH       Export destination inside home (default: ~/socmedia-data/contacts-<date>.<format>)\n  --json            Print the command result as JSON\n  --help            Show this help message\n\nInstagram and Facebook profile reads populate contacts; import is not implemented yet.");
+    console.log("Usage: socmedia contacts <list|update|export|import> [options]\n\nCommands:\n  list              List locally stored contacts\n  update <id>       Update a contact by its ID; provide --status and/or --note\n  export            Export filtered contacts to a file inside home\n  import            Import contacts and message history from legacy ~/.socmedia-mcp\n\nOptions:\n  --status STATUS   Filter list/export or set status: new, messaged, replied, won, rejected, skip\n  --platform NAME   Filter list/export by ig or fb\n  --note TEXT       Set note on update (maximum 2000 characters; empty clears it)\n  --format FORMAT   Export as csv, json or jsonl (default: csv)\n  --path PATH       Export destination inside home (default: ~/socmedia-data/contacts-<date>.<format>)\n  --from DIR        With import, source directory containing contacts.jsonl / messages.jsonl\n  --json            Print the command result as JSON\n  --help            Show this help message\n\nInstagram and Facebook profile reads populate contacts.");
   } else if (Bun.argv[2] === "post") {
     console.log("Usage: socmedia post <get|comments> <url> [options]\n\nCommands:\n  get <url>       Read a post from Instagram or Facebook\n  comments <url>  Read Instagram or Facebook post comments\n\nOptions:\n  --download      With get, download media files to ~/socmedia-data\n  --slides        Alias for --download\n  --limit N       With comments, maximum comments from 1 to 500 (default: 20)\n  --json          Print the result as JSON\n  --help          Show this help message\n\nExpands available comments through Chrome debugger and reads visible English UI; results may be incomplete.");
   } else if (Bun.argv[2] === "page") {
@@ -1380,7 +1426,83 @@ if (Bun.argv[2] === "--service-daemon") {
         filters.platform = value;
       }
     }
-    console.log(JSON.stringify(await queueRequest(`contacts list ${JSON.stringify(filters)}`)));
+    const current = await status();
+    if (current.running) {
+      console.log(JSON.stringify(await queueRequest(`contacts list ${JSON.stringify(filters)}`)));
+    } else {
+      mkdirSync(stateDir, { recursive: true, mode: 0o700 });
+      const db = new Database(join(stateDir, "state.sqlite"));
+      db.run("CREATE TABLE IF NOT EXISTS contacts (id TEXT PRIMARY KEY, data TEXT NOT NULL)");
+      const rows = db.query("SELECT data FROM contacts ORDER BY rowid").all() as { data: string }[];
+      const contacts = rows.map((row) => JSON.parse(row.data)).filter((contact) => (!filters.status || contact.status === filters.status) && (!filters.platform || contact.platform === filters.platform));
+      db.close();
+      console.log(JSON.stringify({ count: contacts.length, file: join(stateDir, "state.sqlite"), contacts }));
+    }
+  } catch (error) { console.error(error instanceof Error ? error.message : String(error)); process.exitCode = 1; }
+} else if (Bun.argv[2] === "contacts" && Bun.argv[3] === "import") {
+  try {
+    let from: string | undefined;
+    for (let i = 4; i < Bun.argv.length; i++) {
+      const option = Bun.argv[i];
+      if (option === "--json") continue;
+      if (option === "--from") {
+        from = Bun.argv[++i];
+        if (!from) throw new Error("Missing value for --from");
+      } else throw new Error(`Unknown contacts import option: ${option}`);
+    }
+    const current = await status();
+    if (current.running) {
+      console.log(JSON.stringify(await queueRequest(`contacts import ${JSON.stringify({ from })}`)));
+    } else {
+      // Direct SQLite import if service is not running
+      mkdirSync(stateDir, { recursive: true, mode: 0o700 });
+      const db = new Database(join(stateDir, "state.sqlite"));
+      db.run("CREATE TABLE IF NOT EXISTS contacts (id TEXT PRIMARY KEY, data TEXT NOT NULL)");
+      db.run("CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY, at TEXT NOT NULL, platform TEXT NOT NULL, toUrl TEXT NOT NULL, text TEXT NOT NULL, status TEXT NOT NULL, error TEXT, jobId INTEGER)");
+      const sourceDir = from ? resolveHomePath(from) : join(homedir(), ".socmedia-mcp");
+      let contactsImported = 0;
+      let messagesImported = 0;
+      const contactsFile = join(sourceDir, "contacts.jsonl");
+      if (existsSync(contactsFile)) {
+        const lines = readFileSync(contactsFile, "utf8").split("\n").filter((l) => l.trim());
+        db.transaction(() => {
+          for (const line of lines) {
+            try {
+              const c = JSON.parse(line);
+              if (c && typeof c.id === "string") {
+                const existing = db.query("SELECT data FROM contacts WHERE id = ?").get(c.id);
+                if (!existing) {
+                  db.query("INSERT INTO contacts (id, data) VALUES (?, ?)").run(c.id, JSON.stringify(c));
+                  contactsImported++;
+                }
+              }
+            } catch {}
+          }
+        })();
+      }
+      const messagesFile = join(sourceDir, "messages.jsonl");
+      if (existsSync(messagesFile)) {
+        const lines = readFileSync(messagesFile, "utf8").split("\n").filter((l) => l.trim());
+        db.transaction(() => {
+          for (const line of lines) {
+            try {
+              const m = JSON.parse(line);
+              if (m && m.at && m.to && m.text) {
+                const existing = db.query("SELECT id FROM messages WHERE at = ? AND toUrl = ? AND text = ?").get(m.at, m.to, m.text);
+                if (!existing) {
+                  db.query("INSERT INTO messages (at, platform, toUrl, text, status, error, jobId) VALUES (?, ?, ?, ?, ?, ?, ?)").run(
+                    m.at, m.platform || "ig", m.to, m.text, m.status || "sent", m.error || null, m.jobId || null
+                  );
+                  messagesImported++;
+                }
+              }
+            } catch {}
+          }
+        })();
+      }
+      db.close();
+      console.log(JSON.stringify({ contactsImported, messagesImported, source: sourceDir }));
+    }
   } catch (error) { console.error(error instanceof Error ? error.message : String(error)); process.exitCode = 1; }
 } else if (Bun.argv[2] === "profile" && Bun.argv[3] === "get") {
   try {

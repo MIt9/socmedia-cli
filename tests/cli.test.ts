@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createServer } from "node:net";
@@ -907,6 +907,59 @@ test("youtube commands enforce channel allowlist, confirm gate and inspect studi
         await Bun.sleep(20);
       }
     }
+    await rm(stateDir, { recursive: true, force: true });
+    await rm(fakeHome, { recursive: true, force: true });
+  }
+});
+
+test("contacts import imports legacy contacts.jsonl and messages.jsonl idempotently", async () => {
+  const fakeHome = await mkdtemp(join(tmpdir(), "socmedia-import-home-"));
+  const stateDir = await mkdtemp(join(tmpdir(), "socmedia-import-state-"));
+  const legacyDir = join(fakeHome, ".socmedia-mcp");
+  await mkdir(legacyDir, { recursive: true });
+
+  const contact1 = { id: "ig:nasa", platform: "ig", username: "nasa", name: "NASA", status: "messaged", note: "VIP", firstSeen: "2026-01-01T00:00:00.000Z", lastSeen: "2026-01-02T00:00:00.000Z" };
+  const contact2 = { id: "fb:esa", platform: "fb", username: "esa", name: "ESA", status: "new", firstSeen: "2026-01-03T00:00:00.000Z", lastSeen: "2026-01-03T00:00:00.000Z" };
+  await Bun.write(join(legacyDir, "contacts.jsonl"), `${JSON.stringify(contact1)}\n${JSON.stringify(contact2)}\n`);
+
+  const msg1 = { at: "2026-01-02T10:00:00.000Z", platform: "ig", to: "https://www.instagram.com/nasa/", text: "Hello from MCP", status: "sent", jobId: 101 };
+  await Bun.write(join(legacyDir, "messages.jsonl"), `${JSON.stringify(msg1)}\n`);
+
+  const run = async (...args: string[]) => {
+    const cli = Bun.spawn(["bun", "run", "src/cli.ts", ...args], {
+      cwd: import.meta.dir + "/..",
+      env: { ...process.env, HOME: fakeHome, SOCMEDIA_STATE_DIR: stateDir, SOCMEDIA_EXTENSION_PORT: "0" },
+      stdout: "pipe", stderr: "pipe",
+    });
+    const [stdout, stderr, exit] = await Promise.all([new Response(cli.stdout).text(), new Response(cli.stderr).text(), cli.exited]);
+    return { stdout, stderr, exit };
+  };
+
+  try {
+    const helpRes = await run("contacts", "--help");
+    expect(helpRes.stdout).toContain("import");
+
+    const importRes = await run("contacts", "import", "--from", legacyDir, "--json");
+    expect(importRes.exit).toBe(0);
+    const parsedImport = JSON.parse(importRes.stdout);
+    expect(parsedImport.contactsImported).toBe(2);
+    expect(parsedImport.messagesImported).toBe(1);
+
+    // Idempotent repeat: existing records are not duplicated
+    const secondImport = await run("contacts", "import", "--from", legacyDir, "--json");
+    expect(secondImport.exit).toBe(0);
+    const parsedSecond = JSON.parse(secondImport.stdout);
+    expect(parsedSecond.contactsImported).toBe(0);
+    expect(parsedSecond.messagesImported).toBe(0);
+
+    const listRes = await run("contacts", "list", "--json");
+    expect(listRes.exit).toBe(0);
+    const listParsed = JSON.parse(listRes.stdout);
+    expect(listParsed.count).toBe(2);
+    const nasa = listParsed.contacts.find((c: any) => c.id === "ig:nasa");
+    expect(nasa.status).toBe("messaged");
+    expect(nasa.note).toBe("VIP");
+  } finally {
     await rm(stateDir, { recursive: true, force: true });
     await rm(fakeHome, { recursive: true, force: true });
   }
