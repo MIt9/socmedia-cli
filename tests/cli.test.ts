@@ -8,7 +8,7 @@ import { createHash, createHmac, randomBytes, webcrypto } from "node:crypto";
 import packageInfo from "../package.json";
 import manifest from "../extension/manifest.json";
 import { Database } from "bun:sqlite";
-import { isPrivateHost, isMediaHost, mediaExt, safeSeg, postId, postDir } from "../src/cli";
+import { isPrivateHost, isMediaHost, mediaExt, safeSeg, postId, postDir, parseDataUrl, screenshotPath, resolveHomePath } from "../src/cli";
 
 const projectVersion = packageInfo.version;
 
@@ -374,6 +374,133 @@ test("media helpers validate magic bytes, hosts and paths safely", () => {
   expect(safeSeg("../../../evil")).toBe("evil");
   expect(postId("https://www.instagram.com/p/Cx_123/")).toMatch(/^Cx_123/);
   expect(postId("https://www.facebook.com/sample/posts/123456789/")).toBe("123456789");
+
+  const minimalPng = Buffer.from("89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4890000000a49444154789c63000100000500010d0a2db40000000049454e44ae426082", "hex");
+  expect(parseDataUrl(`data:image/png;base64,${minimalPng.toString("base64")}`)).toEqual(minimalPng);
+  expect(() => parseDataUrl("not-a-data-url")).toThrow("Extension returned no PNG data URL");
+  expect(() => parseDataUrl("data:image/png;base64,bm90LXBuZw==")).toThrow("Screenshot data is not a PNG");
+
+  const p = screenshotPath("ig", "https://www.instagram.com/p/Cx_123/");
+  expect(p).toContain("socmedia-data/screenshots/ig-p-cx-123-");
+
+  expect(() => resolveHomePath("/etc/passwd")).toThrow("Path must be inside home");
+  expect(() => resolveHomePath("../../outside")).toThrow("Path must be inside home");
+});
+
+test("extension screenshot crops element and handles HALT checks", async () => {
+  const script = await Bun.file(new URL("../extension/background.js", import.meta.url)).text();
+  const tab = { id: 42, windowId: 4, active: true, status: "complete", url: "https://www.instagram.com/sample/" };
+  const location = { href: tab.url, pathname: "/sample/", hostname: "www.instagram.com" };
+  const rect = { left: 10, top: 20, right: 210, bottom: 220, width: 200, height: 200 };
+  const postElement = { getBoundingClientRect: () => rect };
+  const document = {
+    body: { innerText: "" },
+    querySelector: (sel: string) => sel.includes("article") ? postElement : null,
+    querySelectorAll: () => [],
+    scrollingElement: { scrollHeight: 1000, scrollTop: 0, clientHeight: 800 },
+  };
+  const windowObj = { devicePixelRatio: 2, innerWidth: 1000, innerHeight: 800 };
+  const ignore = { addListener() {} };
+  const context = {
+    chrome: {
+      tabs: {
+        get: async () => tab,
+        query: async () => [tab],
+        update: async (_: any, u: any) => Object.assign(tab, u),
+        captureVisibleTab: async () => "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==",
+      },
+      storage: { local: { get: async () => ({ cliSelectedTab: 42 }), set: async () => {} }, onChanged: ignore },
+      scripting: { executeScript: async () => [] },
+      alarms: { create: () => {}, onAlarm: ignore },
+      runtime: { onStartup: ignore },
+    },
+    WebSocket, console, URL, document, location, window: windowObj,
+    setTimeout: (fn: () => void, ms?: number) => { if ((ms ?? 0) < 10000) { fn(); return 0; } return setTimeout(fn, ms); },
+    clearTimeout: (id: any) => clearTimeout(id),
+  };
+  runInNewContext(script, context);
+  const crop = runInNewContext('pgGetCropRect(null, "post")', context);
+  expect(crop).toMatchObject({
+    crop: true,
+    dpr: 2,
+    x: 20,
+    y: 40,
+    width: 400,
+    height: 400,
+  });
+
+  const cropViewport = runInNewContext('pgGetCropRect(null, "viewport")', context);
+  expect(cropViewport).toMatchObject({ crop: false });
+});
+
+test("screenshot command validates arguments, writes PNG file inside home, and records queued job", async () => {
+  const fakeHome = await mkdtemp(join(tmpdir(), "socmedia-screenshot-home-"));
+  const stateDir = await mkdtemp(join(tmpdir(), "socmedia-screenshot-state-"));
+  const run = async (...args: string[]) => {
+    const cli = Bun.spawn(["bun", "run", "src/cli.ts", ...args], {
+      cwd: import.meta.dir + "/..",
+      env: { ...process.env, HOME: fakeHome, SOCMEDIA_STATE_DIR: stateDir, SOCMEDIA_EXTENSION_PORT: "0" },
+      stdout: "pipe", stderr: "pipe",
+    });
+    const [stdout, stderr, exit] = await Promise.all([new Response(cli.stdout).text(), new Response(cli.stderr).text(), cli.exited]);
+    return { stdout, stderr, exit };
+  };
+  let pid: number | undefined;
+  let ws: WebSocket | undefined;
+  try {
+    const help = await run("screenshot", "--help");
+    expect(help.stdout).toContain("--url");
+    expect(help.stdout).toContain("--target");
+    expect(help.stdout).toContain("--selector");
+    expect(help.stdout).toContain("--path");
+    expect(help.stdout).toContain("--json");
+
+    expect((await run("screenshot", "--target", "invalid", "--json")).exit).not.toBe(0);
+    expect((await run("screenshot", "--path", "/etc/outside.png", "--json")).exit).not.toBe(0);
+
+    const id = "g".repeat(32);
+    const pairing = JSON.parse((await run("extension", "pair", "--id", id, "--json")).stdout);
+    const started = JSON.parse((await run("service", "start", "--json")).stdout);
+    pid = started.pid;
+    ws = new WebSocket(`ws://127.0.0.1:${started.extension.port}/extension`, { headers: { Origin: `chrome-extension://${id}` } } as unknown as string[]);
+    await authenticateMock(ws, pairing.token);
+
+    const minimalPng = Buffer.from("89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4890000000a49444154789c63000100000500010d0a2db40000000049454e44ae426082", "hex");
+    const dataUrl = `data:image/png;base64,${minimalPng.toString("base64")}`;
+
+    ws.onmessage = (event) => {
+      const request = JSON.parse(String(event.data));
+      expect(request).toMatchObject({ action: "screenshot", args: { target: "viewport" } });
+      ws!.send(JSON.stringify({
+        type: "result",
+        id: request.id,
+        result: { dataUrl, width: 800, height: 600, url: "https://www.instagram.com/sample/" },
+      }));
+    };
+
+    const result = await run("screenshot", "--json");
+    expect(result.exit).toBe(0);
+    const parsed = JSON.parse(result.stdout);
+    expect(parsed.width).toBe(800);
+    expect(parsed.height).toBe(600);
+    expect(parsed.url).toBe("https://www.instagram.com/sample/");
+    expect(parsed.path).toContain(join(fakeHome, "socmedia-data", "screenshots"));
+    expect(parsed.dataUrl).toBeUndefined();
+
+    const fileBytes = await readFile(parsed.path);
+    expect(fileBytes.subarray(0, 8).toString("hex")).toBe("89504e470d0a1a0a");
+  } finally {
+    ws?.close();
+    if (pid) {
+      try { process.kill(pid, "SIGTERM"); } catch {}
+      for (let i = 0; i < 100; i++) {
+        try { process.kill(pid, 0); } catch { break; }
+        await Bun.sleep(20);
+      }
+    }
+    await rm(stateDir, { recursive: true, force: true });
+    await rm(fakeHome, { recursive: true, force: true });
+  }
 });
 
 test("profile posts validates profile URL and limit and returns queued result", async () => {

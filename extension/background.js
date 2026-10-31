@@ -673,6 +673,110 @@ async function getPost({ url }) {
   return execution?.result || null;
 }
 
+function pgGetCropRect(selector, target) {
+  let el = null;
+  if (selector) {
+    el = document.querySelector(selector);
+  } else if (target === "post") {
+    el = document.querySelector("article, [role=article], main");
+  } else if (target === "profile") {
+    el = document.querySelector("header, [role=main] header, main");
+  }
+
+  const dpr = window.devicePixelRatio || 1;
+  const vw = window.innerWidth;
+  const vh = window.innerHeight;
+
+  if (!el) {
+    return { crop: false, dpr, width: vw, height: vh, truncated: false };
+  }
+
+  const rect = el.getBoundingClientRect();
+  const visibleTop = Math.max(0, rect.top);
+  const visibleLeft = Math.max(0, rect.left);
+  const visibleRight = Math.min(vw, rect.right);
+  const visibleBottom = Math.min(vh, rect.bottom);
+
+  const visibleWidth = Math.max(0, visibleRight - visibleLeft);
+  const visibleHeight = Math.max(0, visibleBottom - visibleTop);
+  const truncated = rect.height > vh || rect.bottom > vh || rect.top < 0;
+
+  return {
+    crop: true,
+    truncated,
+    dpr,
+    x: Math.round(visibleLeft * dpr),
+    y: Math.round(visibleTop * dpr),
+    width: Math.round(visibleWidth * dpr),
+    height: Math.round(visibleHeight * dpr),
+  };
+}
+
+async function screenshot({ url, selector, target = "viewport" } = {}) {
+  let tabId;
+  if (url) {
+    const tab = await navigateSocial(url);
+    tabId = tab.id;
+  } else {
+    const active = await getSelectedTab();
+    tabId = active.id;
+  }
+  const current = await safeTab(tabId);
+  const [cropExec] = await chrome.scripting.executeScript({
+    target: { tabId },
+    func: pgGetCropRect,
+    args: [selector || null, target || "viewport"],
+  });
+  const cropInfo = cropExec?.result;
+  const tab = await chrome.tabs.get(tabId);
+  const fullDataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, { format: "png" });
+
+  if (!cropInfo || !cropInfo.crop || cropInfo.width <= 0 || cropInfo.height <= 0) {
+    return {
+      dataUrl: fullDataUrl,
+      width: cropInfo?.width || 0,
+      height: cropInfo?.height || 0,
+      url: current.url,
+      truncated: false,
+    };
+  }
+
+  try {
+    const res = await fetch(fullDataUrl);
+    const blob = await res.blob();
+    const bmp = await createImageBitmap(blob);
+    const sx = Math.min(Math.max(0, cropInfo.x), bmp.width);
+    const sy = Math.min(Math.max(0, cropInfo.y), bmp.height);
+    const sw = Math.min(cropInfo.width, bmp.width - sx);
+    const sh = Math.min(cropInfo.height, bmp.height - sy);
+    const canvas = new OffscreenCanvas(sw, sh);
+    const ctx = canvas.getContext("2d");
+    ctx.drawImage(bmp, sx, sy, sw, sh, 0, 0, sw, sh);
+    const croppedBlob = await canvas.convertToBlob({ type: "image/png" });
+    const reader = new FileReader();
+    const dataUrl = await new Promise((resolve, reject) => {
+      reader.onloadend = () => resolve(reader.result);
+      reader.onerror = reject;
+      reader.readAsDataURL(croppedBlob);
+    });
+    return {
+      dataUrl,
+      width: sw,
+      height: sh,
+      url: current.url,
+      truncated: Boolean(cropInfo.truncated),
+    };
+  } catch {
+    return {
+      dataUrl: fullDataUrl,
+      width: cropInfo.width,
+      height: cropInfo.height,
+      url: current.url,
+      truncated: Boolean(cropInfo.truncated),
+    };
+  }
+}
+
 async function readPage({ maxLines = 200 }) {
   if (!Number.isInteger(maxLines) || maxLines < 1 || maxLines > 1000) throw new Error("maxLines must be an integer from 1 to 1000");
   const tab = await safeWorkTab();
@@ -736,9 +840,9 @@ async function connect() {
       } else if (message.type === "hello" && verified) {
         authenticated = message.compatible === true;
         if (!authenticated) console.warn("Socmedia service version is incompatible", message.version);
-      } else if (authenticated && message.type === "request" && (message.action === "tabs.list" || message.action === "tabs.use" || message.action === "readPage" || message.action === "snapshot" || message.action === "getProfile" || message.action === "getComments" || message.action === "getPosts" || message.action === "getPost")) {
+      } else if (authenticated && message.type === "request" && (message.action === "tabs.list" || message.action === "tabs.use" || message.action === "readPage" || message.action === "snapshot" || message.action === "getProfile" || message.action === "getComments" || message.action === "getPosts" || message.action === "getPost" || message.action === "screenshot")) {
         const reply = (result) => { if (connection.readyState === WebSocket.OPEN) connection.send(JSON.stringify({ type: "result", id: message.id, ...result })); };
-        const task = browserAction.then(() => message.action === "tabs.list" ? listTabs() : message.action === "tabs.use" ? useTab(message.args || {}) : message.action === "snapshot" ? snapshot() : message.action === "getProfile" ? getProfile(message.args || {}) : message.action === "getComments" ? getComments(message.args || {}) : message.action === "getPosts" ? getPosts(message.args || {}) : message.action === "getPost" ? getPost(message.args || {}) : readPage(message.args || {}));
+        const task = browserAction.then(() => message.action === "tabs.list" ? listTabs() : message.action === "tabs.use" ? useTab(message.args || {}) : message.action === "snapshot" ? snapshot() : message.action === "getProfile" ? getProfile(message.args || {}) : message.action === "getComments" ? getComments(message.args || {}) : message.action === "getPosts" ? getPosts(message.args || {}) : message.action === "getPost" ? getPost(message.args || {}) : message.action === "screenshot" ? screenshot(message.args || {}) : readPage(message.args || {}));
         browserAction = task.then(() => undefined, () => undefined);
         task.then((result) => reply({ result }), (error) => reply({ error: error.code === "HALT" ? { code: "HALT", reason: error.reason } : error.message }));
       }

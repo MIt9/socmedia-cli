@@ -254,6 +254,46 @@ async function downloadPostMedia(result: any, postUrl: string) {
   return result;
 }
 
+function resolveHomePath(inputPath: string): string {
+  const home = resolve(homedir());
+  const target = resolve(home, inputPath.replace(/^~(?=\/|$)/, home));
+  const rel = relative(home, target);
+  if (!rel || rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) throw new Error("Path must be inside home");
+  return target;
+}
+
+const PNG_MAGIC = "89504e470d0a1a0a";
+function parseDataUrl(dataUrl: unknown): Buffer {
+  const m = /^data:image\/png;base64,([A-Za-z0-9+/=]+)$/.exec(String(dataUrl ?? ""));
+  if (!m) throw new Error("Extension returned no PNG data URL");
+  const buf = Buffer.from(m[1], "base64");
+  if (buf.length < 16 || buf.subarray(0, 8).toString("hex") !== PNG_MAGIC) throw new Error("Screenshot data is not a PNG");
+  return buf;
+}
+
+const stamp = (d = new Date()) => {
+  const p = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
+};
+
+const slug = (s: unknown) => String(s || "").toLowerCase().normalize("NFKC").replace(/[^\p{L}\p{N}]+/gu, "-").replace(/^-+|-+$/g, "") || "page";
+
+function screenshotPath(platform: string, url?: string, now = new Date()): string {
+  const home = resolve(homedir());
+  const baseDir = join(home, "socmedia-data", "screenshots");
+  let part = "page";
+  if (url) {
+    try {
+      const u = new URL(url);
+      part = slug(u.pathname);
+    } catch {}
+  }
+  const base = join(baseDir, `${platform}-${part}-${stamp(now)}`);
+  let file = `${base}.png`;
+  for (let i = 2; existsSync(file); i++) file = `${base}-${i}.png`;
+  return file;
+}
+
 function instagramProfileUrl(value: unknown): string {
   if (typeof value !== "string") throw new Error("Instagram profile URL is required");
   let url: URL;
@@ -393,6 +433,19 @@ function validateJob(value: unknown) {
     args.url = postUrl(args.url);
     if (args.limit !== undefined && (!Number.isInteger(args.limit) || Number(args.limit) < 1 || Number(args.limit) > 500)) throw new Error("Comment limit must be an integer from 1 to 500");
   }
+  if (job.action === "screenshot") {
+    const args = job.args as Record<string, unknown>;
+    for (const key of Object.keys(args)) {
+      if (!["url", "selector", "target", "path"].includes(key)) throw new Error(`Unknown screenshot option: ${key}`);
+    }
+    if (args.url !== undefined && (typeof args.url !== "string" || !args.url)) throw new Error("Screenshot url must be a nonempty string");
+    if (args.selector !== undefined && (typeof args.selector !== "string" || !args.selector)) throw new Error("Screenshot selector must be a nonempty string");
+    if (args.target !== undefined && !["viewport", "post", "profile"].includes(String(args.target))) throw new Error("Screenshot target must be viewport, post or profile");
+    if (args.path !== undefined) {
+      if (typeof args.path !== "string" || !args.path) throw new Error("Screenshot path must be a nonempty string");
+      resolveHomePath(args.path);
+    }
+  }
   if (job.key !== undefined && (typeof job.key !== "string" || !job.key)) throw new Error("--key must be a nonempty string");
   if (job.notBefore !== undefined && (typeof job.notBefore !== "string" || !Number.isFinite(Date.parse(job.notBefore)))) throw new Error("--not-before must be a valid ISO date");
   return job;
@@ -494,7 +547,7 @@ async function queueRequest(command: string): Promise<unknown> {
   });
 }
 
-async function runPageJob(action: "snapshot" | "readPage" | "getProfile" | "getComments" | "getPosts" | "getPost", args: Record<string, unknown>): Promise<unknown> {
+async function runPageJob(action: "snapshot" | "readPage" | "getProfile" | "getComments" | "getPosts" | "getPost" | "screenshot", args: Record<string, unknown>): Promise<unknown> {
   const current = await status();
   if (!current.running) throw new Error("Service not running");
   if (current.halted) {
@@ -555,7 +608,7 @@ if (Bun.argv[2] === "--service-daemon") {
   db.run("CREATE TABLE IF NOT EXISTS service_state (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
   const haltRow = db.query("SELECT value FROM service_state WHERE key = 'halted'").get() as { value: string } | null;
   let halted: { code: string; reason: string } | null = haltRow ? JSON.parse(haltRow.value) : null;
-  db.run("UPDATE jobs SET data = json_set(data, '$.status', 'queued') WHERE json_extract(data, '$.action') IN ('readPage','snapshot','getProfile','getComments','getPosts','getPost') AND json_extract(data, '$.status') = 'running'");
+  db.run("UPDATE jobs SET data = json_set(data, '$.status', 'queued') WHERE json_extract(data, '$.action') IN ('readPage','snapshot','getProfile','getComments','getPosts','getPost','screenshot') AND json_extract(data, '$.status') = 'running'");
   type ExtensionData = { token: string; challenge?: { clientNonce: string; serverNonce: string; version: string } };
   let extensionSocket: Bun.ServerWebSocket<ExtensionData> | null = null;
   let connectedVersion: string | null = null;
@@ -618,7 +671,7 @@ if (Bun.argv[2] === "--service-daemon") {
   function pump() {
     if (workerWake) { clearTimeout(workerWake); workerWake = undefined; }
     if (halted || browserBusy || !extensionSocket || !connectedVersion || !compatibleVersion(connectedVersion)) return;
-    const rows = db.query("SELECT id, data FROM jobs WHERE json_extract(data, '$.action') IN ('readPage','snapshot','getProfile','getComments','getPosts','getPost') AND json_extract(data, '$.status') = 'queued' ORDER BY id").all() as { id: number; data: string }[];
+    const rows = db.query("SELECT id, data FROM jobs WHERE json_extract(data, '$.action') IN ('readPage','snapshot','getProfile','getComments','getPosts','getPost','screenshot') AND json_extract(data, '$.status') = 'queued' ORDER BY id").all() as { id: number; data: string }[];
     const now = Date.now();
     let wakeAt = Infinity;
     const row = rows.find((candidate) => {
@@ -644,11 +697,42 @@ if (Bun.argv[2] === "--service-daemon") {
       else if (error === "Extension disconnected") { job.status = "queued"; }
       else if (error) { job.status = "failed"; job.error = error; }
       else {
-        let finalResult = reply;
+        let finalResult: unknown = reply;
         if (job.action === "getPost" && job.args?.download) {
           try { finalResult = await downloadPostMedia(reply, job.args.url); } catch {}
+        } else if (job.action === "screenshot") {
+          try {
+            const replyObj = reply as { dataUrl?: string; width?: number; height?: number; url?: string; truncated?: boolean };
+            const buf = parseDataUrl(replyObj?.dataUrl);
+            const from = (job.args as any)?.url || replyObj?.url;
+            let platform = "web";
+            if (from) {
+              try {
+                const u = new URL(from);
+                if (u.hostname.includes("instagram.com")) platform = "ig";
+                else if (u.hostname.includes("facebook.com") || u.hostname.includes("fb.com")) platform = "fb";
+              } catch {}
+            }
+            const targetPath = (job.args as any)?.path ? resolveHomePath((job.args as any).path) : screenshotPath(platform, from);
+            mkdirSync(dirname(targetPath), { recursive: true, mode: 0o700 });
+            writeFileSync(targetPath, buf);
+            finalResult = {
+              path: targetPath,
+              width: replyObj?.width ?? null,
+              height: replyObj?.height ?? null,
+              url: replyObj?.url ?? from ?? null,
+              ...(replyObj?.truncated ? { truncated: true } : {}),
+            };
+          } catch (e: any) {
+            job.status = "failed";
+            job.error = e?.message || String(e);
+            finalResult = undefined;
+          }
         }
-        job.status = "done"; job.result = finalResult;
+        if (job.status !== "failed") {
+          job.status = "done";
+          job.result = finalResult;
+        }
       }
       try {
         db.transaction(() => {
@@ -817,12 +901,14 @@ if (Bun.argv[2] === "--service-daemon") {
     console.log("Usage: socmedia post <get|comments> <url> [options]\n\nCommands:\n  get <url>       Read a post from Instagram or Facebook\n  comments <url>  Read Instagram or Facebook post comments\n\nOptions:\n  --download      With get, download media files to ~/socmedia-data\n  --slides        Alias for --download\n  --limit N       With comments, maximum comments from 1 to 500 (default: 20)\n  --json          Print the result as JSON\n  --help          Show this help message\n\nExpands available comments through Chrome debugger and reads visible English UI; results may be incomplete.");
   } else if (Bun.argv[2] === "page") {
     console.log("Usage: socmedia page <read|snapshot> [options]\n\nCommands:\n  read            Queue and return visible page text and URL\n  snapshot        Queue and return visible interactive elements\n\nOptions:\n  --max-lines N   With read, limit output to 1-1000 lines (default: 200)\n  --json          Print the result as JSON\n  --help          Show this help message");
+  } else if (Bun.argv[2] === "screenshot") {
+    console.log("Usage: socmedia screenshot [options]\n\nOptions:\n  --url URL         Navigate to URL first\n  --selector SEL    CSS selector to crop\n  --target TARGET   viewport, post, or profile (default: viewport)\n  --path PATH       Output file destination inside home\n  --json            Print the result as JSON\n  --help            Show this help message");
   } else if (Bun.argv[2] === "config") {
     console.log("Usage: socmedia config <get|set|unset> port [value] [--json]\n\nCommands:\n  get port          Show the effective port and configuration source\n  set port <value>  Save a port from 1 to 65535\n  unset port        Remove the saved port\n\nOptions:\n  --json            Print the result as JSON\n  --help            Show this help message\n\nSOCMEDIA_EXTENSION_PORT overrides the saved port; changes apply when the service restarts.");
   } else if (Bun.argv[2] === "extension") {
     console.log("Usage: socmedia extension <install|path|pair> [options]\n\nCommands:\n  install    Copy the extension to its stable state directory and show Chrome setup steps\n  path       Show the stable extension directory\n  pair       Generate a pairing secret for the Chrome extension\n\nOptions:\n  --open     With install, open chrome://extensions in Google Chrome\n  --id ID    With pair, set the Chrome extension ID\n  --json     Print the result as JSON; pairing output contains a sensitive secret\n  --help     Show this help message\n\nPairing replaces any previous pairing; restart the service to disconnect existing clients.");
   } else {
-    console.log("Usage: socmedia [options]\n\nCommands:\n  service    Start or inspect the local service\n  queue      Inspect the service queue\n  extension  Pair the Chrome extension\n  tabs       Inspect extension work tabs\n  page       Inspect the work page\n  post       Inspect a social post\n  profile    Read a social profile\n  contacts   List local contacts\n  config     Configure the service\n\nOptions:\n  --version  Show the CLI version\n  --help     Show this help message");
+    console.log("Usage: socmedia [options]\n\nCommands:\n  service    Start or inspect the local service\n  queue      Inspect the service queue\n  extension  Pair the Chrome extension\n  tabs       Inspect extension work tabs\n  page       Inspect the work page\n  screenshot Take a screenshot of the work page\n  post       Inspect a social post\n  profile    Read a social profile\n  contacts   List local contacts\n  config     Configure the service\n\nOptions:\n  --version  Show the CLI version\n  --help     Show this help message");
   }
 } else if (Bun.argv[2] === "post" && Bun.argv[3] === "get") {
   try {
@@ -1023,6 +1109,33 @@ if (Bun.argv[2] === "--service-daemon") {
     const job = validateJob({ action, args, key, notBefore });
     console.log(JSON.stringify(await queueRequest(`queue enqueue ${JSON.stringify(job)}`)));
   } catch (error) { console.error(error instanceof Error ? error.message : String(error)); process.exitCode = 1; }
+} else if (Bun.argv[2] === "screenshot") {
+  try {
+    const args: { url?: string; selector?: string; target?: string; path?: string } = {};
+    for (let i = 3; i < Bun.argv.length; i++) {
+      const option = Bun.argv[i];
+      if (option === "--json") continue;
+      if (option === "--url") {
+        const val = Bun.argv[++i];
+        if (!val) throw new Error("Missing value for --url");
+        args.url = val;
+      } else if (option === "--selector") {
+        const val = Bun.argv[++i];
+        if (!val) throw new Error("Missing value for --selector");
+        args.selector = val;
+      } else if (option === "--target") {
+        const val = Bun.argv[++i];
+        if (!val || !["viewport", "post", "profile"].includes(val)) throw new Error("Screenshot target must be viewport, post or profile");
+        args.target = val;
+      } else if (option === "--path") {
+        const val = Bun.argv[++i];
+        if (!val) throw new Error("Missing value for --path");
+        args.path = val;
+      } else throw new Error(`Unknown screenshot option: ${option}`);
+    }
+    if (!args.target) args.target = "viewport";
+    console.log(JSON.stringify(await runPageJob("screenshot", args)));
+  } catch (error) { console.error(error instanceof Error ? error.message : String(error)); process.exitCode = 1; }
 } else if (Bun.argv[2] === "queue" && (Bun.argv[3] === "get" || Bun.argv[3] === "cancel")) {
   try {
     const id = Bun.argv[4];
@@ -1032,4 +1145,4 @@ if (Bun.argv[2] === "--service-daemon") {
   catch (error) { console.error(error instanceof Error ? error.message : String(error)); process.exitCode = 1; }
 }
 
-export { isPrivateHost, isMediaHost, mediaExt, safeSeg, postId, postDir, downloadPostMedia };
+export { isPrivateHost, isMediaHost, mediaExt, safeSeg, postId, postDir, downloadPostMedia, parseDataUrl, screenshotPath, resolveHomePath };
