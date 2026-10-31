@@ -15,20 +15,34 @@ socmedia (CLI)  --HTTP+токен-->  локальний сервіс (Bun)  --W
 
 ## Швидкий старт
 
+### Встановлення (Curl)
+
+Встановлення скомпільованого бінарника у `~/.local/bin` та розпакування Chrome-розширення у `~/.socmedia-cli/extension`:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/MIt9/socmedia-cli/main/scripts/install.sh | sh
+```
+
+Або локально з розробницької версії:
+```sh
+bun scripts/build.ts
+sh scripts/install.sh
+```
+
 ### Розширення та запуск сервісу
 
-1. Встановіть розширення у стабільний каталог стану:
+1. Встановіть розширення:
    ```sh
-   bun run src/cli.ts extension install
+   socmedia extension install
    ```
-2. Відкрийте `chrome://extensions` у Google Chrome, увімкніть **Developer mode** і натисніть **Load unpacked**, вказавши каталог, надрукований командою `extension install`.
+2. Відкрийте `chrome://extensions` у Google Chrome, увімкніть **Developer mode** і натисніть **Load unpacked**, вказавши каталог `~/.socmedia-cli/extension`.
 3. Згенеруйте сполучення:
    ```sh
-   bun run src/cli.ts extension pair --id <EXTENSION_ID>
+   socmedia extension pair --id <EXTENSION_ID>
    ```
 4. Запустіть сервіс:
    ```sh
-   bun run src/cli.ts service start
+   socmedia service start
    ```
 
 ## Основні команди

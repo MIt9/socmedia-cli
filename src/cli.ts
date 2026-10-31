@@ -102,9 +102,20 @@ function writeConfig(config: Record<string, unknown>) {
   finally { rmSync(temporary, { force: true }); }
 }
 
+declare const EXT_BUNDLE_JSON: string | undefined;
+
 function installExtension() {
-  const source = fileURLToPath(new URL("../extension/", import.meta.url));
-  const manifest = JSON.parse(readFileSync(join(source, "manifest.json"), "utf8"));
+  let manifest: any;
+  let sourceFiles: Record<string, Buffer> | null = null;
+  if (typeof EXT_BUNDLE_JSON !== "undefined") {
+    sourceFiles = Object.fromEntries(
+      Object.entries(JSON.parse(EXT_BUNDLE_JSON) as Record<string, string>).map(([k, v]) => [k, Buffer.from(v, "base64")])
+    );
+    manifest = JSON.parse(sourceFiles["manifest.json"]!.toString("utf8"));
+  } else {
+    const source = fileURLToPath(new URL("../extension/", import.meta.url));
+    manifest = JSON.parse(readFileSync(join(source, "manifest.json"), "utf8"));
+  }
   if (manifest.version !== extensionVersion || typeof manifest.key !== "string" || !manifest.key) throw new Error("Extension manifest version or public key is invalid");
   const hash = createHash("sha256").update(Buffer.from(manifest.key, "base64")).digest("hex").slice(0, 32);
   const id = [...hash].map((nibble) => String.fromCharCode(97 + parseInt(nibble, 16))).join("");
@@ -114,8 +125,17 @@ function installExtension() {
   const backup = `${staged}-previous`;
   let movedPrevious = false;
   try {
-    for (const file of ["manifest.json", "background.js", "yt-judge.js", "popup.html", "popup.js", "README.md"]) cpSync(join(source, file), join(staged, file));
-    cpSync(join(source, "icons"), join(staged, "icons"), { recursive: true });
+    if (sourceFiles) {
+      for (const [rel, buf] of Object.entries(sourceFiles)) {
+        const dest = join(staged, rel);
+        mkdirSync(dirname(dest), { recursive: true });
+        writeFileSync(dest, buf);
+      }
+    } else {
+      const source = fileURLToPath(new URL("../extension/", import.meta.url));
+      for (const file of ["manifest.json", "background.js", "yt-judge.js", "popup.html", "popup.js", "README.md"]) cpSync(join(source, file), join(staged, file));
+      cpSync(join(source, "icons"), join(staged, "icons"), { recursive: true });
+    }
     if (existsSync(extensionPath)) { renameSync(extensionPath, backup); movedPrevious = true; }
     try { renameSync(staged, extensionPath); }
     catch (error) { if (movedPrevious) renameSync(backup, extensionPath); throw error; }
