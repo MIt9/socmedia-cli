@@ -826,6 +826,92 @@ test("inbox and message commands enforce safeguards, confirm gate and slot spaci
   }
 });
 
+test("youtube commands enforce channel allowlist, confirm gate and inspect studio", async () => {
+  const fakeHome = await mkdtemp(join(tmpdir(), "socmedia-yt-home-"));
+  const stateDir = await mkdtemp(join(tmpdir(), "socmedia-yt-state-"));
+  const run = async (...args: string[]) => {
+    const cli = Bun.spawn(["bun", "run", "src/cli.ts", ...args], {
+      cwd: import.meta.dir + "/..",
+      env: { ...process.env, HOME: fakeHome, SOCMEDIA_STATE_DIR: stateDir, SOCMEDIA_EXTENSION_PORT: "0" },
+      stdout: "pipe", stderr: "pipe",
+    });
+    const [stdout, stderr, exit] = await Promise.all([new Response(cli.stdout).text(), new Response(cli.stderr).text(), cli.exited]);
+    return { stdout, stderr, exit };
+  };
+
+  const channelId = "UC1234567890123456789012";
+  const ytConfig = {
+    channels: {
+      primary: { id: channelId, label: "My Channel", handle: "@mychannel", write: true },
+    },
+    default: "primary",
+    maxUploadsPerDay: 5,
+  };
+  await Bun.write(join(stateDir, "youtube.json"), JSON.stringify(ytConfig));
+
+  let pid: number | undefined;
+  let ws: WebSocket | undefined;
+  try {
+    const helpRes = await run("youtube", "--help");
+    expect(helpRes.stdout).toContain("studio status");
+    expect(helpRes.stdout).toContain("upload");
+    expect(helpRes.stdout).toContain("video update");
+
+    const channelRes = await run("youtube", "channel", "--json");
+    expect(channelRes.exit).toBe(0);
+    const parsedChannel = JSON.parse(channelRes.stdout);
+    expect(parsedChannel.channel.id).toBe(channelId);
+    expect(parsedChannel.channel.write).toBe(true);
+
+    const testVideo = join(fakeHome, "test.mp4");
+    await Bun.write(testVideo, "dummy-video-content");
+    const previewRes = await run("youtube", "upload", testVideo, "--title", "Test Video", "--json");
+    expect(previewRes.exit).toBe(0);
+    const parsedPreview = JSON.parse(previewRes.stdout);
+    expect(parsedPreview.uploaded).toBe(false);
+    expect(parsedPreview.preview.title).toBe("Test Video");
+
+    const id = "h".repeat(32);
+    const pairing = JSON.parse((await run("extension", "pair", "--id", id, "--json")).stdout);
+    const started = JSON.parse((await run("service", "start", "--json")).stdout);
+    pid = started.pid;
+    ws = new WebSocket(`ws://127.0.0.1:${started.extension.port}/extension`, { headers: { Origin: `chrome-extension://${id}` } } as unknown as string[]);
+    await authenticateMock(ws, pairing.token);
+
+    ws.onmessage = (event) => {
+      const request = JSON.parse(String(event.data));
+      if (request.action === "ytStudioRead") {
+        ws!.send(JSON.stringify({
+          type: "result", id: request.id,
+          result: {
+            url: `https://studio.youtube.com/channel/${channelId}/videos`,
+            title: "Channel videos - YouTube Studio",
+            section: "videos",
+            probe: { studioChannelId: channelId, account: { channelId, handle: "@mychannel", name: "My Channel" } },
+          },
+        }));
+      }
+    };
+
+    const statusRes = await run("youtube", "studio", "status", "--json");
+    expect(statusRes.exit).toBe(0);
+    const parsedStatus = JSON.parse(statusRes.stdout);
+    expect(parsedStatus.channel.matched).toBe(true);
+    expect(parsedStatus.tab.section).toBe("videos");
+  } finally {
+    ws?.close();
+    if (pid) {
+      try { process.kill(pid, "SIGTERM"); } catch {}
+      for (let i = 0; i < 100; i++) {
+        try { process.kill(pid, 0); } catch { break; }
+        await Bun.sleep(20);
+      }
+    }
+    await rm(stateDir, { recursive: true, force: true });
+    await rm(fakeHome, { recursive: true, force: true });
+  }
+});
+
 test("screenshot command validates arguments, writes PNG file inside home, and records queued job", async () => {
   const fakeHome = await mkdtemp(join(tmpdir(), "socmedia-screenshot-home-"));
   const stateDir = await mkdtemp(join(tmpdir(), "socmedia-screenshot-state-"));

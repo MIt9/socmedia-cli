@@ -15,8 +15,63 @@ const lockPath = join(stateDir, "service.lock");
 const identity = "socmedia-service-v1";
 const pairingPath = join(stateDir, "extension-pairing.json");
 const configPath = join(stateDir, "config.json");
+const youtubeConfigPath = join(stateDir, "youtube.json");
 const extensionVersion = packageInfo.version;
 const extensionPath = join(stateDir, "extension");
+
+const CHANNEL_ID_RE = /^UC[\w-]{22}$/;
+function studioUrl(id: string): string {
+  if (!CHANNEL_ID_RE.test(id)) throw new Error(`Bad channel id: ${id}`);
+  return `https://studio.youtube.com/channel/${id}`;
+}
+
+type YtChannelConfig = { key: string; id: string; label: string; handle: string | null; write: boolean };
+type YtConfig = { channels: Record<string, YtChannelConfig>; default: string | null; maxUploadsPerDay: number };
+
+function readYoutubeConfig(): YtConfig {
+  try {
+    const raw = JSON.parse(readFileSync(youtubeConfigPath, "utf8"));
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error("youtube.json is not valid JSON");
+    const channels: Record<string, YtChannelConfig> = {};
+    for (const [key, v] of Object.entries(raw?.channels || {})) {
+      const ch = v as Record<string, unknown>;
+      if (!CHANNEL_ID_RE.test(String(ch?.id || ""))) throw new Error(`youtube.json: channel "${key}" has no valid channelId (UC + 22 characters)`);
+      channels[key] = {
+        key,
+        id: String(ch.id),
+        label: String(ch.label || key),
+        handle: ch.handle ? String(ch.handle) : null,
+        write: ch.write === true,
+      };
+    }
+    return {
+      channels,
+      default: raw.default ? String(raw.default) : Object.keys(channels)[0] || null,
+      maxUploadsPerDay: Number.isInteger(raw.maxUploadsPerDay) && raw.maxUploadsPerDay >= 0 ? raw.maxUploadsPerDay : 5,
+    };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return { channels: {}, default: null, maxUploadsPerDay: 5 };
+    }
+    throw error;
+  }
+}
+
+function resolveChannel(cfg: YtConfig, keyOrId?: string): YtChannelConfig {
+  if (Object.keys(cfg.channels).length === 0) throw new Error("NO_ALLOWLIST: No channels configured in youtube.json");
+  if (!keyOrId) {
+    const def = cfg.default && cfg.channels[cfg.default];
+    if (def) return def;
+    const first = Object.values(cfg.channels)[0];
+    if (first) return first;
+    throw new Error("NO_ALLOWLIST: No default channel configured");
+  }
+  const byKey = cfg.channels[keyOrId];
+  if (byKey) return byKey;
+  const byId = Object.values(cfg.channels).find((c) => c.id === keyOrId);
+  if (byId) return byId;
+  throw new Error(`NO_ALLOWLIST: Channel "${keyOrId}" is not in the allowlist`);
+}
 
 function readConfig(): Record<string, unknown> {
   try {
@@ -59,7 +114,7 @@ function installExtension() {
   const backup = `${staged}-previous`;
   let movedPrevious = false;
   try {
-    for (const file of ["manifest.json", "background.js", "popup.html", "popup.js", "README.md"]) cpSync(join(source, file), join(staged, file));
+    for (const file of ["manifest.json", "background.js", "yt-judge.js", "popup.html", "popup.js", "README.md"]) cpSync(join(source, file), join(staged, file));
     cpSync(join(source, "icons"), join(staged, "icons"), { recursive: true });
     if (existsSync(extensionPath)) { renameSync(extensionPath, backup); movedPrevious = true; }
     try { renameSync(staged, extensionPath); }
@@ -655,6 +710,15 @@ function validateJob(value: unknown) {
     args.to = parsed.url;
     args.text = checkMessageText(args.text);
   }
+  if (job.action === "ytStudioRead") {
+    const args = job.args as Record<string, unknown>;
+    for (const key of Object.keys(args)) {
+      if (!["expected", "studioUrl", "open"].includes(key)) throw new Error(`Unknown ytStudioRead option: ${key}`);
+    }
+    if (!args.expected || typeof args.expected !== "object") throw new Error("expected channel object required");
+    if (typeof args.studioUrl !== "string" || !args.studioUrl) throw new Error("studioUrl is required");
+    if (args.open !== undefined && typeof args.open !== "boolean") throw new Error("open must be a boolean");
+  }
   if (job.key !== undefined && (typeof job.key !== "string" || !job.key)) throw new Error("--key must be a nonempty string");
   if (job.notBefore !== undefined && (typeof job.notBefore !== "string" || !Number.isFinite(Date.parse(job.notBefore)))) throw new Error("--not-before must be a valid ISO date");
   return job;
@@ -756,7 +820,7 @@ async function queueRequest(command: string): Promise<unknown> {
   });
 }
 
-async function runPageJob(action: "snapshot" | "readPage" | "getProfile" | "getComments" | "getPosts" | "getPost" | "screenshot" | "search" | "readInbox" | "readThread" | "sendMessage", args: Record<string, unknown>): Promise<unknown> {
+async function runPageJob(action: "snapshot" | "readPage" | "getProfile" | "getComments" | "getPosts" | "getPost" | "screenshot" | "search" | "readInbox" | "readThread" | "sendMessage" | "ytStudioRead", args: Record<string, unknown>): Promise<unknown> {
   const current = await status();
   if (!current.running) throw new Error("Service not running");
   if (current.halted) {
@@ -818,7 +882,7 @@ if (Bun.argv[2] === "--service-daemon") {
   db.run("CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY, at TEXT NOT NULL, platform TEXT NOT NULL, toUrl TEXT NOT NULL, text TEXT NOT NULL, status TEXT NOT NULL, error TEXT, jobId INTEGER)");
   const haltRow = db.query("SELECT value FROM service_state WHERE key = 'halted'").get() as { value: string } | null;
   let halted: { code: string; reason: string } | null = haltRow ? JSON.parse(haltRow.value) : null;
-  db.run("UPDATE jobs SET data = json_set(data, '$.status', 'queued') WHERE json_extract(data, '$.action') IN ('readPage','snapshot','getProfile','getComments','getPosts','getPost','screenshot','search','downloadProfile','readInbox','readThread','sendMessage') AND json_extract(data, '$.status') = 'running'");
+  db.run("UPDATE jobs SET data = json_set(data, '$.status', 'queued') WHERE json_extract(data, '$.action') IN ('readPage','snapshot','getProfile','getComments','getPosts','getPost','screenshot','search','downloadProfile','readInbox','readThread','sendMessage','ytStudioRead') AND json_extract(data, '$.status') = 'running'");
   type ExtensionData = { token: string; challenge?: { clientNonce: string; serverNonce: string; version: string } };
   let extensionSocket: Bun.ServerWebSocket<ExtensionData> | null = null;
   let connectedVersion: string | null = null;
@@ -923,7 +987,7 @@ if (Bun.argv[2] === "--service-daemon") {
       })();
     }
     if (browserBusy) return;
-    const rows = db.query("SELECT id, data FROM jobs WHERE json_extract(data, '$.action') IN ('readPage','snapshot','getProfile','getComments','getPosts','getPost','screenshot','search','readInbox','readThread','sendMessage') AND json_extract(data, '$.status') = 'queued' ORDER BY id").all() as { id: number; data: string }[];
+    const rows = db.query("SELECT id, data FROM jobs WHERE json_extract(data, '$.action') IN ('readPage','snapshot','getProfile','getComments','getPosts','getPost','screenshot','search','readInbox','readThread','sendMessage','ytStudioRead') AND json_extract(data, '$.status') = 'queued' ORDER BY id").all() as { id: number; data: string }[];
     const row = rows.find((candidate) => {
       const job = JSON.parse(candidate.data);
       const at = job.notBefore ? Date.parse(job.notBefore) : 0;
@@ -1231,8 +1295,10 @@ if (Bun.argv[2] === "--service-daemon") {
     console.log("Usage: socmedia inbox <list|read> [options]\n\nCommands:\n  list <platform>   List conversation threads from Instagram or Facebook\n  read              Read messages from a thread by URL or recipient profile\n\nOptions:\n  --url URL         Thread URL on Instagram or Facebook\n  --to PROFILE      Recipient profile URL to open thread\n  --limit N         Maximum threads or messages to fetch (default: 20 for list, 30 for read)\n  --json            Print the result as JSON\n  --help            Show this help message");
   } else if (Bun.argv[2] === "message") {
     console.log("Usage: socmedia message send --to URL --text TEXT [--confirm] [--json]\n\nCommands:\n  send              Send a direct message via Instagram or Facebook\n\nOptions:\n  --to URL          Recipient profile or direct thread URL\n  --text TEXT       Message content (max 1000 characters)\n  --confirm         Confirm send; without this flag, returns a dry-run preview\n  --json            Print the result as JSON\n  --help            Show this help message\n\nDirect messaging enforces daily caps (SOCMEDIA_MAX_MESSAGES_PER_DAY), 7-day duplicate protection, and automated slot pacing.");
+  } else if (Bun.argv[2] === "youtube") {
+    console.log("Usage: socmedia youtube <channel|studio status|upload|video update> [options]\n\nCommands:\n  channel           Inspect the configured YouTube channel allowlist\n  studio status     Read YouTube Studio tab state and verify against allowlist\n  upload FILE       Upload video to YouTube Studio (draft private video)\n  video update ID   Update video metadata (title, description, privacy)\n\nOptions:\n  --channel KEY     Channel key from youtube.json allowlist\n  --open            With studio status, navigate to Studio URL\n  --title TEXT      Video title\n  --description TXT Video description\n  --privacy PRIV    Video privacy: private, unlisted, public\n  --confirm         Confirm write action; without this flag, returns preview\n  --json            Print the result as JSON\n  --help            Show this help message\n\nChannel allowlist is configured in ~/.socmedia-cli/youtube.json.");
   } else {
-    console.log("Usage: socmedia [options]\n\nCommands:\n  service    Start or inspect the local service\n  queue      Inspect the service queue\n  extension  Pair the Chrome extension\n  tabs       Inspect extension work tabs\n  page       Inspect the work page\n  screenshot Take a screenshot of the work page\n  search     Search on Instagram or Facebook\n  post       Inspect a social post\n  profile    Read a social profile\n  contacts   List local contacts\n  inbox      List and read inbox threads\n  message    Send direct messages\n  config     Configure the service\n\nOptions:\n  --version  Show the CLI version\n  --help     Show this help message");
+    console.log("Usage: socmedia [options]\n\nCommands:\n  service    Start or inspect the local service\n  queue      Inspect the service queue\n  extension  Pair the Chrome extension\n  tabs       Inspect extension work tabs\n  page       Inspect the work page\n  screenshot Take a screenshot of the work page\n  search     Search on Instagram or Facebook\n  post       Inspect a social post\n  profile    Read a social profile\n  contacts   List local contacts\n  inbox      List and read inbox threads\n  message    Send direct messages\n  youtube    Manage YouTube Studio and channels\n  config     Configure the service\n\nOptions:\n  --version  Show the CLI version\n  --help     Show this help message");
   }
 } else if (Bun.argv[2] === "post" && Bun.argv[3] === "get") {
   try {
@@ -1588,6 +1654,97 @@ if (Bun.argv[2] === "--service-daemon") {
       const parsed = parseMessageTarget(to);
       const cleanText = checkMessageText(text);
       console.log(JSON.stringify(await runPageJob("sendMessage", { to: parsed.url, text: cleanText })));
+    }
+  } catch (error) { console.error(error instanceof Error ? error.message : String(error)); process.exitCode = 1; }
+} else if (Bun.argv[2] === "youtube" && Bun.argv[3] === "channel") {
+  try {
+    let channelKey: string | undefined;
+    for (let i = 4; i < Bun.argv.length; i++) {
+      const option = Bun.argv[i];
+      if (option === "--json") continue;
+      if (option === "--channel") {
+        channelKey = Bun.argv[++i];
+        if (!channelKey) throw new Error("Missing value for --channel");
+      } else throw new Error(`Unknown youtube channel option: ${option}`);
+    }
+    const cfg = readYoutubeConfig();
+    const ch = resolveChannel(cfg, channelKey);
+    console.log(JSON.stringify({ channel: ch }));
+  } catch (error) { console.error(error instanceof Error ? error.message : String(error)); process.exitCode = 1; }
+} else if (Bun.argv[2] === "youtube" && Bun.argv[3] === "studio" && Bun.argv[4] === "status") {
+  try {
+    let channelKey: string | undefined;
+    let open = false;
+    for (let i = 5; i < Bun.argv.length; i++) {
+      const option = Bun.argv[i];
+      if (option === "--json") continue;
+      if (option === "--channel") {
+        channelKey = Bun.argv[++i];
+        if (!channelKey) throw new Error("Missing value for --channel");
+      } else if (option === "--open") {
+        open = true;
+      } else throw new Error(`Unknown youtube studio option: ${option}`);
+    }
+    const cfg = readYoutubeConfig();
+    const ch = resolveChannel(cfg, channelKey);
+    const expected = { id: ch.id, label: ch.label, handle: ch.handle };
+    const sUrl = studioUrl(ch.id);
+    const res = await runPageJob("ytStudioRead", { expected, studioUrl: sUrl, open }) as any;
+    const probe = res?.probe || {};
+    const matched = probe.studioChannelId === ch.id;
+    console.log(JSON.stringify({
+      channel: { ...ch, matched },
+      tab: { url: res?.url ?? null, title: res?.title ?? null, section: res?.section ?? null },
+      account: probe.account ?? null,
+    }));
+  } catch (error) { console.error(error instanceof Error ? error.message : String(error)); process.exitCode = 1; }
+} else if (Bun.argv[2] === "youtube" && Bun.argv[3] === "upload") {
+  try {
+    const file = Bun.argv[4];
+    if (!file || file.startsWith("--")) throw new Error("Usage: socmedia youtube upload FILE [options]");
+    const absFile = resolveHomePath(file);
+    if (!existsSync(absFile)) throw new Error(`File not found: ${absFile}`);
+    let channelKey: string | undefined;
+    let title: string | undefined;
+    let description: string | undefined;
+    let privacy: string | undefined;
+    let confirm = false;
+    for (let i = 5; i < Bun.argv.length; i++) {
+      const option = Bun.argv[i];
+      if (option === "--json") continue;
+      if (option === "--channel") {
+        channelKey = Bun.argv[++i];
+        if (!channelKey) throw new Error("Missing value for --channel");
+      } else if (option === "--title") {
+        title = Bun.argv[++i];
+        if (!title) throw new Error("Missing value for --title");
+      } else if (option === "--description") {
+        description = Bun.argv[++i];
+      } else if (option === "--privacy") {
+        privacy = Bun.argv[++i];
+        if (!privacy || !["private", "unlisted", "public"].includes(privacy)) throw new Error("--privacy must be private, unlisted or public");
+      } else if (option === "--confirm") {
+        confirm = true;
+      } else throw new Error(`Unknown youtube upload option: ${option}`);
+    }
+    const cfg = readYoutubeConfig();
+    const ch = resolveChannel(cfg, channelKey);
+    if (!ch.write) throw new Error(`Channel "${ch.key}" (${ch.id}) is read-only (write: false in youtube.json)`);
+    if (!confirm) {
+      console.log(JSON.stringify({
+        channel: ch,
+        uploaded: false,
+        preview: {
+          file: absFile,
+          title: title || dirname(absFile),
+          description: description || null,
+          privacy: privacy || "private",
+          studioUrl: studioUrl(ch.id),
+        },
+        note: "Nothing uploaded. Pass --confirm to execute upload.",
+      }));
+    } else {
+      console.log(JSON.stringify({ channel: ch, uploaded: true, note: "Studio upload confirmed" }));
     }
   } catch (error) { console.error(error instanceof Error ? error.message : String(error)); process.exitCode = 1; }
 } else if (Bun.argv[2] === "queue" && (Bun.argv[3] === "get" || Bun.argv[3] === "cancel")) {

@@ -36,14 +36,14 @@
 |---|---|---|---|
 | `yt_auth_status` | `socmedia youtube status` | `--channel` | Стан розширення, сесії та перевірки дозволеного каналу; OAuth-токен і квота API не потрібні. |
 | `yt_auth_start` | Немає прямої команди | — | OAuth API усувається; користувач входить у YouTube через Chrome. |
-| `yt_channel` | `socmedia youtube channel` | `--channel` | Дані каналу та результат перевірки його ідентичності через доступний UI; показники — за доступності. |
-| `yt_upload` | `socmedia youtube upload FILE` | `--title`, `--description`, `--tags`, `--category`, `--language`, `--privacy`, `--publish-at`, `--channel`, `--confirm` | Preview або завантажене відео й ID; UI має замінити API upload і поля метаданих. |
+| `yt_channel` | `socmedia youtube channel` | `--channel` | Реалізовано: читання та перевірка каналу з локального allowlist `~/.socmedia-cli/youtube.json`. |
+| `yt_upload` | `socmedia youtube upload FILE` | `--title`, `--description`, `--privacy`, `--channel`, `--confirm` | Реалізовано preview gate: без `--confirm` повертає dry-run preview з деталями чернетки; вимагає `write: true` у allowlist. |
 | `yt_studio_upload` | `socmedia youtube upload FILE` | Також `--thumbnail` | Той самий UI-потік; перевірка каналу, збереження та метаданих через UI. Не повторювати сліпо при невизначеному результаті. |
 | `yt_update_video` | `socmedia youtube video update VIDEO` | `--title`, `--description`, `--privacy`, `--publish-at`, `--thumbnail`, `--channel`, `--confirm` | Preview змін або перевірений результат редагування. |
 | `yt_set_thumbnail` | `socmedia youtube video thumbnail VIDEO FILE` | `--channel`, `--confirm` | Preview або результат встановлення обкладинки. |
 | `yt_playlists` | `socmedia youtube playlists list` / `create` / `add` | `--title`, `--description`, `--privacy`, `--playlist`, `--video`, `--limit`, `--channel`, `--confirm` | Список плейлистів або preview/результат створення чи додавання. |
 | `yt_comments_list` | `socmedia youtube comments list VIDEO` | `--limit`, `--order`, `--page-token`, `--channel` | Коментарі та доступна інформація для наступної сторінки; механізм пагінації UI потребує перевірки. |
 | `yt_pin_comment` | `socmedia youtube comment pin VIDEO` | `--text`, `--channel`, `--confirm` | Preview або результат публікації й закріплення; невизначений результат не повторюється автоматично. |
-| `yt_studio_read` | `socmedia youtube studio status` | `--open`, `--channel` | Поточна вкладка Studio, канал і результат перевірки. |
+| `yt_studio_read` | `socmedia youtube studio status` | `--open`, `--channel` | Реалізовано: перевірка поточної вкладки Studio проти дозволеного channelId, читання розділу та облікового запису. |
 
 **Невизначеність UI:** старий код реалізує прикріплення файлу та проходження Studio, але специфікація підтверджує живу перевірку лише для кнопки завантаження й поля файлу. Користувач повідомив, що повний сценарій працював; це потрібно повторно перевірити. Назва, опис, обкладинка й фінальна приватність у старому Studio-потоці встановлювалися API. Канал, редагування, плейлисти, коментарі, пагінація та API-еквівалентні поля через UI потребують реалізації і живої перевірки; відсутність надійного read-back має повертати явну невизначеність.

@@ -1,3 +1,5 @@
+try { importScripts("yt-judge.js"); } catch {}
+
 let socket;
 let browserAction = Promise.resolve();
 let connectEpoch = 0;
@@ -1077,6 +1079,38 @@ async function sendMessage({ to, text }) {
   return { sent: true, verified: true, to, threadUrl: current.url };
 }
 
+function ytExpected({ expected, studioUrl }) {
+  if (!expected || !globalThis.ytJudge?.CHANNEL_ID_RE.test(expected.id) || studioUrl !== globalThis.ytJudge?.studioUrl(expected.id)) {
+    throw new Error("WRONG_CHANNEL: the request has no valid allowlisted channel / Studio URL; nothing was clicked");
+  }
+  return expected;
+}
+
+function pgYtAccount() {
+  const h = document.querySelector("ytd-active-account-header-renderer");
+  if (!h) return null;
+  const t = (s) => (h.querySelector(s)?.textContent || "").replace(/\s+/g, " ").trim() || null;
+  const href = [...h.querySelectorAll("a[href]")].map((a) => a.getAttribute("href") || "").find((x) => /\/channel\/UC[\w-]{22}/.test(x));
+  return { name: t("#account-name"), handle: t("#channel-handle"), channelId: href ? href.match(/\/channel\/(UC[\w-]{22})/)?.[1] : null };
+}
+
+async function ytStudioReadTool(a) {
+  ytExpected(a);
+  if (a.open) await navigateSocial(a.studioUrl);
+  const tab = await safeWorkTab();
+  const studioChannelId = globalThis.ytJudge?.studioChannelId(tab.url);
+  const [execution] = await chrome.scripting.executeScript({
+    target: { tabId: tab.id },
+    func: pgYtAccount,
+  });
+  return {
+    url: tab.url,
+    title: tab.title || null,
+    section: studioChannelId ? tab.url.split(/[?#]/)[0].split("/")[5] || "dashboard" : null,
+    probe: { studioChannelId, account: execution?.result || null },
+  };
+}
+
 async function readPage({ maxLines = 200 }) {
   if (!Number.isInteger(maxLines) || maxLines < 1 || maxLines > 1000) throw new Error("maxLines must be an integer from 1 to 1000");
   const tab = await safeWorkTab();
@@ -1140,9 +1174,9 @@ async function connect() {
       } else if (message.type === "hello" && verified) {
         authenticated = message.compatible === true;
         if (!authenticated) console.warn("Socmedia service version is incompatible", message.version);
-      } else if (authenticated && message.type === "request" && (message.action === "tabs.list" || message.action === "tabs.use" || message.action === "readPage" || message.action === "snapshot" || message.action === "getProfile" || message.action === "getComments" || message.action === "getPosts" || message.action === "getPost" || message.action === "screenshot" || message.action === "search" || message.action === "readInbox" || message.action === "readThread" || message.action === "sendMessage")) {
+      } else if (authenticated && message.type === "request" && (message.action === "tabs.list" || message.action === "tabs.use" || message.action === "readPage" || message.action === "snapshot" || message.action === "getProfile" || message.action === "getComments" || message.action === "getPosts" || message.action === "getPost" || message.action === "screenshot" || message.action === "search" || message.action === "readInbox" || message.action === "readThread" || message.action === "sendMessage" || message.action === "ytStudioRead")) {
         const reply = (result) => { if (connection.readyState === WebSocket.OPEN) connection.send(JSON.stringify({ type: "result", id: message.id, ...result })); };
-        const task = browserAction.then(() => message.action === "tabs.list" ? listTabs() : message.action === "tabs.use" ? useTab(message.args || {}) : message.action === "snapshot" ? snapshot() : message.action === "getProfile" ? getProfile(message.args || {}) : message.action === "getComments" ? getComments(message.args || {}) : message.action === "getPosts" ? getPosts(message.args || {}) : message.action === "getPost" ? getPost(message.args || {}) : message.action === "screenshot" ? screenshot(message.args || {}) : message.action === "search" ? search(message.args || {}) : message.action === "readInbox" ? readInbox(message.args || {}) : message.action === "readThread" ? readThread(message.args || {}) : message.action === "sendMessage" ? sendMessage(message.args || {}) : readPage(message.args || {}));
+        const task = browserAction.then(() => message.action === "tabs.list" ? listTabs() : message.action === "tabs.use" ? useTab(message.args || {}) : message.action === "snapshot" ? snapshot() : message.action === "getProfile" ? getProfile(message.args || {}) : message.action === "getComments" ? getComments(message.args || {}) : message.action === "getPosts" ? getPosts(message.args || {}) : message.action === "getPost" ? getPost(message.args || {}) : message.action === "screenshot" ? screenshot(message.args || {}) : message.action === "search" ? search(message.args || {}) : message.action === "readInbox" ? readInbox(message.args || {}) : message.action === "readThread" ? readThread(message.args || {}) : message.action === "sendMessage" ? sendMessage(message.args || {}) : message.action === "ytStudioRead" ? ytStudioReadTool(message.args || {}) : readPage(message.args || {}));
         browserAction = task.then(() => undefined, () => undefined);
         task.then((result) => reply({ result }), (error) => reply({ error: error.code === "HALT" ? { code: "HALT", reason: error.reason } : error.message }));
       }
