@@ -145,13 +145,54 @@ function profileUrl(value) {
   return `https://www.facebook.com/${parts.join("/")}`;
 }
 
-function instagramPostUrl(value) {
-  if (typeof value !== "string") throw new Error("Instagram post or reel URL is required");
+function postUrl(value) {
+  if (typeof value !== "string") throw new Error("Instagram or Facebook post URL is required");
   let url;
-  try { url = new URL(value); } catch { throw new Error("Invalid Instagram post or reel URL"); }
+  try { url = new URL(value); } catch { throw new Error("Invalid Instagram or Facebook post URL"); }
+  const host = url.hostname.toLowerCase();
   const parts = url.pathname.split("/").filter(Boolean);
-  if (url.protocol !== "https:" || !["instagram.com", "www.instagram.com"].includes(url.hostname.toLowerCase()) || url.username || url.password || url.port || parts.length !== 2 || !["p", "reel"].includes(parts[0]) || !/^[a-zA-Z0-9_-]{1,64}$/.test(parts[1])) throw new Error("Provide an HTTPS Instagram post or reel URL; Facebook comments are not supported yet");
-  return `https://www.instagram.com/${parts[0]}/${parts[1]}/`;
+  if (url.protocol !== "https:" || url.username || url.password || url.port) {
+    throw new Error("Provide an HTTPS Instagram or Facebook post URL");
+  }
+
+  if (["instagram.com", "www.instagram.com"].includes(host)) {
+    if (parts.length !== 2 || !["p", "reel"].includes(parts[0]) || !/^[a-zA-Z0-9_-]{1,64}$/.test(parts[1])) {
+      throw new Error("Provide an HTTPS Instagram post or reel URL, for example https://www.instagram.com/p/ID/");
+    }
+    return `https://www.instagram.com/${parts[0]}/${parts[1]}/`;
+  }
+
+  const facebookHosts = ["facebook.com", "www.facebook.com", "m.facebook.com", "mbasic.facebook.com", "web.facebook.com", "fb.com", "www.fb.com"];
+  if (facebookHosts.includes(host)) {
+    const idPattern = /^[a-zA-Z0-9._-]{1,100}$/;
+    if (parts.length === 1 && ["permalink.php", "story.php"].includes(parts[0].toLowerCase())) {
+      const fbid = url.searchParams.get("story_fbid");
+      const uid = url.searchParams.get("id");
+      if (!fbid || !uid || !/^\d+$/.test(uid) || !idPattern.test(fbid)) {
+        throw new Error("Facebook permalink requires story_fbid and numeric id");
+      }
+      return `https://www.facebook.com/permalink.php?story_fbid=${fbid}&id=${uid}`;
+    }
+    if (parts.length === 1 && parts[0].toLowerCase() === "photo.php") {
+      const fbid = url.searchParams.get("fbid");
+      if (!fbid || !/^\d+$/.test(fbid)) throw new Error("Facebook photo.php requires numeric fbid");
+      return `https://www.facebook.com/photo.php?fbid=${fbid}`;
+    }
+    if (parts.length === 1 && parts[0].toLowerCase() === "watch") {
+      const v = url.searchParams.get("v");
+      if (!v || !idPattern.test(v)) throw new Error("Facebook watch URL requires video parameter v");
+      return `https://www.facebook.com/watch/?v=${v}`;
+    }
+    if (parts.length === 2 && ["posts", "reel", "reels"].includes(parts[0].toLowerCase()) && idPattern.test(parts[1])) {
+      const type = parts[0].toLowerCase() === "reels" ? "reel" : parts[0].toLowerCase();
+      return `https://www.facebook.com/${type}/${parts[1]}/`;
+    }
+    if (parts.length === 3 && ["posts", "videos", "photos"].includes(parts[1].toLowerCase()) && idPattern.test(parts[0]) && idPattern.test(parts[2])) {
+      return `https://www.facebook.com/${parts[0]}/${parts[1].toLowerCase()}/${parts[2]}/`;
+    }
+  }
+
+  throw new Error("Provide an HTTPS Instagram or Facebook post URL");
 }
 
 function extractInstagramProfile() {
@@ -331,14 +372,51 @@ function extractInstagramComments(limit) {
   return comments;
 }
 
+function extractFacebookComments(limit) {
+  const num = (s) => {
+    if (s == null) return null;
+    const match = String(s).replace(/,/g, "").match(/([\d.]+)\s*([KkMmBb])?/);
+    if (!match) return null;
+    const value = parseFloat(match[1]);
+    if (isNaN(value)) return null;
+    return Math.round(value * ({ k: 1e3, m: 1e6, b: 1e9 }[(match[2] || "").toLowerCase()] || 1));
+  };
+  const comments = [];
+  for (const item of document.querySelectorAll("[role=article][aria-label]")) {
+    const label = item.getAttribute("aria-label") || "";
+    const match = label.match(/^(?:Comment|Reply) by (.+?)(?: to .+?'s comment)? (\S+ \S+ ago|just now|a (?:minute|day|week|month|year) ago)$/i);
+    if (!match) continue;
+    const author = match[1];
+    const own = (item.innerText || "").split("\n").map((s) => s.trim()).filter(Boolean);
+    const nested = [...item.querySelectorAll("[role=article]")].flatMap((n) => (n.innerText || "").split("\n").map((s) => s.trim()));
+    const lines = own.filter((line) => !nested.includes(line));
+    const start = Math.max(lines.indexOf("Follow"), lines.findIndex((line) => /^\d+\s*[smhdwy]$/.test(line)));
+    const body = lines.slice(start + 1).filter((line) => line !== "·" && !/^(Like|Reply|Share|Edited|Author|Top fan|See translation|View \d+ repl(y|ies)|View all \d+ replies|[\d.,]+[KkMm]?)$/i.test(line));
+    const text = body.join("\n") || null;
+    if (!text) continue;
+    const link = [...item.querySelectorAll("a[href]")].find((a) => (a.innerText || "").trim() === author) || item.querySelector("a[href]");
+    let authorUrl = null;
+    try {
+      const u = new URL(link.href);
+      for (const k of [...u.searchParams.keys()]) if (k !== "id") u.searchParams.delete(k);
+      authorUrl = u.href;
+    } catch {}
+    const likeCount = lines.slice(start + 1).find((line) => /^[\d.,]+[KkMm]?$/.test(line));
+    comments.push({ author, authorUrl, text, date: match[2], likes: likeCount ? num(likeCount) : 0 });
+    if (comments.length >= limit) break;
+  }
+  return comments;
+}
+
 async function getComments({ url, limit = 20 }) {
-  const target = instagramPostUrl(url);
+  const target = postUrl(url);
   if (!Number.isInteger(limit) || limit < 1 || limit > 500) throw new Error("Comment limit must be an integer from 1 to 500");
   const tab = await navigateSocial(target);
   const tabId = tab.id;
+  const isIg = new URL(target).hostname.includes("instagram.com");
   const checkTarget = async () => {
     const current = await safeTab(tabId);
-    if (instagramPostUrl(current.url) !== target) throw new Error("Redirected to a different Instagram post");
+    if (postUrl(current.url) !== target) throw new Error(`Redirected to a different ${isIg ? "Instagram" : "Facebook"} post`);
     return current;
   };
   await checkTarget();
@@ -369,8 +447,9 @@ async function getComments({ url, limit = 20 }) {
     }
   } finally { if (attached) await chrome.debugger.detach({ tabId }).catch(() => {}); }
   const current = await checkTarget();
-  const [execution] = await chrome.scripting.executeScript({ target: { tabId }, func: extractInstagramComments, args: [limit] });
-  return { platform: "ig", url: current.url, comments: execution?.result || [] };
+  const extractor = isIg ? extractInstagramComments : extractFacebookComments;
+  const [execution] = await chrome.scripting.executeScript({ target: { tabId }, func: extractor, args: [limit] });
+  return { platform: isIg ? "ig" : "fb", url: current.url, comments: execution?.result || [] };
 }
 
 async function readPage({ maxLines = 200 }) {

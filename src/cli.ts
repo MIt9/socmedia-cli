@@ -152,13 +152,54 @@ function profileUrl(value: unknown): string {
   return `https://www.facebook.com/${parts.join("/")}`;
 }
 
-function instagramPostUrl(value: unknown): string {
-  if (typeof value !== "string") throw new Error("Instagram post or reel URL is required");
+function postUrl(value: unknown): string {
+  if (typeof value !== "string") throw new Error("Instagram or Facebook post URL is required");
   let url: URL;
-  try { url = new URL(value); } catch { throw new Error("Invalid Instagram post or reel URL"); }
+  try { url = new URL(value); } catch { throw new Error("Invalid Instagram or Facebook post URL"); }
+  const host = url.hostname.toLowerCase();
   const parts = url.pathname.split("/").filter(Boolean);
-  if (url.protocol !== "https:" || !["instagram.com", "www.instagram.com"].includes(url.hostname.toLowerCase()) || url.username || url.password || url.port || parts.length !== 2 || !["p", "reel"].includes(parts[0]!) || !/^[a-zA-Z0-9_-]{1,64}$/.test(parts[1]!)) throw new Error("Provide an HTTPS Instagram post or reel URL; Facebook comments are not supported yet");
-  return `https://www.instagram.com/${parts[0]}/${parts[1]}/`;
+  if (url.protocol !== "https:" || url.username || url.password || url.port) {
+    throw new Error("Provide an HTTPS Instagram or Facebook post URL");
+  }
+
+  if (["instagram.com", "www.instagram.com"].includes(host)) {
+    if (parts.length !== 2 || !["p", "reel"].includes(parts[0]!) || !/^[a-zA-Z0-9_-]{1,64}$/.test(parts[1]!)) {
+      throw new Error("Provide an HTTPS Instagram post or reel URL, for example https://www.instagram.com/p/ID/");
+    }
+    return `https://www.instagram.com/${parts[0]}/${parts[1]}/`;
+  }
+
+  const facebookHosts = ["facebook.com", "www.facebook.com", "m.facebook.com", "mbasic.facebook.com", "web.facebook.com", "fb.com", "www.fb.com"];
+  if (facebookHosts.includes(host)) {
+    const idPattern = /^[a-zA-Z0-9._-]{1,100}$/;
+    if (parts.length === 1 && ["permalink.php", "story.php"].includes(parts[0]!.toLowerCase())) {
+      const fbid = url.searchParams.get("story_fbid");
+      const uid = url.searchParams.get("id");
+      if (!fbid || !uid || !/^\d+$/.test(uid) || !idPattern.test(fbid)) {
+        throw new Error("Facebook permalink requires story_fbid and numeric id");
+      }
+      return `https://www.facebook.com/permalink.php?story_fbid=${fbid}&id=${uid}`;
+    }
+    if (parts.length === 1 && parts[0]!.toLowerCase() === "photo.php") {
+      const fbid = url.searchParams.get("fbid");
+      if (!fbid || !/^\d+$/.test(fbid)) throw new Error("Facebook photo.php requires numeric fbid");
+      return `https://www.facebook.com/photo.php?fbid=${fbid}`;
+    }
+    if (parts.length === 1 && parts[0]!.toLowerCase() === "watch") {
+      const v = url.searchParams.get("v");
+      if (!v || !idPattern.test(v)) throw new Error("Facebook watch URL requires video parameter v");
+      return `https://www.facebook.com/watch/?v=${v}`;
+    }
+    if (parts.length === 2 && ["posts", "reel", "reels"].includes(parts[0]!.toLowerCase()) && idPattern.test(parts[1]!)) {
+      const type = parts[0]!.toLowerCase() === "reels" ? "reel" : parts[0]!.toLowerCase();
+      return `https://www.facebook.com/${type}/${parts[1]}/`;
+    }
+    if (parts.length === 3 && ["posts", "videos", "photos"].includes(parts[1]!.toLowerCase()) && idPattern.test(parts[0]!) && idPattern.test(parts[2]!)) {
+      return `https://www.facebook.com/${parts[0]}/${parts[1].toLowerCase()}/${parts[2]}/`;
+    }
+  }
+
+  throw new Error("Provide an HTTPS Instagram or Facebook post URL");
 }
 
 function upsertProfileContact(db: Database, value: unknown, requestedUrl: string) {
@@ -204,7 +245,7 @@ function validateJob(value: unknown) {
   if (job.action === "getComments") {
     const args = job.args as Record<string, unknown>;
     if (Object.keys(args).some((key) => key !== "url" && key !== "limit")) throw new Error("getComments accepts only url and limit");
-    args.url = instagramPostUrl(args.url);
+    args.url = postUrl(args.url);
     if (args.limit !== undefined && (!Number.isInteger(args.limit) || Number(args.limit) < 1 || Number(args.limit) > 500)) throw new Error("Comment limit must be an integer from 1 to 500");
   }
   if (job.key !== undefined && (typeof job.key !== "string" || !job.key)) throw new Error("--key must be a nonempty string");
@@ -622,7 +663,7 @@ if (Bun.argv[2] === "--service-daemon") {
   } else if (Bun.argv[2] === "contacts") {
     console.log("Usage: socmedia contacts <list|update|export> [options]\n\nCommands:\n  list              List locally stored contacts\n  update <id>       Update a contact by its ID; provide --status and/or --note\n  export            Export filtered contacts to a file inside home\n\nOptions:\n  --status STATUS   Filter list/export or set status: new, messaged, replied, won, rejected, skip\n  --platform NAME   Filter list/export by ig or fb\n  --note TEXT       Set note on update (maximum 2000 characters; empty clears it)\n  --format FORMAT   Export as csv, json or jsonl (default: csv)\n  --path PATH       Export destination inside home (default: ~/socmedia-data/contacts-<date>.<format>)\n  --json            Print the command result as JSON\n  --help            Show this help message\n\nInstagram and Facebook profile reads populate contacts; import is not implemented yet.");
   } else if (Bun.argv[2] === "post") {
-    console.log("Usage: socmedia post comments <url> [--limit N] [--json]\n\nCommands:\n  comments <url>  Read Instagram post/reel comments; Facebook is not supported yet\n\nOptions:\n  --limit N       Maximum comments, 1-500 (default: 20)\n  --json          Print the result as JSON\n  --help          Show this help message\n\nExpands available comments through Chrome debugger and reads visible English UI; results may be incomplete.");
+    console.log("Usage: socmedia post comments <url> [--limit N] [--json]\n\nCommands:\n  comments <url>  Read Instagram or Facebook post comments\n\nOptions:\n  --limit N       Maximum comments, 1-500 (default: 20)\n  --json          Print the result as JSON\n  --help          Show this help message\n\nExpands available comments through Chrome debugger and reads visible English UI; results may be incomplete.");
   } else if (Bun.argv[2] === "page") {
     console.log("Usage: socmedia page <read|snapshot> [options]\n\nCommands:\n  read            Queue and return visible page text and URL\n  snapshot        Queue and return visible interactive elements\n\nOptions:\n  --max-lines N   With read, limit output to 1-1000 lines (default: 200)\n  --json          Print the result as JSON\n  --help          Show this help message");
   } else if (Bun.argv[2] === "config") {
@@ -634,7 +675,7 @@ if (Bun.argv[2] === "--service-daemon") {
   }
 } else if (Bun.argv[2] === "post" && Bun.argv[3] === "comments") {
   try {
-    const url = instagramPostUrl(Bun.argv[4]);
+    const url = postUrl(Bun.argv[4]);
     const args: { url: string; limit?: number } = { url };
     for (let i = 5; i < Bun.argv.length; i++) {
       const option = Bun.argv[i];
