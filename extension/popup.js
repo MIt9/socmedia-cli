@@ -2,6 +2,14 @@ const token = document.getElementById("token");
 const message = document.getElementById("message");
 const portInput = document.getElementById("port");
 const portMessage = document.getElementById("port-message");
+if (typeof window !== "undefined" && typeof URLSearchParams !== "undefined") {
+  const urlToken = new URLSearchParams(window.location.search).get("token");
+  if (urlToken && /^[a-f0-9]{64}$/.test(urlToken)) {
+    chrome.storage.local.set({ token: urlToken }).then(() => {
+      message.textContent = "Saved token automatically. Connected to service!";
+    });
+  }
+}
 chrome.storage.local.get("port").then(({ port }) => { portInput.value = String(port ?? 47842); });
 document.getElementById("save-port").addEventListener("click", async () => {
   const raw = portInput.value.trim();

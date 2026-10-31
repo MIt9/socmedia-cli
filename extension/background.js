@@ -1202,7 +1202,16 @@ async function scrollTool({ selector, times = 3 }) {
 async function connect() {
   if (socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)) return;
   const epoch = ++connectEpoch;
-  const { token, port: savedPort } = await chrome.storage.local.get(["token", "port"]);
+  let { token, port: savedPort } = await chrome.storage.local.get(["token", "port"]);
+  if (typeof token !== "string" || !/^[a-f0-9]{64}$/.test(token)) {
+    try {
+      const res = await fetch(chrome.runtime.getURL("pair.json")).then((r) => r.json());
+      if (typeof res?.token === "string" && /^[a-f0-9]{64}$/.test(res.token)) {
+        token = res.token;
+        await chrome.storage.local.set({ token });
+      }
+    } catch {}
+  }
   if (typeof token !== "string" || !/^[a-f0-9]{64}$/.test(token)) return;
   const port = savedPort === undefined ? 47842 : savedPort;
   if (!Number.isInteger(port) || port < 1 || port > 65535) return;

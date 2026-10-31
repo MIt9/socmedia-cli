@@ -790,7 +790,9 @@ async function start() {
   const existing = await status();
   if (existing.running) return existing;
   mkdirSync(stateDir, { recursive: true, mode: 0o700 });
-  const child = spawn(process.execPath, [import.meta.path, "--service-daemon"], {
+  const isCompiled = import.meta.path.startsWith("/$bunfs");
+  const childArgs = isCompiled ? ["--service-daemon"] : [import.meta.path, "--service-daemon"];
+  const child = spawn(process.execPath, childArgs, {
     detached: true, stdio: "ignore", env: process.env,
   });
   child.unref();
@@ -1664,6 +1666,9 @@ if (Bun.argv[2] === "--service-daemon") {
       writeFileSync(temporary, JSON.stringify(pairing), { mode: 0o600, flag: "wx" });
       renameSync(temporary, pairingPath);
     } finally { rmSync(temporary, { force: true }); }
+    if (existsSync(extensionPath) && lstatSync(extensionPath).isDirectory()) {
+      try { writeFileSync(join(extensionPath, "pair.json"), JSON.stringify(pairing), "utf8"); } catch {}
+    }
     if (Bun.argv.includes("--json")) console.log(JSON.stringify(pairing));
     else console.log(`Extension paired: ${pairing.id}`);
   } catch (error) { console.error(error instanceof Error ? error.message : String(error)); process.exitCode = 1; }
