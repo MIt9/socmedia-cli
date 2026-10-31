@@ -1,7 +1,7 @@
-import { closeSync, constants, cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, renameSync, rmSync, writeFileSync, writeSync } from "node:fs";
+import { chmodSync, closeSync, constants, copyFileSync, cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, renameSync, rmSync, statSync, writeFileSync, writeSync } from "node:fs";
 import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { createConnection, createServer } from "node:net";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
@@ -977,6 +977,261 @@ async function runPageJob(action: "snapshot" | "readPage" | "getProfile" | "getC
   throw new Error(`Job ${created.id} still pending; inspect it with queue get`);
 }
 
+export type DoctorCheck = {
+  check: string;
+  ok: boolean;
+  message: string;
+  fix: string | null;
+};
+
+export async function runDoctor(): Promise<{ ok: boolean; checks: DoctorCheck[] }> {
+  const checks: DoctorCheck[] = [];
+
+  // 1. Chrome
+  const chromePaths = [
+    "/Applications/Google Chrome.app",
+    "/Applications/Chromium.app",
+    "/usr/bin/google-chrome",
+    "/usr/bin/chromium-browser",
+    "/usr/bin/chromium",
+  ];
+  if (process.env.LOCALAPPDATA) {
+    chromePaths.push(join(process.env.LOCALAPPDATA, "Google/Chrome/Application/chrome.exe"));
+  }
+  const chromeFound = chromePaths.some((p) => existsSync(p));
+  checks.push({
+    check: "chrome",
+    ok: chromeFound,
+    message: chromeFound ? "Google Chrome detected" : "Google Chrome not found in standard paths",
+    fix: chromeFound ? null : "Install Google Chrome",
+  });
+
+  // 2. Bun
+  const bunOk = typeof Bun !== "undefined" && typeof Bun.version === "string";
+  checks.push({
+    check: "bun",
+    ok: bunOk,
+    message: bunOk ? `Bun v${Bun.version}` : "Bun runtime missing",
+    fix: bunOk ? null : "Install Bun (https://bun.sh)",
+  });
+
+  // 3. State directory
+  let stateDirOk = false;
+  let stateDirMsg = "";
+  try {
+    if (!existsSync(stateDir)) {
+      mkdirSync(stateDir, { recursive: true, mode: 0o700 });
+    }
+    const st = statSync(stateDir);
+    const mode = st.mode & 0o777;
+    if (process.platform === "win32" || mode === 0o700) {
+      stateDirOk = true;
+      stateDirMsg = `${stateDir} (0700)`;
+    } else {
+      stateDirOk = false;
+      stateDirMsg = `${stateDir} mode is 0${mode.toString(8)}, expected 0700`;
+    }
+  } catch (err: any) {
+    stateDirOk = false;
+    stateDirMsg = `Cannot access ${stateDir}: ${err?.message || err}`;
+  }
+  checks.push({
+    check: "stateDir",
+    ok: stateDirOk,
+    message: stateDirMsg,
+    fix: stateDirOk ? null : `mkdir -p "${stateDir}" && chmod 700 "${stateDir}"`,
+  });
+
+  // 4. Database
+  let dbOk = false;
+  let dbMsg = "";
+  const dbFile = join(stateDir, "state.sqlite");
+  try {
+    mkdirSync(stateDir, { recursive: true, mode: 0o700 });
+    const db = new Database(dbFile);
+    const checkRow = db.query("PRAGMA quick_check").get() as Record<string, unknown> | null;
+    const res = checkRow ? Object.values(checkRow)[0] : null;
+    db.close();
+    if (res === "ok") {
+      dbOk = true;
+      dbMsg = "SQLite database integrity verified";
+    } else {
+      dbOk = false;
+      dbMsg = `SQLite integrity check: ${res}`;
+    }
+  } catch (err: any) {
+    dbOk = false;
+    dbMsg = `SQLite error: ${err?.message || err}`;
+  }
+  checks.push({
+    check: "database",
+    ok: dbOk,
+    message: dbMsg,
+    fix: dbOk ? null : `Repair or remove corrupted database at ${dbFile}`,
+  });
+
+  // 5. Port & Service
+  const s = await status();
+  const port = s.port;
+  if (s.running) {
+    checks.push({
+      check: "port",
+      ok: true,
+      message: `Port ${port} active (socmedia service daemon)`,
+      fix: null,
+    });
+  } else {
+    const portBusy = await isPortInUse(port);
+    checks.push({
+      check: "port",
+      ok: !portBusy,
+      message: portBusy ? `Port ${port} in use by another process` : `Port ${port} available`,
+      fix: portBusy ? `Stop process using port ${port} or run socmedia config set port <port>` : null,
+    });
+  }
+
+  checks.push({
+    check: "service",
+    ok: s.running,
+    message: s.running ? `Daemon running (PID ${s.pid}, v${s.version})` : "Daemon is stopped",
+    fix: s.running ? null : "Run socmedia service start",
+  });
+
+  // 6. Extension
+  let extOk = false;
+  let extMsg = "";
+  const extManifest = join(extensionPath, "manifest.json");
+  if (existsSync(extManifest)) {
+    try {
+      const manifest = JSON.parse(readFileSync(extManifest, "utf8"));
+      if (manifest.version === extensionVersion) {
+        extOk = true;
+        extMsg = `Installed at ${extensionPath} (v${manifest.version})`;
+      } else {
+        extOk = false;
+        extMsg = `Version mismatch: installed v${manifest.version}, CLI v${extensionVersion}`;
+      }
+    } catch (err: any) {
+      extOk = false;
+      extMsg = `Invalid manifest: ${err?.message || err}`;
+    }
+  } else {
+    extOk = false;
+    extMsg = `Extension not installed at ${extensionPath}`;
+  }
+  checks.push({
+    check: "extension",
+    ok: extOk,
+    message: extMsg,
+    fix: extOk ? null : "Run socmedia extension install",
+  });
+
+  if (s.running) {
+    const ext = s.extension as { connected?: boolean; version?: string } | undefined;
+    const connected = ext?.connected === true;
+    checks.push({
+      check: "extensionConnected",
+      ok: connected,
+      message: connected ? `Connected (v${ext?.version})` : "Extension not connected",
+      fix: connected ? null : "Open Chrome, ensure extension is loaded at chrome://extensions, and reconnect",
+    });
+  }
+
+  const allOk = checks.every((c) => c.ok);
+  return { ok: allOk, checks };
+}
+
+function isNewer(latest: string, current: string): boolean {
+  const l = latest.split(".").map(Number);
+  const c = current.split(".").map(Number);
+  for (let i = 0; i < 3; i++) {
+    const lp = l[i] ?? 0;
+    const cp = c[i] ?? 0;
+    if (lp > cp) return true;
+    if (lp < cp) return false;
+  }
+  return false;
+}
+
+export async function runUpdate(checkOnly = false) {
+  let latestTag: string | null = null;
+  try {
+    const res = await fetch("https://api.github.com/repos/MIt9/socmedia-cli/releases/latest", {
+      headers: { "User-Agent": "socmedia-cli" },
+    });
+    if (res.ok) {
+      const data = await res.json() as { tag_name?: string };
+      if (data?.tag_name) latestTag = data.tag_name;
+    }
+  } catch {}
+
+  const currentVer = extensionVersion;
+  const cleanLatest = latestTag ? latestTag.replace(/^v/, "") : null;
+  const updateAvailable = cleanLatest !== null && isNewer(cleanLatest, currentVer);
+
+  const out = {
+    current: currentVer,
+    latest: cleanLatest,
+    checkOnly,
+    updateAvailable,
+    hint: updateAvailable
+      ? "Update available; run socmedia update or re-run install.sh"
+      : (cleanLatest && cleanLatest !== currentVer ? "Current version is ahead of latest release" : "Already up to date"),
+  };
+
+  if (checkOnly) return out;
+
+  if (!updateAvailable) {
+    return { ...out, updated: false, message: "Already up to date" };
+  }
+
+  const isCompiled = import.meta.path.startsWith("/$bunfs");
+  if (!isCompiled) {
+    return {
+      ...out,
+      updated: false,
+      message: "Running from source repository; run git pull && bun install to update",
+    };
+  }
+
+  const platform = process.platform === "darwin" ? "darwin" : "linux";
+  const arch = process.arch === "arm64" ? "arm64" : "x64";
+  const binaryTarget = process.execPath;
+  const downloadUrl = `https://github.com/MIt9/socmedia-cli/releases/download/${latestTag}/socmedia-${latestTag}-${platform}-${arch}.tar.gz`;
+
+  const resp = await fetch(downloadUrl);
+  if (!resp.ok) throw new Error(`Failed to download update from ${downloadUrl}: ${resp.statusText}`);
+  const tarBuf = Buffer.from(await resp.arrayBuffer());
+
+  const tmpTar = join(tmpdir(), `socmedia-update-${randomBytes(8).toString("hex")}.tar.gz`);
+  const tmpExtract = join(tmpdir(), `socmedia-update-${randomBytes(8).toString("hex")}`);
+  try {
+    writeFileSync(tmpTar, tarBuf);
+    mkdirSync(tmpExtract, { recursive: true });
+    spawnSync("tar", ["-xzf", tmpTar, "-C", tmpExtract]);
+    const newBin = join(tmpExtract, "bin", "socmedia");
+    if (!existsSync(newBin)) throw new Error("Downloaded package did not contain bin/socmedia");
+    chmodSync(newBin, 0o755);
+
+    if (platform === "darwin") {
+      spawnSync("codesign", ["-s", "-", "-f", newBin]);
+    }
+
+    const backupBin = `${binaryTarget}.old`;
+    try { renameSync(binaryTarget, backupBin); } catch {}
+    copyFileSync(newBin, binaryTarget);
+    chmodSync(binaryTarget, 0o755);
+    if (platform === "darwin") {
+      spawnSync("codesign", ["-s", "-", "-f", binaryTarget]);
+    }
+    rmSync(backupBin, { force: true });
+    return { current: currentVer, latest: cleanLatest, updatedTo: cleanLatest, updated: true, hint: `Updated to ${cleanLatest}` };
+  } finally {
+    rmSync(tmpTar, { force: true });
+    rmSync(tmpExtract, { recursive: true, force: true });
+  }
+}
+
 export type CommandMeta = {
   name: string;
   usage: string;
@@ -1237,6 +1492,27 @@ export const COMMAND_REGISTRY: CommandMeta[] = [
       { flag: "--selector SEL", description: "CSS selector to target" },
       { flag: "--text TEXT", description: "Visible text of element to click" },
       { flag: "--times N", description: "Number of times to scroll (1-20, default: 3)" },
+      { flag: "--json", description: "Print the result as JSON" },
+      { flag: "--text", description: "Print the result as plain text" },
+      { flag: "--help", description: "Show this help message" },
+    ],
+  },
+  {
+    name: "doctor",
+    usage: "socmedia doctor [options]",
+    summary: "Check system health, permissions, services, and extension status",
+    options: [
+      { flag: "--json", description: "Print the result as JSON" },
+      { flag: "--text", description: "Print the result as plain text" },
+      { flag: "--help", description: "Show this help message" },
+    ],
+  },
+  {
+    name: "update",
+    usage: "socmedia update [--check] [options]",
+    summary: "Check for or install socmedia CLI updates",
+    options: [
+      { flag: "--check", description: "Check for updates without downloading or installing" },
       { flag: "--json", description: "Print the result as JSON" },
       { flag: "--text", description: "Print the result as plain text" },
       { flag: "--help", description: "Show this help message" },
@@ -2363,6 +2639,34 @@ if (Bun.argv[2] === "--service-daemon") {
     console.log(JSON.stringify(await queueRequest(`queue ${Bun.argv[3]} ${id}`)));
   }
   catch (error) { printError(error); }
+} else if (Bun.argv[2] === "doctor") {
+  try {
+    const res = await runDoctor();
+    printOutput(res, () => {
+      const lines = ["socmedia doctor:"];
+      for (const c of res.checks) {
+        const mark = c.ok ? "[✓]" : "[✗]";
+        lines.push(`  ${mark} ${c.check}: ${c.message}${c.fix ? ` (fix: ${c.fix})` : ""}`);
+      }
+      lines.push(res.ok ? "\nResult: all checks passed" : `\nResult: ${res.checks.filter((c) => !c.ok).length} check(s) failed`);
+      return lines.join("\n");
+    });
+    if (!res.ok) process.exitCode = 1;
+  } catch (error) { printError(error); }
+} else if (Bun.argv[2] === "update") {
+  try {
+    const checkOnly = Bun.argv.includes("--check");
+    const res = await runUpdate(checkOnly);
+    printOutput(res, () => {
+      const r = res as { current: string; latest?: string | null; hint?: string; message?: string };
+      const lines = [
+        `Current version: ${r.current}`,
+        `Latest version:  ${r.latest || "unknown"}`,
+        `Status:          ${r.hint || r.message || ""}`,
+      ];
+      return lines.join("\n");
+    });
+  } catch (error) { printError(error); }
 }
 
 export { isPrivateHost, isMediaHost, mediaExt, safeSeg, postId, postDir, downloadPostMedia, parseDataUrl, screenshotPath, resolveHomePath, profileDir, downloadProfile, profileMarkdown };

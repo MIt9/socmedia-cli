@@ -1,0 +1,32 @@
+#!/bin/sh
+# Release validation hook: runs only when pushing version tags (v*)
+while read local_ref local_sha remote_ref remote_sha; do
+  case "$local_ref" in
+    refs/tags/v*) ;;
+    *) continue ;;
+  esac
+
+  TAG=${local_ref#refs/tags/v}
+  VERSION=$(bun -e "console.log(require('./package.json').version)")
+  if [ "$TAG" != "$VERSION" ]; then
+    echo "Error: Tag v$TAG does not match package.json version $VERSION" >&2
+    exit 1
+  fi
+
+  MANIFEST=$(bun -e "console.log(require('./extension/manifest.json').version)")
+  if [ "$MANIFEST" != "$VERSION" ]; then
+    echo "Error: manifest.json version $MANIFEST does not match package.json version $VERSION" >&2
+    exit 1
+  fi
+
+  if [ -n "$(git status --porcelain)" ]; then
+    echo "Error: Working tree is not clean. Commit or stash all changes before tagging." >&2
+    exit 1
+  fi
+
+  echo "Running pre-release tests and typecheck..."
+  bun test || exit 1
+  bun run typecheck || exit 1
+done
+
+exit 0
