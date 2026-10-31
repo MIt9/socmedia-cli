@@ -777,6 +777,109 @@ async function screenshot({ url, selector, target = "viewport" } = {}) {
   }
 }
 
+function pgScrapeSearch(platform, type, limit) {
+  const num = (s) => {
+    if (s == null) return null;
+    const m = String(s).replace(/,/g, "").match(/([\d.]+)\s*([KkMmBb])?/);
+    if (!m) return null;
+    const val = parseFloat(m[1]);
+    if (isNaN(val)) return null;
+    const mult = { k: 1e3, m: 1e6, b: 1e9 }[(m[2] || "").toLowerCase()] || 1;
+    return Math.round(val * mult);
+  };
+  const results = [];
+  if (platform === "ig") {
+    if (type === "hashtag") {
+      const links = [...document.querySelectorAll('a[href*="/p/"], a[href*="/reel/"]')];
+      for (const a of links.slice(0, limit)) {
+        results.push({
+          name: location.pathname.split("/").filter(Boolean).pop() || null,
+          username: null,
+          url: a.href,
+          subtitle: a.querySelector("img")?.alt || null,
+          followers: null,
+          verified: null,
+        });
+      }
+      return results;
+    }
+    const NAV = ["explore", "direct", "reels", "stories", "accounts", "p", "reel", "about", "legal", "emails"];
+    const links = [...document.querySelectorAll('a[href^="/"]')].filter((a) => {
+      const segs = a.pathname.split("/").filter(Boolean);
+      return segs.length === 1 && !NAV.includes(segs[0]) && !a.closest("nav, [role=navigation], footer") && a.innerText?.trim();
+    });
+    const seen = new Set();
+    for (const a of links) {
+      const username = a.pathname.replace(/^\/+|\/+$/g, "").split("/")[0];
+      if (seen.has(username)) continue;
+      seen.add(username);
+      const parts = (a.innerText || "").split(/\n|\s•\s/).map((s) => s.trim()).filter((s) => s && s !== "•");
+      const fl = parts.find((s) => /^[\d.,]+[KkMmBb]?\s+followers$/i.test(s));
+      const lines = parts.filter((s) => s !== fl);
+      const name = (lines[0] === username ? lines[1] : lines[0]) || username;
+      const subtitle = lines.slice(lines[0] === username ? 2 : 1).join(" · ") || null;
+      const verified = Boolean(a.querySelector('[aria-label*="Verified" i], svg[aria-label*="Verified" i]'));
+      results.push({ name, username, url: a.href, subtitle, followers: num(fl), verified });
+      if (results.length >= limit) break;
+    }
+    return results;
+  }
+
+  // Facebook search results
+  const cards = [...document.querySelectorAll("[role=feed] [role=article], [role=main] [role=article], div[role=article]")];
+  for (const card of cards) {
+    const link = [...card.querySelectorAll("h2 a, h3 a, strong a, a[role=link], a[href]")].find((a) => a.innerText?.trim()) || card.querySelector("a[href]");
+    if (!link) continue;
+    const name = link.innerText?.trim() || (card.innerText || "").split("\n").map((l) => l.trim()).find(Boolean) || null;
+    let url = link.href;
+    try {
+      const u = new URL(url);
+      for (const k of [...u.searchParams.keys()]) if (k !== "id") u.searchParams.delete(k);
+      url = u.href;
+    } catch {}
+    let username = null;
+    try {
+      username = url.includes("profile.php") ? null : new URL(url, location.href).pathname.replace(/^\/+|\/+$/g, "").split("/")[0] || null;
+    } catch {}
+    const lines = (card.innerText || "").split("\n").map((l) => l.trim()).filter((l) => l && l !== name);
+    const subtitle = lines[0] || null;
+    const verified = Boolean(card.querySelector('[aria-label*="Verified" i]'));
+    const followers = num((card.innerText || "").match(/([\d.,]+[KkMmBb]?)\s+followers/i)?.[1]);
+    results.push({ name, username, url, subtitle, followers, verified });
+    if (results.length >= limit) break;
+  }
+  return results;
+}
+
+async function search({ platform = "ig", query, type = "users", limit = 20 }) {
+  if (!query || typeof query !== "string") throw new Error("Search query is required");
+  const normPlatform = platform === "instagram" || platform === "ig" ? "ig" : platform === "facebook" || platform === "fb" ? "fb" : null;
+  if (!normPlatform) throw new Error("Platform must be ig or fb");
+
+  let targetUrl;
+  if (normPlatform === "ig") {
+    if (type === "hashtag") {
+      const cleanTag = encodeURIComponent(query.replace(/^#/, ""));
+      targetUrl = `https://www.instagram.com/explore/tags/${cleanTag}/`;
+    } else {
+      targetUrl = `https://www.instagram.com/explore/`;
+    }
+  } else {
+    const q = encodeURIComponent(query);
+    const sub = type === "pages" ? "pages" : type === "places" ? "places" : "people";
+    targetUrl = `https://www.facebook.com/search/${sub}/?q=${q}`;
+  }
+
+  const tab = await navigateSocial(targetUrl);
+  const current = await safeTab(tab.id);
+  const [execution] = await chrome.scripting.executeScript({
+    target: { tabId: tab.id },
+    func: pgScrapeSearch,
+    args: [normPlatform, type, limit],
+  });
+  return { platform: normPlatform, results: execution?.result || [] };
+}
+
 async function readPage({ maxLines = 200 }) {
   if (!Number.isInteger(maxLines) || maxLines < 1 || maxLines > 1000) throw new Error("maxLines must be an integer from 1 to 1000");
   const tab = await safeWorkTab();
@@ -840,9 +943,9 @@ async function connect() {
       } else if (message.type === "hello" && verified) {
         authenticated = message.compatible === true;
         if (!authenticated) console.warn("Socmedia service version is incompatible", message.version);
-      } else if (authenticated && message.type === "request" && (message.action === "tabs.list" || message.action === "tabs.use" || message.action === "readPage" || message.action === "snapshot" || message.action === "getProfile" || message.action === "getComments" || message.action === "getPosts" || message.action === "getPost" || message.action === "screenshot")) {
+      } else if (authenticated && message.type === "request" && (message.action === "tabs.list" || message.action === "tabs.use" || message.action === "readPage" || message.action === "snapshot" || message.action === "getProfile" || message.action === "getComments" || message.action === "getPosts" || message.action === "getPost" || message.action === "screenshot" || message.action === "search")) {
         const reply = (result) => { if (connection.readyState === WebSocket.OPEN) connection.send(JSON.stringify({ type: "result", id: message.id, ...result })); };
-        const task = browserAction.then(() => message.action === "tabs.list" ? listTabs() : message.action === "tabs.use" ? useTab(message.args || {}) : message.action === "snapshot" ? snapshot() : message.action === "getProfile" ? getProfile(message.args || {}) : message.action === "getComments" ? getComments(message.args || {}) : message.action === "getPosts" ? getPosts(message.args || {}) : message.action === "getPost" ? getPost(message.args || {}) : message.action === "screenshot" ? screenshot(message.args || {}) : readPage(message.args || {}));
+        const task = browserAction.then(() => message.action === "tabs.list" ? listTabs() : message.action === "tabs.use" ? useTab(message.args || {}) : message.action === "snapshot" ? snapshot() : message.action === "getProfile" ? getProfile(message.args || {}) : message.action === "getComments" ? getComments(message.args || {}) : message.action === "getPosts" ? getPosts(message.args || {}) : message.action === "getPost" ? getPost(message.args || {}) : message.action === "screenshot" ? screenshot(message.args || {}) : message.action === "search" ? search(message.args || {}) : readPage(message.args || {}));
         browserAction = task.then(() => undefined, () => undefined);
         task.then((result) => reply({ result }), (error) => reply({ error: error.code === "HALT" ? { code: "HALT", reason: error.reason } : error.message }));
       }

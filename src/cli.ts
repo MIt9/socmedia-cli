@@ -446,6 +446,19 @@ function validateJob(value: unknown) {
       resolveHomePath(args.path);
     }
   }
+  if (job.action === "search") {
+    const args = job.args as Record<string, unknown>;
+    for (const key of Object.keys(args)) {
+      if (!["platform", "query", "type", "limit"].includes(key)) throw new Error(`Unknown search option: ${key}`);
+    }
+    if (typeof args.platform !== "string") throw new Error("Search platform is required");
+    const norm = { ig: "ig", instagram: "ig", fb: "fb", facebook: "fb" }[args.platform.toLowerCase()];
+    if (!norm) throw new Error("Search platform must be ig or fb");
+    args.platform = norm;
+    if (typeof args.query !== "string" || !args.query.trim() || args.query.length > 200) throw new Error("Search query must be a string between 1 and 200 characters");
+    if (args.type !== undefined && !["users", "hashtag", "pages", "places"].includes(String(args.type))) throw new Error("Search type must be users, hashtag, pages or places");
+    if (args.limit !== undefined && (!Number.isInteger(args.limit) || Number(args.limit) < 1 || Number(args.limit) > 50)) throw new Error("Search limit must be an integer from 1 to 50");
+  }
   if (job.key !== undefined && (typeof job.key !== "string" || !job.key)) throw new Error("--key must be a nonempty string");
   if (job.notBefore !== undefined && (typeof job.notBefore !== "string" || !Number.isFinite(Date.parse(job.notBefore)))) throw new Error("--not-before must be a valid ISO date");
   return job;
@@ -547,7 +560,7 @@ async function queueRequest(command: string): Promise<unknown> {
   });
 }
 
-async function runPageJob(action: "snapshot" | "readPage" | "getProfile" | "getComments" | "getPosts" | "getPost" | "screenshot", args: Record<string, unknown>): Promise<unknown> {
+async function runPageJob(action: "snapshot" | "readPage" | "getProfile" | "getComments" | "getPosts" | "getPost" | "screenshot" | "search", args: Record<string, unknown>): Promise<unknown> {
   const current = await status();
   if (!current.running) throw new Error("Service not running");
   if (current.halted) {
@@ -558,7 +571,7 @@ async function runPageJob(action: "snapshot" | "readPage" | "getProfile" | "getC
   if (!extension?.connected) throw new Error("Extension not connected");
   if (!extension.compatible) throw new Error("Extension version incompatible");
   const created = await queueRequest(`queue enqueue ${JSON.stringify({ action, args })}`) as { id: number };
-  const deadline = Date.now() + (action === "getComments" || action === "getPosts" || action === "getPost" ? 75000 : action === "getProfile" ? 60000 : 30000);
+  const deadline = Date.now() + (action === "getComments" || action === "getPosts" || action === "getPost" || action === "search" ? 75000 : action === "getProfile" ? 60000 : 30000);
   while (Date.now() < deadline) {
     let job = await queueRequest(`queue get ${created.id}`) as { status: string; result?: unknown; error?: string | { code?: string; reason?: string } };
     if (!["done", "failed", "cancelled"].includes(job.status)) {
@@ -608,7 +621,7 @@ if (Bun.argv[2] === "--service-daemon") {
   db.run("CREATE TABLE IF NOT EXISTS service_state (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
   const haltRow = db.query("SELECT value FROM service_state WHERE key = 'halted'").get() as { value: string } | null;
   let halted: { code: string; reason: string } | null = haltRow ? JSON.parse(haltRow.value) : null;
-  db.run("UPDATE jobs SET data = json_set(data, '$.status', 'queued') WHERE json_extract(data, '$.action') IN ('readPage','snapshot','getProfile','getComments','getPosts','getPost','screenshot') AND json_extract(data, '$.status') = 'running'");
+  db.run("UPDATE jobs SET data = json_set(data, '$.status', 'queued') WHERE json_extract(data, '$.action') IN ('readPage','snapshot','getProfile','getComments','getPosts','getPost','screenshot','search') AND json_extract(data, '$.status') = 'running'");
   type ExtensionData = { token: string; challenge?: { clientNonce: string; serverNonce: string; version: string } };
   let extensionSocket: Bun.ServerWebSocket<ExtensionData> | null = null;
   let connectedVersion: string | null = null;
@@ -671,7 +684,7 @@ if (Bun.argv[2] === "--service-daemon") {
   function pump() {
     if (workerWake) { clearTimeout(workerWake); workerWake = undefined; }
     if (halted || browserBusy || !extensionSocket || !connectedVersion || !compatibleVersion(connectedVersion)) return;
-    const rows = db.query("SELECT id, data FROM jobs WHERE json_extract(data, '$.action') IN ('readPage','snapshot','getProfile','getComments','getPosts','getPost','screenshot') AND json_extract(data, '$.status') = 'queued' ORDER BY id").all() as { id: number; data: string }[];
+    const rows = db.query("SELECT id, data FROM jobs WHERE json_extract(data, '$.action') IN ('readPage','snapshot','getProfile','getComments','getPosts','getPost','screenshot','search') AND json_extract(data, '$.status') = 'queued' ORDER BY id").all() as { id: number; data: string }[];
     const now = Date.now();
     let wakeAt = Infinity;
     const row = rows.find((candidate) => {
@@ -903,12 +916,14 @@ if (Bun.argv[2] === "--service-daemon") {
     console.log("Usage: socmedia page <read|snapshot> [options]\n\nCommands:\n  read            Queue and return visible page text and URL\n  snapshot        Queue and return visible interactive elements\n\nOptions:\n  --max-lines N   With read, limit output to 1-1000 lines (default: 200)\n  --json          Print the result as JSON\n  --help          Show this help message");
   } else if (Bun.argv[2] === "screenshot") {
     console.log("Usage: socmedia screenshot [options]\n\nOptions:\n  --url URL         Navigate to URL first\n  --selector SEL    CSS selector to crop\n  --target TARGET   viewport, post, or profile (default: viewport)\n  --path PATH       Output file destination inside home\n  --json            Print the result as JSON\n  --help            Show this help message");
+  } else if (Bun.argv[2] === "search") {
+    console.log("Usage: socmedia search <platform> <query> [options]\n\nSearch for profiles, pages, places or hashtags on Instagram or Facebook\n\nArguments:\n  platform       Social network: ig (instagram) or fb (facebook)\n  query          Search keyword or hashtag (1-200 characters)\n\nOptions:\n  --type TYPE    users, hashtag, pages, places (default: users)\n  --limit N      Maximum results from 1 to 50 (default: 20)\n  --json         Print the result as JSON\n  --help         Show this help message");
   } else if (Bun.argv[2] === "config") {
     console.log("Usage: socmedia config <get|set|unset> port [value] [--json]\n\nCommands:\n  get port          Show the effective port and configuration source\n  set port <value>  Save a port from 1 to 65535\n  unset port        Remove the saved port\n\nOptions:\n  --json            Print the result as JSON\n  --help            Show this help message\n\nSOCMEDIA_EXTENSION_PORT overrides the saved port; changes apply when the service restarts.");
   } else if (Bun.argv[2] === "extension") {
     console.log("Usage: socmedia extension <install|path|pair> [options]\n\nCommands:\n  install    Copy the extension to its stable state directory and show Chrome setup steps\n  path       Show the stable extension directory\n  pair       Generate a pairing secret for the Chrome extension\n\nOptions:\n  --open     With install, open chrome://extensions in Google Chrome\n  --id ID    With pair, set the Chrome extension ID\n  --json     Print the result as JSON; pairing output contains a sensitive secret\n  --help     Show this help message\n\nPairing replaces any previous pairing; restart the service to disconnect existing clients.");
   } else {
-    console.log("Usage: socmedia [options]\n\nCommands:\n  service    Start or inspect the local service\n  queue      Inspect the service queue\n  extension  Pair the Chrome extension\n  tabs       Inspect extension work tabs\n  page       Inspect the work page\n  screenshot Take a screenshot of the work page\n  post       Inspect a social post\n  profile    Read a social profile\n  contacts   List local contacts\n  config     Configure the service\n\nOptions:\n  --version  Show the CLI version\n  --help     Show this help message");
+    console.log("Usage: socmedia [options]\n\nCommands:\n  service    Start or inspect the local service\n  queue      Inspect the service queue\n  extension  Pair the Chrome extension\n  tabs       Inspect extension work tabs\n  page       Inspect the work page\n  screenshot Take a screenshot of the work page\n  search     Search on Instagram or Facebook\n  post       Inspect a social post\n  profile    Read a social profile\n  contacts   List local contacts\n  config     Configure the service\n\nOptions:\n  --version  Show the CLI version\n  --help     Show this help message");
   }
 } else if (Bun.argv[2] === "post" && Bun.argv[3] === "get") {
   try {
@@ -1135,6 +1150,29 @@ if (Bun.argv[2] === "--service-daemon") {
     }
     if (!args.target) args.target = "viewport";
     console.log(JSON.stringify(await runPageJob("screenshot", args)));
+  } catch (error) { console.error(error instanceof Error ? error.message : String(error)); process.exitCode = 1; }
+} else if (Bun.argv[2] === "search") {
+  try {
+    const platform = Bun.argv[3];
+    const query = Bun.argv[4];
+    if (!platform || !query || platform.startsWith("--") || query.startsWith("--")) throw new Error("Usage: socmedia search <platform> <query> [options]");
+    const norm = { ig: "ig", instagram: "ig", fb: "fb", facebook: "fb" }[platform.toLowerCase()];
+    if (!norm) throw new Error("Search platform must be ig or fb");
+    const args: { platform: string; query: string; type?: string; limit?: number } = { platform: norm, query, type: "users", limit: 20 };
+    for (let i = 5; i < Bun.argv.length; i++) {
+      const option = Bun.argv[i];
+      if (option === "--json") continue;
+      if (option === "--type") {
+        const val = Bun.argv[++i];
+        if (!val || !["users", "hashtag", "pages", "places"].includes(val)) throw new Error("Search type must be users, hashtag, pages or places");
+        args.type = val;
+      } else if (option === "--limit") {
+        const val = Bun.argv[++i];
+        if (!val || !/^[1-9]\d*$/.test(val) || Number(val) > 50) throw new Error("--limit must be an integer from 1 to 50");
+        args.limit = Number(val);
+      } else throw new Error(`Unknown search option: ${option}`);
+    }
+    console.log(JSON.stringify(await runPageJob("search", args)));
   } catch (error) { console.error(error instanceof Error ? error.message : String(error)); process.exitCode = 1; }
 } else if (Bun.argv[2] === "queue" && (Bun.argv[3] === "get" || Bun.argv[3] === "cancel")) {
   try {

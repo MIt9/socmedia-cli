@@ -433,6 +433,134 @@ test("extension screenshot crops element and handles HALT checks", async () => {
   expect(cropViewport).toMatchObject({ crop: false });
 });
 
+test("search extraction parses Instagram and Facebook search results with HALT checks", async () => {
+  const script = await Bun.file(new URL("../extension/background.js", import.meta.url)).text();
+  const tab = { id: 42, windowId: 4, active: true, status: "complete", url: "https://www.instagram.com/explore/" };
+  const location = { href: tab.url, pathname: "/explore/", hostname: "www.instagram.com" };
+
+  const igLink = {
+    pathname: "/nasa/",
+    href: "https://www.instagram.com/nasa/",
+    innerText: "nasa\nNASA • 104M followers",
+    closest: () => null,
+    querySelector: (sel: string) => sel.includes("Verified") ? {} : null,
+  };
+
+  const documentIg = {
+    body: { innerText: "" },
+    querySelector: () => null,
+    querySelectorAll: (sel: string) => sel.includes('a[href^="/"]') ? [igLink] : [],
+  };
+
+  const ignore = { addListener() {} };
+  const chrome = {
+    storage: { local: { get: async () => ({ cliSelectedTab: 42 }), set: async () => {} }, onChanged: ignore },
+    tabs: { get: async () => tab, query: async () => [tab], update: async (_: any, u: any) => Object.assign(tab, u) },
+    tabGroups: { query: async () => [] },
+    scripting: { executeScript: async () => [] },
+    alarms: { create: () => {}, onAlarm: ignore },
+    runtime: { onStartup: ignore },
+  };
+  const contextIg = { chrome, WebSocket, console, URL, document: documentIg, location, window: { devicePixelRatio: 1 } };
+  runInNewContext(script, contextIg);
+
+  const resultsIg = runInNewContext('pgScrapeSearch("ig", "users", 10)', contextIg);
+  expect(resultsIg).toEqual([
+    { name: "NASA", username: "nasa", url: "https://www.instagram.com/nasa/", subtitle: null, followers: 104000000, verified: true },
+  ]);
+
+  const fbLink = {
+    href: "https://www.facebook.com/NASA/",
+    innerText: "NASA",
+  };
+  const fbCard = {
+    innerText: "NASA\nScience & tech • 25M followers\nOfficial page",
+    querySelectorAll: () => [fbLink],
+    querySelector: (sel: string) => sel.includes("Verified") ? {} : fbLink,
+  };
+  const documentFb = {
+    body: { innerText: "" },
+    querySelector: () => null,
+    querySelectorAll: (sel: string) => sel.includes("role=article") ? [fbCard] : [],
+  };
+  const locationFb = { href: "https://www.facebook.com/search/pages/?q=nasa", pathname: "/search/pages/", hostname: "www.facebook.com" };
+  const contextFb = { chrome, WebSocket, console, URL, document: documentFb, location: locationFb, window: { devicePixelRatio: 1 } };
+  runInNewContext(script, contextFb);
+  const resultsFb = runInNewContext('pgScrapeSearch("fb", "pages", 10)', contextFb);
+  expect(resultsFb).toEqual([
+    { name: "NASA", username: "NASA", url: "https://www.facebook.com/NASA/", subtitle: "Science & tech • 25M followers", followers: 25000000, verified: true },
+  ]);
+
+  tab.url = "https://www.instagram.com/checkpoint/";
+  await expect(runInNewContext('search({platform:"ig",query:"nasa"})', contextIg)).rejects.toMatchObject({ code: "HALT" });
+});
+
+test("search command validates platform and query and returns queued results", async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), "socmedia-search-state-"));
+  const run = async (...args: string[]) => {
+    const cli = Bun.spawn(["bun", "run", "src/cli.ts", ...args], {
+      cwd: import.meta.dir + "/..",
+      env: { ...process.env, SOCMEDIA_STATE_DIR: stateDir, SOCMEDIA_EXTENSION_PORT: "0" },
+      stdout: "pipe", stderr: "pipe",
+    });
+    const [stdout, stderr, exit] = await Promise.all([new Response(cli.stdout).text(), new Response(cli.stderr).text(), cli.exited]);
+    return { stdout, stderr, exit };
+  };
+  let pid: number | undefined;
+  let ws: WebSocket | undefined;
+  try {
+    const help = await run("search", "--help");
+    expect(help.stdout).toContain("search <platform> <query>");
+    expect(help.stdout).toContain("--type");
+    expect(help.stdout).toContain("--limit");
+    expect(help.stdout).toContain("--json");
+
+    expect((await run("search", "--json")).exit).not.toBe(0);
+    expect((await run("search", "twitter", "nasa", "--json")).exit).not.toBe(0);
+    expect((await run("search", "ig", "", "--json")).exit).not.toBe(0);
+    expect((await run("search", "ig", "nasa", "--type", "invalid", "--json")).exit).not.toBe(0);
+    expect((await run("search", "ig", "nasa", "--limit", "100", "--json")).exit).not.toBe(0);
+
+    const id = "g".repeat(32);
+    const pairing = JSON.parse((await run("extension", "pair", "--id", id, "--json")).stdout);
+    const started = JSON.parse((await run("service", "start", "--json")).stdout);
+    pid = started.pid;
+    ws = new WebSocket(`ws://127.0.0.1:${started.extension.port}/extension`, { headers: { Origin: `chrome-extension://${id}` } } as unknown as string[]);
+    await authenticateMock(ws, pairing.token);
+
+    const expected = {
+      platform: "ig",
+      results: [{ name: "NASA", username: "nasa", url: "https://www.instagram.com/nasa/", followers: 104000000, verified: true }],
+    };
+
+    ws.onmessage = (event) => {
+      const request = JSON.parse(String(event.data));
+      expect(request).toMatchObject({
+        action: "search",
+        args: { platform: "ig", query: "nasa", type: "users", limit: 5 },
+      });
+      ws!.send(JSON.stringify({ type: "result", id: request.id, result: expected }));
+    };
+
+    const result = await run("search", "instagram", "nasa", "--type", "users", "--limit", "5", "--json");
+    expect(result.exit).toBe(0);
+    expect(JSON.parse(result.stdout)).toEqual(expected);
+
+    const jobs = JSON.parse((await run("queue", "list", "--json")).stdout).jobs;
+    expect(jobs[0]).toMatchObject({ action: "search", status: "done", result: expected });
+  } finally {
+    ws?.close();
+    if (pid) {
+      try { process.kill(pid, "SIGTERM"); } catch {}
+      for (let i = 0; i < 100; i++) {
+        try { process.kill(pid, 0); } catch { break; }
+        await Bun.sleep(20);
+      }
+    }
+    await rm(stateDir, { recursive: true, force: true });
+  }
+});
+
 test("screenshot command validates arguments, writes PNG file inside home, and records queued job", async () => {
   const fakeHome = await mkdtemp(join(tmpdir(), "socmedia-screenshot-home-"));
   const stateDir = await mkdtemp(join(tmpdir(), "socmedia-screenshot-state-"));
@@ -1357,7 +1485,7 @@ test("an interrupted readPage recovers on service restart and persists extension
       await authenticateMock(socket, pairing.token); return { socket, request };
     };
     let link = await connect(); ws = link.socket;
-    const inert = await run("queue", "enqueue", "search", "--args", "{}", "--json");
+    const inert = await run("queue", "enqueue", "scroll", "--args", "{}", "--json");
     const job = await run("queue", "enqueue", "readPage", "--json");
     await Promise.race([link.request, Bun.sleep(1500).then(() => { throw new Error("request timeout"); })]);
     expect((await run("queue", "get", String(inert.id), "--json")).status).toBe("queued");
