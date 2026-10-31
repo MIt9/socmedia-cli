@@ -3,7 +3,7 @@ let browserAction = Promise.resolve();
 let connectEpoch = 0;
 
 const GROUP_TITLE = "Socmedia CLI";
-const isSocial = (url) => /^https:\/\/([\w-]+\.)*(instagram|facebook|youtube)\.com\//.test(url || "");
+const isSocial = (url) => /^https:\/\/([\w-]+\.)*((instagram|facebook|youtube)\.com|fb\.com)\//.test(url || "");
 
 async function selectedWorkTab() {
   const { cliSelectedTab } = await chrome.storage.local.get("cliSelectedTab");
@@ -83,7 +83,7 @@ function inspectPage() {
     return /recaptcha|captcha|arkoselabs/i.test(frame.src || "") && rect.width >= 100 && rect.height >= 50;
   })) return "captcha challenge";
   if (location.hostname.includes("instagram.com") && (document.querySelector("form#loginForm") || document.querySelector('form[action*="/accounts/login"]'))) return "not logged in (Instagram login form)";
-  if (location.hostname.includes("facebook.com") && (document.querySelector("form#login_form") || (document.querySelector('input[name="email"]') && document.querySelector('input[name="pass"]')))) return "not logged in (Facebook login form)";
+  if ((location.hostname.includes("facebook.com") || /(^|\.)fb\.com$/.test(location.hostname)) && (document.querySelector("form#login_form") || (document.querySelector('input[name="email"]') && document.querySelector('input[name="pass"]')))) return "not logged in (Facebook login form)";
   const pattern = /Try Again Later|We restrict certain activity|suspicious activity|Confirm it['’]s you|You['’]re Temporarily Blocked/i;
   const dialogs = [...document.querySelectorAll('[role=dialog], [role=alertdialog], [role=alert]')];
   if ((document.body?.innerText || "").length < 3000 && document.body) dialogs.push(document.body);
@@ -91,28 +91,222 @@ function inspectPage() {
   return null;
 }
 
-async function readPage({ maxLines = 200 }) {
-  if (!Number.isInteger(maxLines) || maxLines < 1 || maxLines > 1000) throw new Error("maxLines must be an integer from 1 to 1000");
-  const { tabId } = await getWorkTab(false);
+async function safeTab(tabId) {
   const tab = await chrome.tabs.get(tabId);
-  if (!isSocial(tab.url)) throw new Error("Work tab is not an open Instagram, Facebook or YouTube tab");
-  const path = new URL(tab.url).pathname.toLowerCase();
+  const parsed = new URL(tab.url);
+  const path = parsed.pathname.toLowerCase();
   const blockedPath = ["/challenge", "/checkpoint", "/accounts/login", "/login", "/suspended"].find((part) => path.includes(part));
-  const [check] = blockedPath ? [] : await chrome.scripting.executeScript({ target: { tabId }, func: inspectPage });
-  const reason = blockedPath ? `URL path "${blockedPath}"` : check?.result;
+  const externalLogin = parsed.hostname === "accounts.google.com" || (/(^|\.)google\.com$/.test(parsed.hostname) && path.startsWith("/sorry"));
+  if (!blockedPath && !externalLogin && !isSocial(tab.url)) throw new Error("Work tab is not an open Instagram, Facebook or YouTube tab");
+  const [check] = blockedPath || externalLogin ? [] : await chrome.scripting.executeScript({ target: { tabId }, func: inspectPage });
+  const reason = blockedPath ? `URL path "${blockedPath}"` : externalLogin ? "Google sign-in or security check" : check?.result;
   if (reason) {
     const error = new Error(`HALT: ${reason}`);
     error.code = "HALT";
     error.reason = reason;
     throw error;
   }
+  return tab;
+}
+
+async function safeWorkTab() {
+  const { tabId } = await getWorkTab(false);
+  return safeTab(tabId);
+}
+
+function instagramProfileUrl(value) {
+  if (typeof value !== "string") throw new Error("Instagram profile URL is required");
+  let url;
+  try { url = new URL(value); } catch { throw new Error("Invalid Instagram profile URL"); }
+  const parts = url.pathname.split("/").filter(Boolean);
+  const reserved = new Set(["accounts", "challenge", "checkpoint", "direct", "explore", "p", "reel", "reels", "stories", "tv", "about", "developer", "legal"]);
+  if (url.protocol !== "https:" || !["instagram.com", "www.instagram.com"].includes(url.hostname.toLowerCase()) || url.username || url.password || url.port || parts.length !== 1 || !/^[a-zA-Z0-9._]{1,30}$/.test(parts[0]) || reserved.has(parts[0].toLowerCase())) throw new Error("Provide an HTTPS Instagram profile URL");
+  return `https://www.instagram.com/${parts[0]}/`;
+}
+
+function profileUrl(value) {
+  if (typeof value !== "string") throw new Error("Instagram or Facebook profile URL is required");
+  let url;
+  try { url = new URL(value); } catch { throw new Error("Invalid Instagram or Facebook profile URL"); }
+  const host = url.hostname.toLowerCase();
+  if (["instagram.com", "www.instagram.com"].includes(host)) return instagramProfileUrl(value);
+  const facebookHosts = ["facebook.com", "www.facebook.com", "m.facebook.com", "mbasic.facebook.com", "web.facebook.com", "fb.com", "www.fb.com"];
+  const parts = url.pathname.split("/").filter(Boolean);
+  const reserved = new Set(["login", "checkpoint", "challenge", "messages", "watch", "reel", "reels", "groups", "events", "marketplace", "share", "photo", "photos", "posts", "videos", "people", "pages", "settings", "help", "home.php", "login.php", "notifications", "friends", "search", "profile.php"]);
+  if (url.protocol !== "https:" || !facebookHosts.includes(host) || url.username || url.password || url.port) throw new Error("Provide an HTTPS Instagram or Facebook profile URL");
+  if (parts.length === 1 && parts[0].toLowerCase() === "profile.php") {
+    const ids = url.searchParams.getAll("id");
+    if (ids.length !== 1 || !/^\d+$/.test(ids[0])) throw new Error("Facebook profile.php URL requires one numeric id");
+    return `https://www.facebook.com/profile.php?id=${ids[0]}`;
+  }
+  const slug = parts.length === 1 && /^[a-zA-Z0-9._-]{1,100}$/.test(parts[0]) && !reserved.has(parts[0].toLowerCase());
+  const named = parts.length === 3 && ["people", "pages"].includes(parts[0].toLowerCase()) && /^[a-zA-Z0-9._-]{1,100}$/.test(parts[1]) && /^\d+$/.test(parts[2]);
+  if (!slug && !named) throw new Error("Provide an HTTPS Instagram or Facebook profile URL");
+  return `https://www.facebook.com/${parts.join("/")}`;
+}
+
+function extractInstagramProfile() {
+  const num = (s) => {
+    if (s == null) return null;
+    const m = String(s).replace(/,/g, "").match(/([\d.]+)\s*([KkMmBb])?/);
+    if (!m) return null;
+    const val = parseFloat(m[1]);
+    if (isNaN(val)) return null;
+    const mult = { k: 1e3, m: 1e6, b: 1e9 }[(m[2] || "").toLowerCase()] || 1;
+    return Math.round(val * mult);
+  };
+  const ogTitle = document.querySelector('meta[property="og:title"]')?.content || "";
+  const ogDesc = document.querySelector('meta[property="og:description"]')?.content || "";
+  const ogImg = document.querySelector('meta[property="og:image"]')?.content || null;
+  const username = location.pathname.replace(/^\/+|\/+$/g, "").split("/")[0] || document.querySelector("header section h2, header h2, header h1")?.innerText?.trim() || null;
+  const name = ogTitle.match(/^(.*?)\s*\(@/)?.[1]?.trim() || document.querySelector('header section span[dir="auto"], header section h1')?.innerText?.trim() || null;
+  const lines = ((document.querySelector("main") || document.body)?.innerText || "").split("\n").map((s) => s.trim()).filter(Boolean);
+  const countLine = (re) => lines.find((line) => re.test(line));
+  const followers = num(countLine(/^[\d.,]+[KkMmBb]?\s+followers$/i)) ?? num(ogDesc.match(/([\d.,]+[KkMmBb]?)\s+Followers/i)?.[1]);
+  const following = num(countLine(/^[\d.,]+[KkMmBb]?\s+following$/i)) ?? num(ogDesc.match(/([\d.,]+[KkMmBb]?)\s+Following/i)?.[1]);
+  const postsCount = num(countLine(/^[\d.,]+[KkMmBb]?\s+posts?$/i)) ?? num(ogDesc.match(/([\d.,]+[KkMmBb]?)\s+Posts/i)?.[1]);
+  const siteRe = /^(?:https?:\/\/)?[\w-]+(?:\.[\w-]+)+(?:\/\S*)?(?: and \d+ more)?$/i;
+  const stopRe = /^(Follow|Following|Message|Edit profile|View archive|Contact|Email|Call|Directions)$/i;
+  const fi = lines.findIndex((line) => /^[\d.,]+[KkMmBb]?\s+following$/i.test(line));
+  let tail = [];
+  if (fi >= 0) {
+    tail = lines.slice(fi + 1, fi + 12);
+    const stop = tail.findIndex((line) => stopRe.test(line) || line === username);
+    if (stop >= 0) tail = tail.slice(0, stop);
+  }
+  const siteLine = tail.find((line) => siteRe.test(line));
+  const bio = tail.filter((line) => line !== siteLine).join("\n") || null;
+  const verified = Boolean(document.querySelector('header [aria-label*="Verified" i], header svg[aria-label*="Verified" i], header [title*="Verified" i]'));
+  const isPrivate = Boolean(document.body?.innerText?.match(/This Account is Private|This account is private/i));
+  const avatarUrl = document.querySelector('header img[alt*="profile picture" i], header img')?.src || ogImg;
+  const category = document.querySelector('header section div:not([dir="auto"])')?.innerText?.trim() || null;
+  const unwrapIg = (href) => { try { return new URL(href, location.href).searchParams.get("u") || href; } catch { return href; } };
+  const links = [...new Set([...document.querySelectorAll('main a[href*="l.instagram.com"], header a[target="_blank"]')].map((a) => unwrapIg(a.href)).filter((href) => href && !href.includes("instagram.com")))];
+  const site = siteLine?.replace(/ and \d+ more$/i, "");
+  const website = (site && (links.find((href) => href.includes(site.replace(/^https?:\/\//, "").replace(/^www\./, ""))) || (/^https?:/.test(site) ? site : `https://${site}`))) || links.find((href) => !/threads\.(com|net)/.test(href)) || null;
+  const emailMatch = (bio || "").match(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/);
+  const phoneMatch = (bio || "").match(/\+?[\d(][\d\s().-]{7,}\d/);
+  const contact = (emailMatch || phoneMatch) ? { email: emailMatch?.[0] || null, phone: phoneMatch?.[0] || null, address: null } : null;
+  const isBusiness = Boolean(category || contact || document.querySelector('[aria-label*="Contact" i]'));
+  return { platform: "ig", url: location.href, username, name, bio, website, category, followers, following, postsCount, verified, private: isPrivate, isBusiness, avatarUrl, contact, links };
+}
+
+function extractFacebookProfile() {
+  const num = (s) => {
+    if (s == null) return null;
+    const m = String(s).replace(/,/g, "").match(/([\d.]+)\s*([KkMmBb])?/);
+    if (!m) return null;
+    const val = parseFloat(m[1]);
+    if (isNaN(val)) return null;
+    const mult = { k: 1e3, m: 1e6, b: 1e9 }[(m[2] || "").toLowerCase()] || 1;
+    return Math.round(val * mult);
+  };
+  const ogTitle = document.querySelector('meta[property="og:title"]')?.content || "";
+  const ogDesc = document.querySelector('meta[property="og:description"]')?.content || "";
+  const ogImg = document.querySelector('meta[property="og:image"]')?.content || null;
+  const lines = ((document.querySelector("[role=main]") || document.body)?.innerText || "").split("\n").map((s) => s.trim()).filter(Boolean);
+  const ci = lines.findIndex((line) => /\bfollowers\b|\bfriends\b|\blikes\b/i.test(line) && /^[\d.,]+[KkMmBb]?\s/.test(line));
+  const buttons = /^(Sign up|Log in|Follow|Following|Search|Message|Like|Liked|Call now|Send message|Book now|Contact us|Learn more|Shop now|Add friend|Friends|Edit profile|Add to story)$/i;
+  let intro = ci >= 0 ? lines.slice(ci + 1) : [];
+  while (intro.length && buttons.test(intro[0])) intro.shift();
+  const moreAt = intro.findIndex((line) => /^(More|All|Posts)$/i.test(line));
+  intro = moreAt >= 0 ? intro.slice(0, moreAt) : intro.slice(0, 6);
+  const section = (title) => {
+    const i = lines.indexOf(title);
+    if (i < 0) return [];
+    const out = [];
+    for (const line of lines.slice(i + 1, i + 12)) {
+      if (/^(Links|Contact info|Photos|Intro|Featured|Reels|Videos|Privacy|See all.*)$/i.test(line)) break;
+      out.push(line.replace(/^·\s*/, ""));
+    }
+    return [...new Set(out)];
+  };
+  const sites = section("Links");
+  const contactLines = section("Contact info");
+  const name = document.querySelector("h1")?.innerText?.trim() || (ci > 0 ? lines[ci - 1] : null) || ogTitle || null;
+  const urlPath = location.pathname.replace(/^\/+|\/+$/g, "");
+  const username = urlPath.includes("profile.php") ? null : urlPath.split("/")[0] || null;
+  const followers = num(document.body?.innerText?.match(/([\d.,]+[KkMmBb]?)\s+followers/i)?.[1]) ?? num(ogDesc.match(/([\d.,]+[KkMmBb]?)\s+followers/i)?.[1]);
+  const following = num(document.body?.innerText?.match(/([\d.,]+[KkMmBb]?)\s+following/i)?.[1]);
+  const verified = Boolean(document.querySelector('h1 [aria-label*="Verified" i], [role=main] [aria-label*="Verified" i]'));
+  const isPrivate = Boolean(document.body?.innerText?.match(/Content Not Found|This content isn't available/i));
+  const avatarUrl = document.querySelector('svg[aria-label*="profile picture" i] image, img[alt*="profile picture" i]')?.src || ogImg;
+  const category = intro.length > 1 && /^[A-Z][\w &'/,-]{2,40}$/.test(intro[intro.length - 1]) ? intro[intro.length - 1] : null;
+  const bio = intro.filter((line) => line !== category).join("\n") || null;
+  const links = sites.map((site) => (/^https?:/.test(site) ? site : `https://${site}`)).filter((href) => /^https?:\/\/[\w-]+(\.[\w-]+)+/.test(href));
+  const website = links[0] || null;
+  const contactText = [...contactLines, bio || ""].join("\n");
+  const emailMatch = contactText.match(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/);
+  const phoneMatch = contactText.match(/\+?[\d(][\d\s().-]{7,}\d/);
+  const contact = (emailMatch || phoneMatch) ? { email: emailMatch?.[0] || null, phone: phoneMatch?.[0] || null, address: contactLines.find((line) => /\d/.test(line) && /,/.test(line) && !/@/.test(line)) || null } : null;
+  const isBusiness = Boolean(category || /page/i.test(document.body?.innerText?.slice(0, 1500) || "") || document.querySelector('a[href*="/reviews/"]'));
+  return { platform: "fb", url: location.href, username, name, bio, website, category, followers, following, postsCount: null, verified, private: isPrivate, isBusiness, avatarUrl, contact, links };
+}
+
+let lastProfileNavigation = 0;
+let nextProfileGap = 3000;
+const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+async function getProfile({ url }) {
+  const target = profileUrl(url);
+  const { tabId } = await getWorkTab();
+  const current = await chrome.tabs.get(tabId);
+  if (current.url !== "about:blank") await safeTab(tabId);
+  if (current.url !== target) {
+    const wait = lastProfileNavigation + nextProfileGap - Date.now();
+    if (wait > 0) await delay(wait);
+    const beforeNavigation = await chrome.tabs.get(tabId);
+    if (beforeNavigation.url !== "about:blank") await safeTab(tabId);
+    await chrome.tabs.update(tabId, { url: target });
+    lastProfileNavigation = Date.now();
+    nextProfileGap = 3000 + Math.floor(Math.random() * 4001);
+    const deadline = Date.now() + 30000;
+    let loaded = false;
+    while (Date.now() < deadline) {
+      const tab = await chrome.tabs.get(tabId);
+      if (tab.status === "complete") { loaded = true; break; }
+      await delay(300);
+    }
+    if (!loaded) throw new Error("Profile navigation timed out");
+    await delay(800 + Math.floor(Math.random() * 701));
+  }
+  const tab = await safeTab(tabId);
+  if (profileUrl(tab.url).toLowerCase() !== target.toLowerCase()) throw new Error("Redirected to a different profile");
+  const extractor = new URL(target).hostname === "www.instagram.com" ? extractInstagramProfile : extractFacebookProfile;
+  const [execution] = await chrome.scripting.executeScript({ target: { tabId }, func: extractor });
+  if (!execution?.result) throw new Error("Could not read profile");
+  return execution.result;
+}
+
+async function readPage({ maxLines = 200 }) {
+  if (!Number.isInteger(maxLines) || maxLines < 1 || maxLines > 1000) throw new Error("maxLines must be an integer from 1 to 1000");
+  const tab = await safeWorkTab();
   const [execution] = await chrome.scripting.executeScript({
-    target: { tabId },
+    target: { tabId: tab.id },
     func: (limit) => (document.body?.innerText || "").split("\n").map((line) => line.trim()).filter(Boolean).slice(0, limit),
     args: [maxLines],
   });
   const lines = execution?.result || [];
   return { url: tab.url, text: lines.join("\n"), lines };
+}
+
+async function snapshot() {
+  const tab = await safeWorkTab();
+  const interactive = 'a,button,input,textarea,[role=button],[role=tab],[role=menuitem],[role=menuitemradio],[role=option],[role=link],[contenteditable=true]';
+  const [execution] = await chrome.scripting.executeScript({
+    target: { tabId: tab.id },
+    func: (selector) => [...document.querySelectorAll(selector)].filter((element) => {
+      const rect = element.getBoundingClientRect(); return rect.width > 0 && rect.height > 0;
+    }).map((element, index) => ({
+      index,
+      role: element.getAttribute("role") || element.tagName.toLowerCase(),
+      label: element.getAttribute("aria-label") || null,
+      text: (element.innerText || "").replace(/\s+/g, " ").trim().slice(0, 80) || null,
+      href: element.href || null,
+    })).slice(0, 400),
+    args: [interactive],
+  });
+  return execution?.result || [];
 }
 
 async function connect() {
@@ -147,9 +341,9 @@ async function connect() {
       } else if (message.type === "hello" && verified) {
         authenticated = message.compatible === true;
         if (!authenticated) console.warn("Socmedia service version is incompatible", message.version);
-      } else if (authenticated && message.type === "request" && (message.action === "tabs.list" || message.action === "tabs.use" || message.action === "readPage")) {
+      } else if (authenticated && message.type === "request" && (message.action === "tabs.list" || message.action === "tabs.use" || message.action === "readPage" || message.action === "snapshot" || message.action === "getProfile")) {
         const reply = (result) => { if (connection.readyState === WebSocket.OPEN) connection.send(JSON.stringify({ type: "result", id: message.id, ...result })); };
-        const task = browserAction.then(() => message.action === "tabs.list" ? listTabs() : message.action === "tabs.use" ? useTab(message.args || {}) : readPage(message.args || {}));
+        const task = browserAction.then(() => message.action === "tabs.list" ? listTabs() : message.action === "tabs.use" ? useTab(message.args || {}) : message.action === "snapshot" ? snapshot() : message.action === "getProfile" ? getProfile(message.args || {}) : readPage(message.args || {}));
         browserAction = task.then(() => undefined, () => undefined);
         task.then((result) => reply({ result }), (error) => reply({ error: error.code === "HALT" ? { code: "HALT", reason: error.reason } : error.message }));
       }

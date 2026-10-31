@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createServer } from "node:net";
@@ -7,8 +7,441 @@ import { runInNewContext } from "node:vm";
 import { createHash, createHmac, randomBytes, webcrypto } from "node:crypto";
 import packageInfo from "../package.json";
 import manifest from "../extension/manifest.json";
+import { Database } from "bun:sqlite";
 
 const projectVersion = packageInfo.version;
+
+test("contacts export writes filtered CSV JSON and JSONL inside home safely", async () => {
+  const home = await mkdtemp(join(tmpdir(), "socmedia-export-home-"));
+  const outside = await mkdtemp(join(tmpdir(), "socmedia-export-outside-"));
+  const stateDir = join(home, "state");
+  const run = async (...args: string[]) => {
+    const cli = Bun.spawn(["bun", "run", "src/cli.ts", ...args], { cwd: import.meta.dir + "/..", env: { ...process.env, HOME: home, SOCMEDIA_STATE_DIR: stateDir, SOCMEDIA_EXTENSION_PORT: "0" }, stdout: "pipe", stderr: "pipe" });
+    const [stdout, stderr, exit] = await Promise.all([new Response(cli.stdout).text(), new Response(cli.stderr).text(), cli.exited]); return { stdout, stderr, exit };
+  };
+  let pid: number | undefined; let ws: WebSocket | undefined;
+  try {
+    const help = await run("contacts", "export", "--help");
+    for (const term of ["export", "--format", "--path", "--status", "--platform", "--json"]) expect(help.stdout).toContain(term);
+    const id = "n".repeat(32);
+    const pairing = JSON.parse((await run("extension", "pair", "--id", id, "--json")).stdout);
+    const started = JSON.parse((await run("service", "start", "--json")).stdout); pid = started.pid;
+    ws = new WebSocket(`ws://127.0.0.1:${started.extension.port}/extension`, { headers: { Origin: `chrome-extension://${id}` } } as unknown as string[]);
+    await authenticateMock(ws, pairing.token);
+    ws.onmessage = (event) => {
+      const request = JSON.parse(String(event.data));
+      ws!.send(JSON.stringify({ type: "result", id: request.id, result: { platform: "ig", url: request.args.url, username: "example", name: '=HYPERLINK("x")', followers: 0, verified: false } }));
+    };
+    expect((await run("profile", "get", "https://www.instagram.com/example/", "--json")).exit).toBe(0);
+    expect((await run("contacts", "update", "ig:example", "--status", "won", "--note", 'line\n"quoted", text', "--json")).exit).toBe(0);
+    const contact = JSON.parse((await run("contacts", "list", "--json")).stdout).contacts[0];
+    const csv = await run("contacts", "export", "--format", "csv", "--path", join(home, "reports", "contacts.csv"), "--status", "won", "--platform", "ig", "--json");
+    expect(csv.exit).toBe(0); expect(JSON.parse(csv.stdout)).toEqual({ path: join(home, "reports", "contacts.csv"), count: 1 });
+    const csvText = await readFile(join(home, "reports", "contacts.csv"), "utf8");
+    expect(csvText).toStartWith("id,platform,username,name,status,followers,following,postsCount,verified,private,isBusiness,category,website,email,phone,bio,url,note,firstSeen,lastSeen,updatedAt\n");
+    expect(csvText).toContain('"\'=HYPERLINK(""x"")"'); expect(csvText).toContain('"line\n""quoted"", text"');
+    for (const format of ["json", "jsonl"]) {
+      const file = join(home, `contacts.${format}`);
+      const result = await run("contacts", "export", "--format", format, "--path", file, "--json"); expect(result.exit).toBe(0);
+      const data = await readFile(file, "utf8"); expect(format === "json" ? JSON.parse(data) : data.trim().split("\n").map((line) => JSON.parse(line))).toEqual([contact]);
+    }
+    const empty = await run("contacts", "export", "--format", "json", "--status", "skip", "--path", join(home, "empty.json"), "--json");
+    expect(JSON.parse(empty.stdout).count).toBe(0); expect(JSON.parse(await readFile(join(home, "empty.json"), "utf8"))).toEqual([]);
+    const defaultResult = JSON.parse((await run("contacts", "export", "--json")).stdout);
+    expect(defaultResult.path).toStartWith(join(home, "socmedia-data", "contacts-"));
+    await symlink(outside, join(home, "escape"));
+    for (const file of [join(outside, "bad.csv"), join(home, "escape", "bad.csv")]) {
+      const rejected = await run("contacts", "export", "--path", file, "--json"); expect(rejected.exit).not.toBe(0);
+    }
+    expect((await run("contacts", "export", "--format", "xml", "--json")).exit).not.toBe(0);
+    expect(await readdir(outside)).toEqual([]);
+    await writeFile(join(outside, "victim"), "unchanged");
+    await symlink(join(outside, "victim"), join(home, "linked.csv"));
+    expect((await run("contacts", "export", "--path", join(home, "linked.csv"), "--json")).exit).not.toBe(0);
+    expect(await readFile(join(outside, "victim"), "utf8")).toBe("unchanged");
+    expect((await run("contacts", "export", "--path", join(stateDir, "state.sqlite"), "--json")).exit).not.toBe(0);
+    expect(JSON.parse((await run("contacts", "list", "--json")).stdout).count).toBe(1);
+  } finally {
+    ws?.close(); if (pid) { try { process.kill(pid, "SIGTERM"); } catch {} for (let i = 0; i < 100; i++) { try { process.kill(pid, 0); } catch { break; } await Bun.sleep(20); } }
+    await rm(home, { recursive: true, force: true }); await rm(outside, { recursive: true, force: true });
+  }
+});
+
+test("Facebook profile extraction uses actual extension DOM logic with HALT checks", async () => {
+  const script = await Bun.file(new URL("../extension/background.js", import.meta.url)).text();
+  const stored: Record<string, unknown> = { cliSelectedTab: 42 };
+  const tab = { id: 42, windowId: 4, active: true, status: "complete", url: "https://www.facebook.com/oldpage" };
+  const location = { href: tab.url, pathname: "/oldpage", hostname: "www.facebook.com" };
+  const text = "Sample Page\n1.2K followers • 15 following\nFollow\nUseful local resources\nCommunity Organization\nMore\nLinks\nexample.org\nContact info\nhello@example.invalid\nPhotos";
+  const document = { body: { innerText: text }, querySelector: (selector: string) => selector === "[role=main]" ? { innerText: text } : selector === "h1" ? { innerText: "Sample Page" } : null, querySelectorAll: () => [] };
+  const ignore = { addListener() {} };
+  const chrome = {
+    storage: { local: { get: async (keys: string | string[]) => Object.fromEntries((Array.isArray(keys) ? keys : [keys]).map((key) => [key, stored[key]])), set: async (values: Record<string, unknown>) => Object.assign(stored, values) }, onChanged: ignore },
+    tabs: { get: async () => tab, query: async () => [], update: async (_id: number, values: { url?: string }) => { if (values.url) { tab.url = values.url; location.href = values.url; location.pathname = new URL(values.url).pathname; } } },
+    tabGroups: { query: async () => [] }, scripting: { executeScript: async ({ func, args = [] }: any) => [{ result: func(...args) }] },
+    alarms: { create() {}, onAlarm: ignore }, runtime: { onStartup: ignore },
+  };
+  const context = { chrome, WebSocket, console, URL, document, location, setTimeout: (fn: () => void) => { fn(); return 0; }, Date, Math };
+  runInNewContext(script, context);
+  const profile = await runInNewContext('getProfile({url:"https://www.facebook.com/samplepage"})', context);
+  expect(profile).toMatchObject({ platform: "fb", username: "samplepage", name: "Sample Page", bio: "Useful local resources", category: "Community Organization", followers: 1200, following: 15, postsCount: null, website: "https://example.org", contact: { email: "hello@example.invalid" } });
+  const numeric = await runInNewContext('getProfile({url:"https://www.facebook.com/profile.php?id=12345"})', context);
+  expect(numeric).toMatchObject({ platform: "fb", username: null });
+  tab.url = "https://www.facebook.com/checkpoint/";
+  await expect(runInNewContext('getProfile({url:"https://www.facebook.com/samplepage"})', context)).rejects.toMatchObject({ code: "HALT" });
+  expect(tab.url).toBe("https://www.facebook.com/checkpoint/");
+  tab.url = "https://www.facebook.com/oldpage";
+  chrome.tabs.update = async () => { tab.url = "https://www.facebook.com/differentpage"; location.href = tab.url; location.pathname = "/differentpage"; };
+  await expect(runInNewContext('getProfile({url:"https://www.facebook.com/samplepage"})', context)).rejects.toThrow("different profile");
+});
+
+test("Facebook profile URLs queue reads and upsert fb contacts while preserving user fields", async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), "socmedia-facebook-"));
+  const run = async (...args: string[]) => {
+    const cli = Bun.spawn(["bun", "run", "src/cli.ts", ...args], { cwd: import.meta.dir + "/..", env: { ...process.env, SOCMEDIA_STATE_DIR: stateDir, SOCMEDIA_EXTENSION_PORT: "0" }, stdout: "pipe", stderr: "pipe" });
+    const [stdout, stderr, exit] = await Promise.all([new Response(cli.stdout).text(), new Response(cli.stderr).text(), cli.exited]); return { stdout, stderr, exit };
+  };
+  let pid: number | undefined; let ws: WebSocket | undefined;
+  try {
+    for (const url of ["http://facebook.com/example", "https://facebook.com.evil.test/example", "https://user@facebook.com/example", "https://facebook.com/profile.php", "https://facebook.com/profile.php?id=abc", "https://facebook.com/profile.php?id=1&id=2", "https://facebook.com/people", "https://facebook.com/example/posts/123"]) {
+      expect((await run("profile", "get", url, "--json")).exit).not.toBe(0);
+    }
+    const extId = "m".repeat(32);
+    const pairing = JSON.parse((await run("extension", "pair", "--id", extId, "--json")).stdout);
+    const started = JSON.parse((await run("service", "start", "--json")).stdout); pid = started.pid;
+    ws = new WebSocket(`ws://127.0.0.1:${started.extension.port}/extension`, { headers: { Origin: `chrome-extension://${extId}` } } as unknown as string[]);
+    await authenticateMock(ws, pairing.token);
+    let name = "First";
+    ws.onmessage = (event) => { const request = JSON.parse(String(event.data)); ws!.send(JSON.stringify({ type: "result", id: request.id, result: { platform: "fb", url: request.args.url, username: request.args.url.includes("profile.php") ? null : "samplepage", name, followers: 1200 } })); };
+    const first = await run("profile", "get", "https://m.facebook.com/samplepage?tracking=ignored", "--json");
+    expect(first.exit).toBe(0); expect(JSON.parse(first.stdout)).toMatchObject({ platform: "fb", url: "https://www.facebook.com/samplepage" });
+    expect((await run("contacts", "update", "fb:samplepage", "--status", "won", "--note", "keep", "--json")).exit).toBe(0);
+    name = "Updated"; expect((await run("profile", "get", "https://fb.com/samplepage", "--json")).exit).toBe(0);
+    const numeric = await run("profile", "get", "https://www.facebook.com/profile.php?id=12345", "--json"); expect(numeric.exit).toBe(0);
+    const contacts = JSON.parse((await run("contacts", "list", "--platform", "fb", "--json")).stdout).contacts;
+    expect(contacts.find((contact: any) => contact.id === "fb:samplepage")).toMatchObject({ name: "Updated", status: "won", note: "keep" });
+    expect(contacts.find((contact: any) => contact.id === "fb:profile.php?id=12345")).toMatchObject({ platform: "fb", status: "new" });
+    expect((await run("service", "stop", "--json")).exit).toBe(0); ws.close();
+    pid = JSON.parse((await run("service", "start", "--json")).stdout).pid;
+    expect(JSON.parse((await run("contacts", "list", "--platform", "fb", "--json")).stdout).contacts).toEqual(contacts);
+  } finally {
+    ws?.close(); if (pid) { try { process.kill(pid, "SIGTERM"); } catch {} for (let i = 0; i < 100; i++) { try { process.kill(pid, 0); } catch { break; } await Bun.sleep(20); } }
+    await rm(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("contacts update preserves status and note through profile refresh and restart", async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), "socmedia-contact-update-"));
+  const run = async (...args: string[]) => {
+    const cli = Bun.spawn(["bun", "run", "src/cli.ts", ...args], { cwd: import.meta.dir + "/..", env: { ...process.env, SOCMEDIA_STATE_DIR: stateDir, SOCMEDIA_EXTENSION_PORT: "0" }, stdout: "pipe", stderr: "pipe" });
+    const [stdout, stderr, exit] = await Promise.all([new Response(cli.stdout).text(), new Response(cli.stderr).text(), cli.exited]); return { stdout, stderr, exit };
+  };
+  let pid: number | undefined; let ws: WebSocket | undefined;
+  try {
+    const help = await run("contacts", "update", "--help");
+    expect(help.stdout).toContain("update <id>"); expect(help.stdout).toContain("--status"); expect(help.stdout).toContain("--note"); expect(help.stdout).toContain("--json");
+    const extId = "l".repeat(32);
+    const pairing = JSON.parse((await run("extension", "pair", "--id", extId, "--json")).stdout);
+    const started = JSON.parse((await run("service", "start", "--json")).stdout); pid = started.pid;
+    ws = new WebSocket(`ws://127.0.0.1:${started.extension.port}/extension`, { headers: { Origin: `chrome-extension://${extId}` } } as unknown as string[]);
+    await authenticateMock(ws, pairing.token);
+    let name = "First";
+    ws.onmessage = (event) => { const request = JSON.parse(String(event.data)); ws!.send(JSON.stringify({ type: "result", id: request.id, result: { platform: "ig", url: request.args.url, username: "example", name } })); };
+    expect((await run("profile", "get", "https://instagram.com/example/", "--json")).exit).toBe(0);
+    const updated = await run("contacts", "update", "ig:example", "--status", "won", "--note", "remember", "--json");
+    expect(updated.exit).toBe(0);
+    expect(JSON.parse(updated.stdout)).toMatchObject({ id: "ig:example", status: "won", note: "remember", updatedAt: expect.any(String) });
+    name = "Second";
+    expect((await run("profile", "get", "https://instagram.com/example/", "--json")).exit).toBe(0);
+    const current = JSON.parse((await run("contacts", "list", "--json")).stdout).contacts[0];
+    expect(current).toMatchObject({ status: "won", note: "remember", name: "Second", updatedAt: expect.any(String) });
+    for (const args of [["ig:missing", "--status", "won"], ["ig:example"], ["ig:example", "--status", "bad"], ["ig:example", "--note", "x".repeat(2001)], ["ig:example", "--unknown"]]) {
+      const invalid = await run("contacts", "update", ...args, "--json"); expect(invalid.exit).not.toBe(0); expect(invalid.stderr.length).toBeGreaterThan(0);
+    }
+    expect((await run("service", "stop", "--json")).exit).toBe(0); ws.close();
+    pid = JSON.parse((await run("service", "start", "--json")).stdout).pid;
+    expect(JSON.parse((await run("contacts", "list", "--json")).stdout).contacts[0]).toEqual(current);
+    const cleared = await run("contacts", "update", "ig:example", "--note", "", "--json");
+    expect(cleared.exit).toBe(0); expect(JSON.parse(cleared.stdout)).toMatchObject({ status: "won", note: "" });
+  } finally {
+    ws?.close(); if (pid) { try { process.kill(pid, "SIGTERM"); } catch {} for (let i = 0; i < 100; i++) { try { process.kill(pid, 0); } catch { break; } await Bun.sleep(20); } }
+    await rm(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("profile results upsert contacts without erasing status or notes and survive restart", async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), "socmedia-contacts-"));
+  const fixture = new Database(join(stateDir, "state.sqlite"));
+  fixture.run("CREATE TABLE contacts (id TEXT PRIMARY KEY, data TEXT NOT NULL)");
+  fixture.query("INSERT INTO contacts (id, data) VALUES (?, ?)").run("ig:example", JSON.stringify({ id: "ig:example", platform: "ig", status: "won", note: "preserve note", firstSeen: "2020-01-01T00:00:00.000Z", bio: "old bio", followers: 12, verified: true }));
+  fixture.close();
+  const run = async (...args: string[]) => {
+    const cli = Bun.spawn(["bun", "run", "src/cli.ts", ...args], { cwd: import.meta.dir + "/..", env: { ...process.env, SOCMEDIA_STATE_DIR: stateDir, SOCMEDIA_EXTENSION_PORT: "0" }, stdout: "pipe", stderr: "pipe" });
+    const [stdout, stderr, exit] = await Promise.all([new Response(cli.stdout).text(), new Response(cli.stderr).text(), cli.exited]);
+    return { stdout, stderr, exit };
+  };
+  let pid: number | undefined; let ws: WebSocket | undefined;
+  try {
+    const help = await run("contacts", "--help"); expect(help.stdout).toContain("list"); expect(help.stdout).toContain("--json");
+    const id = "k".repeat(32);
+    const pairing = JSON.parse((await run("extension", "pair", "--id", id, "--json")).stdout);
+    const started = JSON.parse((await run("service", "start", "--json")).stdout); pid = started.pid;
+    ws = new WebSocket(`ws://127.0.0.1:${started.extension.port}/extension`, { headers: { Origin: `chrome-extension://${id}` } } as unknown as string[]);
+    await authenticateMock(ws, pairing.token);
+    ws.onmessage = (event) => {
+      const request = JSON.parse(String(event.data));
+      const username = new URL(request.args.url).pathname.split("/")[1];
+      const result = { platform: "ig", url: request.args.url, username, name: username === "example" ? "Updated" : "New contact", bio: null, followers: 0, verified: false, contact: username === "other" ? { email: "person@example.invalid", phone: "+10000000000" } : null };
+      ws!.send(JSON.stringify({ type: "result", id: request.id, result }));
+    };
+    expect((await run("profile", "get", "https://instagram.com/example/", "--json")).exit).toBe(0);
+    expect((await run("profile", "get", "https://instagram.com/other/", "--json")).exit).toBe(0);
+    const listing = JSON.parse((await run("contacts", "list", "--json")).stdout);
+    expect(listing.count).toBe(2);
+    const existing = listing.contacts.find((c: any) => c.id === "ig:example");
+    expect(existing).toMatchObject({ status: "won", note: "preserve note", firstSeen: "2020-01-01T00:00:00.000Z", name: "Updated", bio: "old bio", followers: 0, verified: false });
+    expect(existing.lastSeen).toEqual(expect.any(String));
+    expect(listing.contacts.find((c: any) => c.id === "ig:other")).toMatchObject({ status: "new", platform: "ig", username: "other", name: "New contact", email: "person@example.invalid", phone: "+10000000000" });
+    expect(JSON.parse((await run("contacts", "list", "--status", "won", "--platform", "ig", "--json")).stdout).contacts).toEqual([existing]);
+    expect((await run("contacts", "list", "--status", "unknown", "--json")).exit).not.toBe(0);
+    ws.onmessage = (event) => {
+      const request = JSON.parse(String(event.data));
+      ws!.send(JSON.stringify({ type: "result", id: request.id, result: { platform: "ig", url: "https://www.instagram.com/other/", username: "other" } }));
+    };
+    const mismatch = await run("profile", "get", "https://instagram.com/third/", "--json");
+    expect(mismatch.exit).not.toBe(0); expect(mismatch.stderr).toContain("does not match");
+    expect(JSON.parse((await run("contacts", "list", "--json")).stdout)).toEqual(listing);
+    expect((await run("service", "stop", "--json")).exit).toBe(0); ws.close();
+    pid = JSON.parse((await run("service", "start", "--json")).stdout).pid;
+    expect(JSON.parse((await run("contacts", "list", "--json")).stdout)).toEqual(listing);
+  } finally {
+    ws?.close(); if (pid) { try { process.kill(pid, "SIGTERM"); } catch {} for (let i = 0; i < 100; i++) { try { process.kill(pid, 0); } catch { break; } await Bun.sleep(20); } }
+    await rm(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("Instagram profile extraction uses real extension DOM logic after safe navigation", async () => {
+  const script = await Bun.file(new URL("../extension/background.js", import.meta.url)).text();
+  const stored: Record<string, unknown> = { cliSelectedTab: 42 };
+  const tab = { id: 42, windowId: 4, active: true, status: "complete", url: "https://www.instagram.com/previous/" };
+  const location = { href: tab.url, pathname: "/previous/", hostname: "www.instagram.com" };
+  const main = { innerText: "10 posts\n1.2K followers\n45 following\nA sample bio\nexample.org\nMessage" };
+  const document = {
+    body: { innerText: main.innerText },
+    querySelector: (selector: string) => selector === 'meta[property="og:title"]' ? { content: "Example Name (@example)" } : selector === "main" ? main : null,
+    querySelectorAll: () => [],
+  };
+  const ignore = { addListener() {} };
+  const chrome = {
+    storage: { local: { get: async (keys: string | string[]) => Object.fromEntries((Array.isArray(keys) ? keys : [keys]).map((key) => [key, stored[key]])), set: async (values: Record<string, unknown>) => Object.assign(stored, values) }, onChanged: ignore },
+    tabs: {
+      get: async () => tab, query: async () => [],
+      update: async (_id: number, values: { url?: string }) => { if (values.url) { tab.url = values.url; location.href = values.url; location.pathname = new URL(values.url).pathname; } },
+    },
+    tabGroups: { query: async () => [] }, scripting: { executeScript: async ({ func, args = [] }: any) => [{ result: func(...args) }] },
+    alarms: { create() {}, onAlarm: ignore }, runtime: { onStartup: ignore },
+  };
+  const context = { chrome, WebSocket, console, URL, document, location, setTimeout: (fn: () => void) => { fn(); return 0; }, Date, Math };
+  runInNewContext(script, context);
+  const result = await runInNewContext('getProfile({url:"https://www.instagram.com/example/"})', context);
+  expect(result).toMatchObject({ platform: "ig", username: "example", name: "Example Name", bio: "A sample bio", website: "https://example.org", category: null, followers: 1200, following: 45, postsCount: 10, verified: false, private: false, isBusiness: false, avatarUrl: null, contact: null, links: [] });
+  expect(tab.url).toBe("https://www.instagram.com/example/");
+  tab.url = "https://www.instagram.com/checkpoint/";
+  await expect(runInNewContext('getProfile({url:"https://www.instagram.com/example/"})', context)).rejects.toMatchObject({ code: "HALT" });
+  expect(tab.url).toBe("https://www.instagram.com/checkpoint/");
+});
+
+test("profile get validates Instagram URLs and returns queued result", async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), "socmedia-profile-"));
+  const run = async (...args: string[]) => {
+    const cli = Bun.spawn(["bun", "run", "src/cli.ts", ...args], { cwd: import.meta.dir + "/..", env: { ...process.env, SOCMEDIA_STATE_DIR: stateDir, SOCMEDIA_EXTENSION_PORT: "0" }, stdout: "pipe", stderr: "pipe" });
+    const [stdout, stderr, exit] = await Promise.all([new Response(cli.stdout).text(), new Response(cli.stderr).text(), cli.exited]); return { stdout, stderr, exit };
+  };
+  let pid: number | undefined; let ws: WebSocket | undefined;
+  try {
+    const help = await run("profile", "get", "--help"); expect(help.stdout).toContain("get <url>"); expect(help.stdout).toContain("--json");
+    for (const url of ["https://instagram.com.evil.test/example", "http://instagram.com/example", "https://user@instagram.com/example", "https://instagram.com:444/example", "https://instagram.com/p/123", "https://instagram.com/"]) {
+      const invalid = await run("profile", "get", url, "--json"); expect(invalid.exit).not.toBe(0); expect(invalid.stderr).toContain("Instagram");
+    }
+    const id = "j".repeat(32);
+    const pairing = JSON.parse((await run("extension", "pair", "--id", id, "--json")).stdout);
+    const started = JSON.parse((await run("service", "start", "--json")).stdout); pid = started.pid;
+    ws = new WebSocket(`ws://127.0.0.1:${started.extension.port}/extension`, { headers: { Origin: `chrome-extension://${id}` } } as unknown as string[]);
+    await authenticateMock(ws, pairing.token);
+    const expected = { platform: "ig", url: "https://www.instagram.com/example/", username: "example", name: "Example", followers: 1200 };
+    ws.onmessage = (event) => { const request = JSON.parse(String(event.data)); expect(request.action).toBe("getProfile"); expect(request.args).toEqual({ url: expected.url }); ws!.send(JSON.stringify({ type: "result", id: request.id, result: expected })); };
+    const result = await run("profile", "get", "https://www.instagram.com/example/", "--json");
+    expect(result.exit).toBe(0); expect(JSON.parse(result.stdout)).toEqual(expected);
+    const jobs = JSON.parse((await run("queue", "list", "--json")).stdout).jobs;
+    expect(jobs[0]).toMatchObject({ action: "getProfile", status: "done", result: expected });
+    ws.onmessage = (event) => { const request = JSON.parse(String(event.data)); ws!.send(JSON.stringify({ type: "result", id: request.id, error: { code: "HALT", reason: "captcha challenge" } })); };
+    const halted = await run("profile", "get", "https://instagram.com/example/", "--json");
+    expect(halted.exit).not.toBe(0); expect(halted.stderr).toContain("captcha challenge"); expect(halted.stderr).toContain("resume");
+  } finally {
+    ws?.close();
+    if (pid) { try { process.kill(pid, "SIGTERM"); } catch {} for (let i = 0; i < 100; i++) { try { process.kill(pid, 0); } catch { break; } await Bun.sleep(20); } }
+    await rm(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("page read rechecks its job when HALT arrives between job and status reads", async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), "socmedia-halt-race-"));
+  let halted = false;
+  let reads = 0;
+  let mode: "failed" | "queued" = "failed";
+  const server = createServer((socket) => {
+    socket.write(JSON.stringify({ identity: "socmedia-service-v1", pid: process.pid, version: projectVersion, extension: { connected: true, compatible: true }, halted: halted ? { code: "HALT", reason: "captcha challenge" } : null }) + "\n");
+    let input = "";
+    socket.on("data", (data) => {
+      input += data.toString();
+      if (!input.includes("\n")) return;
+      const command = input.split("\n")[0]!;
+      let reply: unknown;
+      if (command.startsWith("queue enqueue ")) reply = { id: 2, status: "queued" };
+      else if (command === "queue get 2") {
+        reads++;
+        if (reads === 1) { halted = true; reply = { id: 2, status: "running" }; }
+        else reply = mode === "failed" ? { id: 2, status: "failed", error: { code: "HALT", reason: "captcha challenge" } } : { id: 2, status: "queued" };
+      } else reply = { error: "unexpected command" };
+      socket.end(JSON.stringify(reply) + "\n");
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(join(stateDir, "service.sock"), resolve));
+  const run = async () => {
+    const cli = Bun.spawn(["bun", "run", "src/cli.ts", "page", "read", "--json"], { cwd: import.meta.dir + "/..", env: { ...process.env, SOCMEDIA_STATE_DIR: stateDir, SOCMEDIA_EXTENSION_PORT: "0" }, stdout: "pipe", stderr: "pipe" });
+    const [stderr, exit] = await Promise.all([new Response(cli.stderr).text(), cli.exited]);
+    return { stderr, exit };
+  };
+  try {
+    const failed = await run();
+    expect(failed.exit).not.toBe(0); expect(failed.stderr).toContain("captcha challenge"); expect(failed.stderr).toContain("resume"); expect(reads).toBe(2);
+    halted = false; reads = 0; mode = "queued";
+    const queued = await run();
+    expect(queued.exit).not.toBe(0); expect(queued.stderr).toContain("Job 2"); expect(queued.stderr).toContain("queued"); expect(reads).toBe(2);
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    await rm(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("page read validates limits and returns queued readPage data or a HALT error", async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), "socmedia-page-read-"));
+  const run = async (...args: string[]) => {
+    const cli = Bun.spawn(["bun", "run", "src/cli.ts", ...args], { cwd: import.meta.dir + "/..", env: { ...process.env, SOCMEDIA_STATE_DIR: stateDir, SOCMEDIA_EXTENSION_PORT: "0" }, stdout: "pipe", stderr: "pipe" });
+    const [stdout, stderr, exit] = await Promise.all([new Response(cli.stdout).text(), new Response(cli.stderr).text(), cli.exited]);
+    return { stdout, stderr, exit };
+  };
+  let pid: number | undefined;
+  let ws: WebSocket | undefined;
+  try {
+    const help = await run("page", "read", "--help");
+    expect(help.stdout).toContain("read"); expect(help.stdout).toContain("--max-lines"); expect(help.stdout).toContain("--json");
+    for (const args of [["--max-lines", "0"], ["--max-lines", "1001"], ["--max-lines", "abc"], ["--max-lines"], ["--unknown"]]) {
+      const invalid = await run("page", "read", ...args, "--json");
+      expect(invalid.exit).not.toBe(0); expect(invalid.stderr).toContain(args[0]);
+    }
+    const extId = "i".repeat(32);
+    const pairing = JSON.parse((await run("extension", "pair", "--id", extId, "--json")).stdout);
+    const started = JSON.parse((await run("service", "start", "--json")).stdout); pid = started.pid;
+    ws = new WebSocket(`ws://127.0.0.1:${started.extension.port}/extension`, { headers: { Origin: `chrome-extension://${extId}` } } as unknown as string[]);
+    await authenticateMock(ws, pairing.token);
+    let halt = false;
+    const seen: any[] = [];
+    ws.onmessage = (event) => {
+      const request = JSON.parse(String(event.data)); seen.push(request);
+      ws!.send(JSON.stringify(halt ? { type: "result", id: request.id, error: { code: "HALT", reason: "captcha challenge" } } : { type: "result", id: request.id, result: { url: "https://www.instagram.com/", text: "one\ntwo", lines: ["one", "two"] } }));
+    };
+    const read = await run("page", "read", "--max-lines", "2", "--json");
+    expect(read.exit).toBe(0); expect(JSON.parse(read.stdout)).toMatchObject({ text: "one\ntwo", lines: ["one", "two"] });
+    expect(seen[0]).toMatchObject({ action: "readPage", args: { maxLines: 2 } });
+    halt = true;
+    const blocked = await run("page", "read", "--json");
+    expect(blocked.exit).not.toBe(0); expect(blocked.stderr).toContain("captcha challenge"); expect(blocked.stderr).toContain("resume");
+    expect(seen[1]).toMatchObject({ action: "readPage", args: {} });
+  } finally {
+    ws?.close();
+    if (pid) { try { process.kill(pid, "SIGTERM"); } catch {} for (let i = 0; i < 100; i++) { try { process.kill(pid, 0); } catch { break; } await Bun.sleep(20); } }
+    await rm(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("extension snapshot preserves visible element fields and shares HALT protection", async () => {
+  const script = await Bun.file(new URL("../extension/background.js", import.meta.url)).text();
+  const stored: Record<string, unknown> = { cliSelectedTab: 42 };
+  const tab = { id: 42, windowId: 4, active: true, url: "https://www.instagram.com/example/" };
+  const element = (visible: boolean, role: string | null, text: string, href: string | null) => ({
+    tagName: "BUTTON", innerText: text, href, getAttribute: (name: string) => name === "role" ? role : name === "aria-label" ? "Profile" : null,
+    getBoundingClientRect: () => ({ width: visible ? 100 : 0, height: visible ? 50 : 0 }),
+  });
+  const elements = [element(true, "button", "  View   profile  ", "https://www.instagram.com/example/"), element(false, null, "hidden", null), element(true, null, " Next ", null)];
+  const document = { body: { innerText: "" }, querySelector: () => null, querySelectorAll: (selector: string) => selector === "iframe" || selector.startsWith("[role=dialog]") ? [] : elements };
+  const ignore = { addListener() {} };
+  const chrome = {
+    storage: { local: { get: async (keys: string | string[]) => Object.fromEntries((Array.isArray(keys) ? keys : [keys]).map((key) => [key, stored[key]])), set: async (v: Record<string, unknown>) => Object.assign(stored, v) }, onChanged: ignore },
+    tabs: { get: async () => tab, query: async () => [] }, tabGroups: { query: async () => [] },
+    scripting: { executeScript: async ({ func, args = [] }: any) => [{ result: func(...args) }] },
+    alarms: { create() {}, onAlarm: ignore }, runtime: { onStartup: ignore },
+  };
+  const context = { chrome, WebSocket, console, URL, document, location: { pathname: "/example/", hostname: "www.instagram.com" } };
+  runInNewContext(script, context);
+  expect(await runInNewContext("snapshot({})", context)).toEqual([
+    { index: 0, role: "button", label: "Profile", text: "View profile", href: "https://www.instagram.com/example/" },
+    { index: 1, role: "button", label: "Profile", text: "Next", href: null },
+  ]);
+  tab.url = "https://www.instagram.com/checkpoint/";
+  await expect(runInNewContext("snapshot({})", context)).rejects.toMatchObject({ code: "HALT" });
+});
+
+test("page snapshot returns a queued browser result through the authenticated extension", async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), "socmedia-snapshot-"));
+  const run = async (...args: string[]) => {
+    const cli = Bun.spawn(["bun", "run", "src/cli.ts", ...args], { cwd: import.meta.dir + "/..", env: { ...process.env, SOCMEDIA_STATE_DIR: stateDir, SOCMEDIA_EXTENSION_PORT: "0" }, stdout: "pipe", stderr: "pipe" });
+    const [stdout, stderr, exit] = await Promise.all([new Response(cli.stdout).text(), new Response(cli.stderr).text(), cli.exited]);
+    return { stdout, stderr, exit };
+  };
+  let pid: number | undefined;
+  let ws: WebSocket | undefined;
+  try {
+    const help = await run("page", "snapshot", "--help");
+    expect(help.stdout).toContain("snapshot"); expect(help.stdout).toContain("--json");
+    const id = "h".repeat(32);
+    const pairing = JSON.parse((await run("extension", "pair", "--id", id, "--json")).stdout);
+    const started = JSON.parse((await run("service", "start", "--json")).stdout); pid = started.pid;
+    ws = new WebSocket(`ws://127.0.0.1:${started.extension.port}/extension`, { headers: { Origin: `chrome-extension://${id}` } } as unknown as string[]);
+    await authenticateMock(ws, pairing.token);
+    const expected = [{ index: 0, role: "button", label: "Open", text: "Open", href: null }];
+    ws.onmessage = (event) => {
+      const request = JSON.parse(String(event.data));
+      expect(request.action).toBe("snapshot");
+      ws!.send(JSON.stringify({ type: "result", id: request.id, result: expected }));
+    };
+    const result = await run("page", "snapshot", "--json");
+    expect(result.exit).toBe(0); expect(JSON.parse(result.stdout)).toEqual(expected);
+    const list = JSON.parse((await run("queue", "list", "--json")).stdout);
+    expect(list.jobs[0]).toMatchObject({ action: "snapshot", status: "done", result: expected });
+    let shouldHalt = true;
+    ws.onmessage = (event) => {
+      const request = JSON.parse(String(event.data));
+      ws!.send(JSON.stringify(shouldHalt ? { type: "result", id: request.id, error: { code: "HALT", reason: "captcha challenge" } } : { type: "result", id: request.id, result: expected }));
+    };
+    const haltedJob = JSON.parse((await run("queue", "enqueue", "snapshot", "--json")).stdout);
+    let state: any;
+    for (let i = 0; i < 40; i++) { state = JSON.parse((await run("service", "status", "--json")).stdout); if (state.halted) break; await Bun.sleep(20); }
+    expect(state.halted).toMatchObject({ code: "HALT", reason: "captcha challenge" });
+    expect(JSON.parse((await run("queue", "get", String(haltedJob.id), "--json")).stdout).status).toBe("failed");
+    const waiting = JSON.parse((await run("queue", "enqueue", "snapshot", "--json")).stdout);
+    expect(JSON.parse((await run("queue", "get", String(waiting.id), "--json")).stdout).status).toBe("queued");
+    shouldHalt = false;
+    expect((await run("service", "resume", "--json")).exit).toBe(0);
+    let final: any;
+    for (let i = 0; i < 40; i++) { final = JSON.parse((await run("queue", "get", String(waiting.id), "--json")).stdout); if (final.status === "done") break; await Bun.sleep(20); }
+    expect(final).toMatchObject({ status: "done", result: expected });
+  } finally {
+    ws?.close();
+    if (pid) { try { process.kill(pid, "SIGTERM"); } catch {} for (let i = 0; i < 100; i++) { try { process.kill(pid, 0); } catch { break; } await Bun.sleep(20); } }
+    await rm(stateDir, { recursive: true, force: true });
+  }
+});
 
 test("port configuration honors env over saved setting and reports running endpoint", async () => {
   const stateDir = await mkdtemp(join(tmpdir(), "socmedia-port-config-"));
@@ -286,7 +719,7 @@ test("an interrupted readPage recovers on service restart and persists extension
       await authenticateMock(socket, pairing.token); return { socket, request };
     };
     let link = await connect(); ws = link.socket;
-    const inert = await run("queue", "enqueue", "getProfile", "--args", "{}", "--json");
+    const inert = await run("queue", "enqueue", "getPosts", "--args", "{}", "--json");
     const job = await run("queue", "enqueue", "readPage", "--json");
     await Promise.race([link.request, Bun.sleep(1500).then(() => { throw new Error("request timeout"); })]);
     expect((await run("queue", "get", String(inert.id), "--json")).status).toBe("queued");

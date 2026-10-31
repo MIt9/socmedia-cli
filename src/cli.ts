@@ -1,8 +1,8 @@
-import { closeSync, cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { closeSync, constants, cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { createConnection, createServer } from "node:net";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { dlopen, FFIType } from "bun:ffi";
@@ -74,6 +74,108 @@ const compatibleVersion = (version: string) => {
   return !!requested && !!current && requested[1] === current[1] && requested[2] === current[2];
 };
 const actions = new Set(["getProfile", "getPosts", "getPost", "getComments", "search", "screenshot", "readInbox", "readThread", "readPage", "snapshot", "scroll", "listTabs", "useTab", "ytStudioRead", "click", "downloadProfile"]);
+const contactStatuses = ["new", "messaged", "replied", "won", "rejected", "skip"];
+const contactColumns = ["id", "platform", "username", "name", "status", "followers", "following", "postsCount", "verified", "private", "isBusiness", "category", "website", "email", "phone", "bio", "url", "note", "firstSeen", "lastSeen", "updatedAt"];
+
+function csvCell(value: unknown) {
+  let text = value == null ? "" : String(value);
+  if (/^[=@\t\r]/.test(text) || (/^[+-]/.test(text) && !/^[+-]?[\d\s().-]+$/.test(text))) text = `'${text}`;
+  return /[",\r\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+}
+
+function exportContactFile(path: unknown, format: string, contacts: Record<string, unknown>[]) {
+  if (path !== undefined && (typeof path !== "string" || !path)) throw new Error("Export path must be a nonempty string");
+  const home = resolve(homedir());
+  const input = path === undefined ? join("socmedia-data", `contacts-${new Date().toISOString().slice(0, 10)}.${format}`) : (path as string).replace(/^~(?=\/|$)/, home);
+  const file = resolve(home, input);
+  const rel = relative(home, file);
+  if (!rel || rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) throw new Error("Export path must be inside home");
+  let current = home;
+  const parents = dirname(rel).split(sep).filter((part) => part && part !== ".");
+  for (const part of parents) {
+    current = join(current, part);
+    try {
+      const entry = lstatSync(current);
+      if (entry.isSymbolicLink() || !entry.isDirectory()) throw new Error("Export directories must not be symbolic links");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      mkdirSync(current, { mode: 0o700 });
+    }
+  }
+  try {
+    const entry = lstatSync(file);
+    if (entry.isSymbolicLink() || !entry.isFile()) throw new Error("Export destination must be a regular file, not a symbolic link");
+  } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+  const serviceFiles = ["state.sqlite", "state.sqlite-wal", "state.sqlite-shm", "extension-pairing.json", "config.json", "service.lock", "service.sock"];
+  if (serviceFiles.some((name) => file === resolve(stateDir, name))) throw new Error("Export destination conflicts with service state");
+  const output = format === "json" ? JSON.stringify(contacts, null, 2)
+    : format === "jsonl" ? contacts.map((contact) => JSON.stringify(contact) + "\n").join("")
+      : [contactColumns, ...contacts.map((contact) => contactColumns.map((column) => contact[column]))].map((row) => row.map(csvCell).join(",")).join("\n") + "\n";
+  const temporary = join(dirname(file), `.contacts-export-${randomBytes(12).toString("hex")}`);
+  let fd: number | undefined;
+  try {
+    fd = openSync(temporary, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+    writeFileSync(fd, output); closeSync(fd); fd = undefined;
+    renameSync(temporary, file);
+  } finally { if (fd !== undefined) closeSync(fd); rmSync(temporary, { force: true }); }
+  return { path: file, count: contacts.length };
+}
+
+function instagramProfileUrl(value: unknown): string {
+  if (typeof value !== "string") throw new Error("Instagram profile URL is required");
+  let url: URL;
+  try { url = new URL(value); } catch { throw new Error("Invalid Instagram profile URL"); }
+  const parts = url.pathname.split("/").filter(Boolean);
+  const reserved = new Set(["accounts", "challenge", "checkpoint", "direct", "explore", "p", "reel", "reels", "stories", "tv", "about", "developer", "legal"]);
+  if (url.protocol !== "https:" || !["instagram.com", "www.instagram.com"].includes(url.hostname.toLowerCase()) || url.username || url.password || url.port || parts.length !== 1 || !/^[a-zA-Z0-9._]{1,30}$/.test(parts[0]!) || reserved.has(parts[0]!.toLowerCase())) throw new Error("Provide an HTTPS Instagram profile URL, for example https://www.instagram.com/username/");
+  return `https://www.instagram.com/${parts[0]}/`;
+}
+
+function profileUrl(value: unknown): string {
+  if (typeof value !== "string") throw new Error("Instagram or Facebook profile URL is required");
+  let url: URL;
+  try { url = new URL(value); } catch { throw new Error("Invalid Instagram or Facebook profile URL"); }
+  const host = url.hostname.toLowerCase();
+  if (["instagram.com", "www.instagram.com"].includes(host)) return instagramProfileUrl(value);
+  const facebookHosts = ["facebook.com", "www.facebook.com", "m.facebook.com", "mbasic.facebook.com", "web.facebook.com", "fb.com", "www.fb.com"];
+  const parts = url.pathname.split("/").filter(Boolean);
+  const reserved = new Set(["login", "checkpoint", "challenge", "messages", "watch", "reel", "reels", "groups", "events", "marketplace", "share", "photo", "photos", "posts", "videos", "people", "pages", "settings", "help", "home.php", "login.php", "notifications", "friends", "search", "profile.php"]);
+  if (url.protocol !== "https:" || !facebookHosts.includes(host) || url.username || url.password || url.port) throw new Error("Provide an HTTPS Instagram or Facebook profile URL");
+  if (parts.length === 1 && parts[0]!.toLowerCase() === "profile.php") {
+    const ids = url.searchParams.getAll("id");
+    if (ids.length !== 1 || !/^\d+$/.test(ids[0]!)) throw new Error("Facebook profile.php URL requires one numeric id");
+    return `https://www.facebook.com/profile.php?id=${ids[0]}`;
+  }
+  const slug = parts.length === 1 && /^[a-zA-Z0-9._-]{1,100}$/.test(parts[0]!) && !reserved.has(parts[0]!.toLowerCase());
+  const named = parts.length === 3 && ["people", "pages"].includes(parts[0]!.toLowerCase()) && /^[a-zA-Z0-9._-]{1,100}$/.test(parts[1]!) && /^\d+$/.test(parts[2]!);
+  if (!slug && !named) throw new Error("Provide an HTTPS Instagram or Facebook profile URL");
+  return `https://www.facebook.com/${parts.join("/")}`;
+}
+
+function upsertProfileContact(db: Database, value: unknown, requestedUrl: string) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Invalid social profile result");
+  const profile = value as Record<string, any>;
+  const canonical = profileUrl(requestedUrl);
+  const parsed = new URL(canonical);
+  const platform = parsed.hostname === "www.instagram.com" ? "ig" : "fb";
+  if (profile.platform !== platform || typeof profile.url !== "string" || profileUrl(profile.url).toLowerCase() !== canonical.toLowerCase()) throw new Error("Social profile result does not match requested profile");
+  const path = parsed.pathname.replace(/^\/+|\/+$/g, "");
+  const rel = platform === "fb" && path.toLowerCase() === "profile.php" ? `${path}?id=${parsed.searchParams.get("id")}` : path;
+  const id = `${platform}:${rel.toLowerCase()}`;
+  const row = db.query("SELECT data FROM contacts WHERE id = ?").get(id) as { data: string } | null;
+  const existing = row ? JSON.parse(row.data) : null;
+  const fields = {
+    id, platform, url: `${parsed.origin}/${rel}`, username: profile.username,
+    name: profile.name, bio: profile.bio, website: profile.website, category: profile.category,
+    followers: profile.followers, following: profile.following, postsCount: profile.postsCount,
+    verified: profile.verified, private: profile.private, isBusiness: profile.isBusiness,
+    email: profile.contact?.email, phone: profile.contact?.phone,
+  };
+  const present = Object.fromEntries(Object.entries(fields).filter(([, value]) => value != null && value !== ""));
+  const now = new Date().toISOString();
+  const contact = existing ? { ...existing, ...present, id, firstSeen: existing.firstSeen, status: existing.status, lastSeen: now } : { status: "new", firstSeen: now, ...present, id, lastSeen: now };
+  db.query("INSERT INTO contacts (id, data) VALUES (?, ?) ON CONFLICT(id) DO UPDATE SET data=excluded.data").run(id, JSON.stringify(contact));
+}
 
 function validateJob(value: unknown) {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Job must be an object");
@@ -83,6 +185,12 @@ function validateJob(value: unknown) {
   if (job.action === "readPage") {
     const args = job.args as Record<string, unknown>;
     if (Object.keys(args).some((key) => key !== "maxLines") || (args.maxLines !== undefined && (!Number.isInteger(args.maxLines) || Number(args.maxLines) < 1 || Number(args.maxLines) > 1000))) throw new Error("readPage maxLines must be an integer from 1 to 1000");
+  }
+  if (job.action === "snapshot" && Object.keys(job.args as object).length) throw new Error("snapshot does not take arguments");
+  if (job.action === "getProfile") {
+    const args = job.args as Record<string, unknown>;
+    if (Object.keys(args).some((key) => key !== "url")) throw new Error("getProfile accepts only a profile URL");
+    args.url = profileUrl(args.url);
   }
   if (job.key !== undefined && (typeof job.key !== "string" || !job.key)) throw new Error("--key must be a nonempty string");
   if (job.notBefore !== undefined && (typeof job.notBefore !== "string" || !Number.isFinite(Date.parse(job.notBefore)))) throw new Error("--not-before must be a valid ISO date");
@@ -185,6 +293,40 @@ async function queueRequest(command: string): Promise<unknown> {
   });
 }
 
+async function runPageJob(action: "snapshot" | "readPage" | "getProfile", args: Record<string, unknown>): Promise<unknown> {
+  const current = await status();
+  if (!current.running) throw new Error("Service not running");
+  if (current.halted) {
+    const reason = (current.halted as { reason?: string }).reason || "security challenge";
+    throw new Error(`HALT: ${reason}; resolve it in Chrome and run service resume`);
+  }
+  const extension = current.extension as { connected?: boolean; compatible?: boolean } | undefined;
+  if (!extension?.connected) throw new Error("Extension not connected");
+  if (!extension.compatible) throw new Error("Extension version incompatible");
+  const created = await queueRequest(`queue enqueue ${JSON.stringify({ action, args })}`) as { id: number };
+  const deadline = Date.now() + (action === "getProfile" ? 60000 : 30000);
+  while (Date.now() < deadline) {
+    let job = await queueRequest(`queue get ${created.id}`) as { status: string; result?: unknown; error?: string | { code?: string; reason?: string } };
+    if (!["done", "failed", "cancelled"].includes(job.status)) {
+      const state = await status();
+      if (state.halted) {
+        // HALT and the job result are persisted together; status can observe them
+        // after the earlier job read, so read the job again before reporting it.
+        job = await queueRequest(`queue get ${created.id}`) as typeof job;
+        if (!["done", "failed", "cancelled"].includes(job.status)) throw new Error(`Job ${created.id} is ${job.status}; resolve the challenge and run service resume`);
+      }
+      if (!state.running) throw new Error(`Service stopped; inspect job ${created.id} after restarting`);
+    }
+    if (job.status === "done") return job.result;
+    if (job.status === "failed" || job.status === "cancelled") {
+      if (typeof job.error === "object" && job.error?.code === "HALT") throw new Error(`HALT: ${job.error.reason}; resolve it in Chrome and run service resume`);
+      throw new Error(`Job ${created.id}: ${typeof job.error === "object" ? job.error?.reason : job.error || job.status}`);
+    }
+    await Bun.sleep(50);
+  }
+  throw new Error(`Job ${created.id} still pending; inspect it with queue get`);
+}
+
 if (Bun.argv[2] === "--service-daemon") {
   const libc = dlopen(process.platform === "darwin" ? "/usr/lib/libSystem.B.dylib" : "libc.so.6", {
     flock: { args: [FFIType.i32, FFIType.i32], returns: FFIType.i32 },
@@ -208,10 +350,11 @@ if (Bun.argv[2] === "--service-daemon") {
   }
   const db = new Database(join(stateDir, "state.sqlite"));
   db.run("CREATE TABLE IF NOT EXISTS jobs (id INTEGER PRIMARY KEY, data TEXT NOT NULL)");
+  db.run("CREATE TABLE IF NOT EXISTS contacts (id TEXT PRIMARY KEY, data TEXT NOT NULL)");
   db.run("CREATE TABLE IF NOT EXISTS service_state (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
   const haltRow = db.query("SELECT value FROM service_state WHERE key = 'halted'").get() as { value: string } | null;
   let halted: { code: string; reason: string } | null = haltRow ? JSON.parse(haltRow.value) : null;
-  db.run("UPDATE jobs SET data = json_set(data, '$.status', 'queued') WHERE json_extract(data, '$.action') = 'readPage' AND json_extract(data, '$.status') = 'running'");
+  db.run("UPDATE jobs SET data = json_set(data, '$.status', 'queued') WHERE json_extract(data, '$.action') IN ('readPage','snapshot','getProfile') AND json_extract(data, '$.status') = 'running'");
   type ExtensionData = { token: string; challenge?: { clientNonce: string; serverNonce: string; version: string } };
   let extensionSocket: Bun.ServerWebSocket<ExtensionData> | null = null;
   let connectedVersion: string | null = null;
@@ -274,7 +417,7 @@ if (Bun.argv[2] === "--service-daemon") {
   function pump() {
     if (workerWake) { clearTimeout(workerWake); workerWake = undefined; }
     if (halted || browserBusy || !extensionSocket || !connectedVersion || !compatibleVersion(connectedVersion)) return;
-    const rows = db.query("SELECT id, data FROM jobs WHERE json_extract(data, '$.action') = 'readPage' AND json_extract(data, '$.status') = 'queued' ORDER BY id").all() as { id: number; data: string }[];
+    const rows = db.query("SELECT id, data FROM jobs WHERE json_extract(data, '$.action') IN ('readPage','snapshot','getProfile') AND json_extract(data, '$.status') = 'queued' ORDER BY id").all() as { id: number; data: string }[];
     const now = Date.now();
     let wakeAt = Infinity;
     const row = rows.find((candidate) => {
@@ -300,16 +443,22 @@ if (Bun.argv[2] === "--service-daemon") {
       else if (error === "Extension disconnected") { job.status = "queued"; }
       else if (error) { job.status = "failed"; job.error = error; }
       else { job.status = "done"; job.result = reply; }
-      db.transaction(() => {
-        if (halt) db.query("INSERT INTO service_state (key, value) VALUES ('halted', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").run(JSON.stringify(halt));
+      try {
+        db.transaction(() => {
+          if (halt) db.query("INSERT INTO service_state (key, value) VALUES ('halted', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").run(JSON.stringify(halt));
+          if (job.status === "done" && job.action === "getProfile") upsertProfileContact(db, reply, job.args.url);
+          db.query("UPDATE jobs SET data = ? WHERE id = ?").run(JSON.stringify(job), row.id);
+        })();
+      } catch (error) {
+        job.status = "failed"; job.error = `Contact upsert failed: ${error instanceof Error ? error.message : String(error)}`; delete job.result;
         db.query("UPDATE jobs SET data = ? WHERE id = ?").run(JSON.stringify(job), row.id);
-      })();
+      }
       browserBusy = false;
       queueMicrotask(pump);
     };
-    const timer = setTimeout(() => { pending.delete(id); finish({ error: "Extension request timed out" }); }, extensionTimeout);
+    const timer = setTimeout(() => { pending.delete(id); finish({ error: "Extension request timed out" }); }, job.action === "getProfile" ? Math.max(extensionTimeout, 45000) : extensionTimeout);
     pending.set(id, { ws, finish, timer });
-    ws.send(JSON.stringify({ type: "request", id, action: "readPage", args: job.args }));
+    ws.send(JSON.stringify({ type: "request", id, action: job.action, args: job.args }));
   }
   const extensionStatus = () => ({ connected: extensionSocket !== null, version: connectedVersion, compatible: connectedVersion === null ? null : compatibleVersion(connectedVersion), port: extensionServer.port });
   const server = createServer((socket) => {
@@ -347,6 +496,42 @@ if (Bun.argv[2] === "--service-daemon") {
       else if (command === "queue list") {
         const rows = db.query("SELECT id, data FROM jobs ORDER BY id DESC").all() as { id: number; data: string }[];
         socket.end(JSON.stringify({ jobs: rows.map((row) => ({ id: row.id, ...JSON.parse(row.data) })) }) + "\n");
+      } else if (command?.startsWith("contacts list ")) {
+        try {
+          const filters = JSON.parse(command.slice("contacts list ".length));
+          if (filters.status !== undefined && !contactStatuses.includes(filters.status)) throw new Error("Invalid contact status");
+          if (filters.platform !== undefined && !["ig", "fb"].includes(filters.platform)) throw new Error("Invalid contact platform");
+          const rows = db.query("SELECT data FROM contacts ORDER BY rowid").all() as { data: string }[];
+          const contacts = rows.map((row) => JSON.parse(row.data)).filter((contact) => (!filters.status || contact.status === filters.status) && (!filters.platform || contact.platform === filters.platform));
+          socket.end(JSON.stringify({ count: contacts.length, file: join(stateDir, "state.sqlite"), contacts }) + "\n");
+        } catch (error) { socket.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }) + "\n"); }
+      } else if (command?.startsWith("contacts export ")) {
+        try {
+          const args = JSON.parse(command.slice("contacts export ".length));
+          if (args.status !== undefined && !contactStatuses.includes(args.status)) throw new Error("Invalid contact status");
+          if (args.platform !== undefined && !["ig", "fb"].includes(args.platform)) throw new Error("Invalid contact platform");
+          const format = args.format ?? "csv";
+          if (!["csv", "json", "jsonl"].includes(format)) throw new Error("Format must be csv, json or jsonl");
+          const rows = db.query("SELECT data FROM contacts ORDER BY rowid").all() as { data: string }[];
+          const contacts = rows.map((row) => JSON.parse(row.data)).filter((contact) => (!args.status || contact.status === args.status) && (!args.platform || contact.platform === args.platform));
+          socket.end(JSON.stringify(exportContactFile(args.path, format, contacts)) + "\n");
+        } catch (error) { socket.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }) + "\n"); }
+      } else if (command?.startsWith("contacts update ")) {
+        try {
+          const update = JSON.parse(command.slice("contacts update ".length));
+          if (typeof update.id !== "string" || !update.id.trim()) throw new Error("Contact ID is required");
+          if (update.status === undefined && update.note === undefined) throw new Error("Provide --status or --note");
+          if (update.status !== undefined && !contactStatuses.includes(update.status)) throw new Error("Invalid contact status");
+          if (update.note !== undefined && (typeof update.note !== "string" || update.note.length > 2000)) throw new Error("Contact note must be at most 2000 characters");
+          const result = db.transaction(() => {
+            const row = db.query("SELECT data FROM contacts WHERE id = ?").get(update.id) as { data: string } | null;
+            if (!row) throw new Error(`No contact ${update.id}`);
+            const contact = { ...JSON.parse(row.data), ...(update.status !== undefined && { status: update.status }), ...(update.note !== undefined && { note: update.note }), updatedAt: new Date().toISOString() };
+            db.query("UPDATE contacts SET data = ? WHERE id = ?").run(JSON.stringify(contact), update.id);
+            return contact;
+          })();
+          socket.end(JSON.stringify(result) + "\n");
+        } catch (error) { socket.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }) + "\n"); }
       } else if (command?.startsWith("queue get ")) {
         const id = Number(command.slice("queue get ".length));
         if (!Number.isSafeInteger(id) || id < 1) {
@@ -411,18 +596,100 @@ if (Bun.argv[2] === "--service-daemon") {
   console.log(extensionVersion);
 } else if (Bun.argv.includes("--help")) {
   if (Bun.argv[2] === "service") {
-    console.log("Usage: socmedia service <start|status|stop|resume> [--json]\n\nCommands:\n  start   Start the local service or return the running service\n  status  Show service, halted state and extension connection status\n  stop    Stop the local service; succeed if already stopped\n  resume  Resume the queue after manually resolving a login or security challenge\n\nOptions:\n  --json  Print the result as JSON\n  --help  Show this help message\n\nEnvironment:\n  SOCMEDIA_STATE_DIR             Service data directory\n  SOCMEDIA_EXTENSION_PORT        Overrides saved config port (default: 47842; 0 selects an available port)\n  SOCMEDIA_EXTENSION_TIMEOUT_MS  Extension request timeout in milliseconds (default: 10000, range: 1-12000)\n\nPort changes apply after the service restarts.");
+    console.log("Usage: socmedia service <start|status|stop|resume> [--json]\n\nCommands:\n  start   Start the local service or return the running service\n  status  Show service, halted state and extension connection status\n  stop    Stop the local service; succeed if already stopped\n  resume  Resume the queue after manually resolving a login or security challenge\n\nOptions:\n  --json  Print the result as JSON\n  --help  Show this help message\n\nEnvironment:\n  SOCMEDIA_STATE_DIR             Service data directory\n  SOCMEDIA_EXTENSION_PORT        Overrides saved config port (default: 47842; 0 selects an available port)\n  SOCMEDIA_EXTENSION_TIMEOUT_MS  Extension request timeout in milliseconds (default: 10000, range: 1-12000; profile requests use at least 45000)\n\nPort changes apply after the service restarts.");
   } else if (Bun.argv[2] === "queue") {
-    console.log("Usage: socmedia queue <list|get|cancel|enqueue> [options]\n\nCommands:\n  list              List saved queue jobs\n  get <id>          Show a job by its positive numeric ID\n  cancel <id>       Cancel a queued job by ID; cancelling twice returns the same job\n  enqueue <action>  Queue an action; only readPage currently executes (args: maxLines 1-1000, default 200)\n\nOptions:\n  --args JSON       Action arguments as a JSON object (default: {})\n  --not-before TIME Earliest run time as an ISO date\n  --key KEY         Reuse the same job; changed action, args or time causes a key conflict\n  --json            Print the result as JSON\n  --help            Show this help message");
+    console.log("Usage: socmedia queue <list|get|cancel|enqueue> [options]\n\nCommands:\n  list              List saved queue jobs\n  get <id>          Show a job by its positive numeric ID\n  cancel <id>       Cancel a queued job by ID; cancelling twice returns the same job\n  enqueue <action>  Queue an action; readPage, snapshot and Instagram/Facebook getProfile execute\n\nOptions:\n  --args JSON       Action arguments as a JSON object (default: {})\n  --not-before TIME Earliest run time as an ISO date\n  --key KEY         Reuse the same job; changed action, args or time causes a key conflict\n  --json            Print the result as JSON\n  --help            Show this help message");
   } else if (Bun.argv[2] === "tabs") {
     console.log("Usage: socmedia tabs <list|use|clear> [options]\n\nCommands:\n  list         List Socmedia CLI group tabs and the selected tab\n  use <tabId>  Select an open Instagram, Facebook or YouTube tab by its numeric ID\n  clear        Clear the selected tab and return to the Socmedia CLI group\n\nOptions:\n  --json       Print the result as JSON\n  --help       Show this help message");
+  } else if (Bun.argv[2] === "profile") {
+    console.log("Usage: socmedia profile get <url> [--json]\n\nCommands:\n  get <url>  Read an Instagram or Facebook profile/page via its HTTPS URL\n\nOptions:\n  --json     Print the result as JSON\n  --help     Show this help message\n\nSuccessful reads update local contacts. Fields may be null or incomplete.");
+  } else if (Bun.argv[2] === "contacts") {
+    console.log("Usage: socmedia contacts <list|update|export> [options]\n\nCommands:\n  list              List locally stored contacts\n  update <id>       Update a contact by its ID; provide --status and/or --note\n  export            Export filtered contacts to a file inside home\n\nOptions:\n  --status STATUS   Filter list/export or set status: new, messaged, replied, won, rejected, skip\n  --platform NAME   Filter list/export by ig or fb\n  --note TEXT       Set note on update (maximum 2000 characters; empty clears it)\n  --format FORMAT   Export as csv, json or jsonl (default: csv)\n  --path PATH       Export destination inside home (default: ~/socmedia-data/contacts-<date>.<format>)\n  --json            Print the command result as JSON\n  --help            Show this help message\n\nInstagram and Facebook profile reads populate contacts; import is not implemented yet.");
+  } else if (Bun.argv[2] === "page") {
+    console.log("Usage: socmedia page <read|snapshot> [options]\n\nCommands:\n  read            Queue and return visible page text and URL\n  snapshot        Queue and return visible interactive elements\n\nOptions:\n  --max-lines N   With read, limit output to 1-1000 lines (default: 200)\n  --json          Print the result as JSON\n  --help          Show this help message");
   } else if (Bun.argv[2] === "config") {
     console.log("Usage: socmedia config <get|set|unset> port [value] [--json]\n\nCommands:\n  get port          Show the effective port and configuration source\n  set port <value>  Save a port from 1 to 65535\n  unset port        Remove the saved port\n\nOptions:\n  --json            Print the result as JSON\n  --help            Show this help message\n\nSOCMEDIA_EXTENSION_PORT overrides the saved port; changes apply when the service restarts.");
   } else if (Bun.argv[2] === "extension") {
     console.log("Usage: socmedia extension <install|path|pair> [options]\n\nCommands:\n  install    Copy the extension to its stable state directory and show Chrome setup steps\n  path       Show the stable extension directory\n  pair       Generate a pairing secret for the Chrome extension\n\nOptions:\n  --open     With install, open chrome://extensions in Google Chrome\n  --id ID    With pair, set the Chrome extension ID\n  --json     Print the result as JSON; pairing output contains a sensitive secret\n  --help     Show this help message\n\nPairing replaces any previous pairing; restart the service to disconnect existing clients.");
   } else {
-    console.log("Usage: socmedia [options]\n\nCommands:\n  service    Start or inspect the local service\n  queue      Inspect the service queue\n  extension  Pair the Chrome extension\n  tabs       Inspect extension work tabs\n  config     Configure the service\n\nOptions:\n  --version  Show the CLI version\n  --help     Show this help message");
+    console.log("Usage: socmedia [options]\n\nCommands:\n  service    Start or inspect the local service\n  queue      Inspect the service queue\n  extension  Pair the Chrome extension\n  tabs       Inspect extension work tabs\n  page       Inspect the work page\n  profile    Read a social profile\n  contacts   List local contacts\n  config     Configure the service\n\nOptions:\n  --version  Show the CLI version\n  --help     Show this help message");
   }
+} else if (Bun.argv[2] === "contacts" && Bun.argv[3] === "export") {
+  try {
+    const args: { status?: string; platform?: string; format?: string; path?: string } = {};
+    for (let i = 4; i < Bun.argv.length; i++) {
+      const option = Bun.argv[i];
+      if (option === "--json") continue;
+      if (!["--status", "--platform", "--format", "--path"].includes(option ?? "")) throw new Error(`Unknown contacts option: ${option}`);
+      const value = Bun.argv[++i];
+      if (value === undefined || value === "" || value.startsWith("--")) throw new Error(`${option} requires a value`);
+      if (option === "--status") { if (!contactStatuses.includes(value)) throw new Error("Invalid contact status"); args.status = value; }
+      else if (option === "--platform") { if (!["ig", "fb"].includes(value)) throw new Error("--platform must be ig or fb"); args.platform = value; }
+      else if (option === "--format") { if (!["csv", "json", "jsonl"].includes(value)) throw new Error("--format must be csv, json or jsonl"); args.format = value; }
+      else args.path = value;
+    }
+    console.log(JSON.stringify(await queueRequest(`contacts export ${JSON.stringify(args)}`)));
+  } catch (error) { console.error(error instanceof Error ? error.message : String(error)); process.exitCode = 1; }
+} else if (Bun.argv[2] === "contacts" && Bun.argv[3] === "update") {
+  try {
+    const id = Bun.argv[4];
+    if (!id || id.startsWith("--") || !id.trim()) throw new Error("Contact ID is required");
+    const update: { id: string; status?: string; note?: string } = { id };
+    for (let i = 5; i < Bun.argv.length; i++) {
+      const option = Bun.argv[i];
+      if (option === "--json") continue;
+      if (option !== "--status" && option !== "--note") throw new Error(`Unknown contacts option: ${option}`);
+      const value = Bun.argv[++i];
+      if (value === undefined || ["--json", "--status", "--note"].includes(value)) throw new Error(`${option} requires a value`);
+      if (option === "--status") {
+        if (!contactStatuses.includes(value)) throw new Error("--status must be new, messaged, replied, won, rejected or skip");
+        update.status = value;
+      } else {
+        if (value.length > 2000) throw new Error("--note must be at most 2000 characters");
+        update.note = value;
+      }
+    }
+    if (update.status === undefined && update.note === undefined) throw new Error("Provide --status or --note");
+    console.log(JSON.stringify(await queueRequest(`contacts update ${JSON.stringify(update)}`)));
+  } catch (error) { console.error(error instanceof Error ? error.message : String(error)); process.exitCode = 1; }
+} else if (Bun.argv[2] === "contacts" && Bun.argv[3] === "list") {
+  try {
+    const filters: { status?: string; platform?: string } = {};
+    for (let i = 4; i < Bun.argv.length; i++) {
+      const option = Bun.argv[i];
+      if (option === "--json") continue;
+      if (option !== "--status" && option !== "--platform") throw new Error(`Unknown contacts option: ${option}`);
+      const value = Bun.argv[++i];
+      if (option === "--status") {
+        if (!value || !contactStatuses.includes(value)) throw new Error("--status must be new, messaged, replied, won, rejected or skip");
+        filters.status = value;
+      } else {
+        if (!value || !["ig", "fb"].includes(value)) throw new Error("--platform must be ig or fb");
+        filters.platform = value;
+      }
+    }
+    console.log(JSON.stringify(await queueRequest(`contacts list ${JSON.stringify(filters)}`)));
+  } catch (error) { console.error(error instanceof Error ? error.message : String(error)); process.exitCode = 1; }
+} else if (Bun.argv[2] === "profile" && Bun.argv[3] === "get") {
+  try {
+    if (Bun.argv.slice(5).some((option) => option !== "--json")) throw new Error("Unknown profile option");
+    const url = profileUrl(Bun.argv[4]);
+    console.log(JSON.stringify(await runPageJob("getProfile", { url })));
+  } catch (error) { console.error(error instanceof Error ? error.message : String(error)); process.exitCode = 1; }
+} else if (Bun.argv[2] === "page" && (Bun.argv[3] === "snapshot" || Bun.argv[3] === "read")) {
+  try {
+    const args: Record<string, number> = {};
+    for (let i = 4; i < Bun.argv.length; i++) {
+      const option = Bun.argv[i];
+      if (option === "--json") continue;
+      if (option === "--max-lines" && Bun.argv[3] === "read") {
+        const value = Bun.argv[++i];
+        if (!value || !/^[1-9]\d*$/.test(value) || Number(value) > 1000) throw new Error("--max-lines must be an integer from 1 to 1000");
+        args.maxLines = Number(value);
+      } else throw new Error(`Unknown page option: ${option}`);
+    }
+    console.log(JSON.stringify(await runPageJob(Bun.argv[3] === "read" ? "readPage" : "snapshot", args)));
+  } catch (error) { console.error(error instanceof Error ? error.message : String(error)); process.exitCode = 1; }
 } else if (Bun.argv[2] === "config") {
   try {
     const action = Bun.argv[3];

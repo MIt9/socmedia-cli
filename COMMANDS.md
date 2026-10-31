@@ -1,13 +1,13 @@
 # Відповідність операцій CLI
 
-Це **запланований контракт**, а не перелік уже реалізованих команд. Джерела: `soc-media-ex/mcp-server/index.js` (32 реєстрації), `README.md` і `SPEC.md`. Форматування параметрів і результатів можна уточнити під час реалізації; `--json` передбачає структурований результат. Для запису `--confirm` означає явне підтвердження; без нього повертається preview.
+Це таблиця цільової відповідності, а не перелік уже реалізованих команд. `page read`, `page snapshot` і `profile get` для Instagram та Facebook реалізовані й перевірені автоматично з імітованим розширенням; їх ще не перевірено наживо в Chrome. Джерела: `soc-media-ex/mcp-server/index.js` (32 реєстрації), `README.md` і `SPEC.md`. Форматування параметрів і результатів можна уточнити під час реалізації; `--json` передбачає структурований результат. Для запису `--confirm` означає явне підтвердження; без нього повертається preview.
 
 ## Instagram, Facebook, браузер і черга
 
 | Поточна операція | Запланована команда | Основні параметри | Результат / поведінка |
 |---|---|---|---|
 | `social_status` | `socmedia status` | `--json` | Стан сервісу та розширення, версії, HALT, ліміти повідомлень, статистика сховища. |
-| `social_get_profile` | `socmedia profile get URL` | `--json` | Профіль, контактні дані, кількісні показники; додавання або оновлення контакту без зміни статусу. |
+| `social_get_profile` | `socmedia profile get URL` | `--json` | Instagram і Facebook: дані профілю й доступні показники, поля можуть бути `null`; успішне читання додає або оновлює контакт. Facebook URL: slug, `profile.php?id=<число>`, або `/people/<slug>/<id>` / `/pages/<slug>/<id>`. Redirect на інший профіль відхиляється. Наживо в Chrome не перевірено. |
 | `social_get_posts` | `socmedia profile posts URL` | `--limit` | Список постів із посиланнями, типами, зображеннями та доступними метриками. |
 | `social_get_post` | `socmedia post get URL` | `--download` (`--slides` як сумісний alias) | Пост, автор, медіа, хештеги, згадки; при завантаженні — шляхи або помилки окремих файлів. |
 | `social_get_comments` | `socmedia post comments URL` | `--limit` | Коментарі, автори, текст, дати та вподобання. |
@@ -17,10 +17,10 @@
 | `social_inbox` | `socmedia inbox list PLATFORM` | `--limit` | Розмови, фрагмент повідомлення, час і стан непрочитаного. |
 | `social_read_thread` | `socmedia inbox read` | `--url URL` або `--to PROFILE`, `--limit` | Повідомлення розмови у хронологічному порядку, тип і доступні медіа. |
 | `social_send_message` | `socmedia message send` | `--to URL`, `--text TEXT`, `--confirm` | Preview або результат/ID відкладеного завдання; зберігаються ліміти, журнал і `unverified`. |
-| `social_contacts` | `socmedia contacts list` / `socmedia contacts update ID` | `--status`, `--platform`; для update `--new-status`, `--note` | Список/фільтр контактів або оновлений контакт. |
-| `social_export` | `socmedia contacts export` | `--status`, `--platform`, `--format csv\|json\|jsonl`, `--path` | Шлях і кількість експортованих контактів. |
-| `social_snapshot` | `socmedia browser snapshot` | — | Інтерактивні елементи вкладки з індексами. |
-| `social_read_page` | `socmedia browser read` | `--max-lines` | URL і видимий текст сторінки. |
+| `social_contacts` | `socmedia contacts list` / `socmedia contacts update ID` | `--status`, `--platform`; для update `--status`, `--note` | Список, фільтри й зміна статусу та нотаток реалізовані; імпорт старих контактів ще не реалізований. |
+| `social_export` | `socmedia contacts export` | `--status`, `--platform`, `--format csv\|json\|jsonl`, `--path`, `--json` | Реалізовано: шлях і кількість експортованих контактів; файл лише всередині home, символічні посилання на шляху відхиляються. |
+| `social_snapshot` | `socmedia page snapshot` | `--json` | Інтерактивні елементи вкладки з індексами; реалізовано, живий Chrome не перевірено. |
+| `social_read_page` | `socmedia page read` | `--max-lines` (1–1000, типово 200), `--json` | URL і видимий текст сторінки; реалізовано, живий Chrome не перевірено. |
 | `social_click` | `socmedia browser click` | один із `--index`, `--selector`, `--text` | Результат кліку; повторення при невизначеному результаті заборонено. |
 | `social_scroll` | `socmedia browser scroll` | `--selector`, `--times` | Результат прокрутки. |
 | `social_tabs` | `socmedia tabs list` | — | Вкладки робочої групи, поточна та вибрана вкладка. |
