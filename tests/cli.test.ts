@@ -2654,3 +2654,35 @@ test("simultaneous starts recover a service killed without cleanup", async () =>
     await rm(stateDir, { recursive: true, force: true });
   }
 });
+
+test("service 'extension reload' command sends {type:'reload'} to the connected extension and errors when none is connected; background.js handles it", async () => {
+  const { createConnection } = await import("node:net");
+  const stateDir = await mkdtemp(join(tmpdir(), "socmedia-reload-"));
+  const run = async (...args: string[]) => {
+    const cli = Bun.spawn(["bun", "run", "src/cli.ts", ...args], { cwd: import.meta.dir + "/..", env: { ...process.env, SOCMEDIA_STATE_DIR: stateDir, SOCMEDIA_EXTENSION_PORT: "0" }, stdout: "pipe", stderr: "pipe" });
+    const out = await new Response(cli.stdout).text(); await cli.exited; return JSON.parse(out);
+  };
+  const ask = (command: string) => new Promise<any>((resolve, reject) => {
+    const s = createConnection(join(stateDir, "service.sock")); let buf = "", greeted = false;
+    s.on("error", reject);
+    s.on("data", (c) => { buf += c.toString(); while (buf.includes("\n")) { const i = buf.indexOf("\n"); const line = buf.slice(0, i); buf = buf.slice(i + 1); if (!greeted) { greeted = true; s.write(command + "\n"); } else { s.destroy(); resolve(JSON.parse(line)); } } });
+  });
+  let pid: number | undefined; let ws: WebSocket | undefined;
+  try {
+    const id = "h".repeat(32);
+    const pairing = await run("extension", "pair", "--id", id, "--json");
+    const started = await run("service", "start", "--json"); pid = started.pid;
+    expect(await ask("extension reload")).toEqual({ error: "Extension not connected" });
+    ws = new WebSocket(`ws://127.0.0.1:${started.extension.port}/extension`, { headers: { Origin: `chrome-extension://${id}` } } as unknown as string[]);
+    await authenticateMock(ws, pairing.token);
+    const got = new Promise<any>((resolve) => { ws!.onmessage = (e) => resolve(JSON.parse(String(e.data))); });
+    expect(await ask("extension reload")).toEqual({ sent: true });
+    expect(await got).toEqual({ type: "reload" });
+  } finally {
+    ws?.close(); if (pid) { try { process.kill(pid, "SIGTERM"); } catch {} for (let i = 0; i < 100; i++) { try { process.kill(pid, 0); } catch { break; } await Bun.sleep(20); } }
+    await rm(stateDir, { recursive: true, force: true });
+  }
+  // extension side (static check; real Chrome not exercised): handler exists, requires the verified server, calls chrome.runtime.reload
+  const bg = await readFile(join(import.meta.dir, "../extension/background.js"), "utf8");
+  expect(bg).toMatch(/verified && message\.type === "reload"[^}]*chrome\.runtime\.reload\(\)/s);
+});

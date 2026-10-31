@@ -27,4 +27,9 @@ test("only socmedia-cli-usage skill exists and covers all commands and safety ru
   expect(content).toContain("SOCMEDIA_CLI_FORMAT");
   expect(content).toContain("PORT_IN_USE");
   expect(content).toContain("unverified");
+
+  // No example command line carries --confirm: examples show the preview form only.
+  const exampleLines = content.split("\n").filter((l) => /^\s+socmedia\s/.test(l));
+  expect(exampleLines.length).toBeGreaterThan(0);
+  expect(exampleLines.filter((l) => l.includes("--confirm"))).toEqual([]);
 });

@@ -8,12 +8,12 @@ socmedia (CLI)  --UNIX/HTTP+токен-->  локальний сервіс (Bun)
 
 Сервіс — єдиний власник SQLite-черги (`~/.socmedia-cli/state.sqlite`), стану зупинки (`HALT`), відновлення завдань та сполучення з розширенням.
 
-> **Статус реалізації (v0.16.0):**
+> **Статус реалізації (v0.16.1):**
 > - **Повний цикл реалізовано:** життєвий цикл сервісу, SQLite-черга з ідемпотентним відновленням незавершених завдань, HMAC-SHA256 сполучення розширення з закріпленим ID (`ingpbbhdgldgomideaihffffiinjgifj`), керування вкладками (`tabs list|use|clear`), читання сторінки й snapshot (`page read|snapshot`), скриншоти (`screenshot`), пошук на Instagram і Facebook (`search`), читання профілів (`profile get`), списку постів (`profile posts`), повне завантаження профілю з медіа (`profile download`), деталі постів (`post get`), коментарі (`post comments`), інбокс та треди (`inbox list|read`), прямі повідомлення з preview gate та лімітами (`message send`), YouTube Studio allowlist та завантаження (`youtube`), контакти (`contacts list|update|export|import`), кліки й скрол (`browser click|scroll`), самодіагностика (`doctor`), безпечне оновлення (`update`), та налаштування конфігурації порту (`config`).
 > - **Модульна архітектура:** кодова база декомпонована на ізольовані модулі: `src/output.ts` (форматування виводу, єдиний COMMAND_REGISTRY, TTY/JSON детекція), `src/media.ts` (захищене завантаження медіа без SSRF, magic-bytes, збереження профілів), `src/doctor.ts` (перевірка стану, прав, SQLite, порту з виявленням `PORT_IN_USE`), `src/update.ts` (безпечне оновлення з перевіркою черги, sha256 та відкатом через `.old`).
-> - **Безпека оновлень (Update Safety):** `socmedia update` автоматично перевіряє стан черги й відмовляється оновлюватись за наявності активних завдань; звіряє sha256 хеш бінарника з `latest.json`; виконує атомарну заміну з резервною копією `.old` та автоматичним відкатом у разі збою.
-> - **Автоматизація релізів:** Git pre-push хук (`.githooks/pre-push`) гарантує проходження тестів, чистоту робочого дерева, валідацію sha256 сум бінарників та публікацію через `gh release create`.
-> - **Перевірено наживо в Chrome:** успішно підтверджено роботу розширення в Chrome з реальними сторінками Instagram (авторизоване вилучення профілів, постів, збереження контактів, скрол, DOM snapshots).
+> - **Безпека оновлень (Update Safety):** `socmedia update` читає `latest.json` (база: GitHub Releases, перевизначення `SOCMEDIA_CLI_UPDATE_URL`), відмовляється працювати за наявності завдання `running`, спершу завантажує й звіряє sha256 бінарника та розширення (за розбіжності нічого не змінюється), потім атомарно підміняє бінарник (попередній лишається як `<binary>.old`), оновлює `~/.socmedia-cli/extension` (попередня папка — `extension.bak`) і лише після успіху перезапускає сервіс та просить розширення перезавантажитись (`{type:"reload"}`; старі розширення це ігнорують). `--check` лише порівнює версії.
+> - **Автоматизація релізів:** `.githooks/pre-push` на пуш тегу `v*` перевіряє версії та чисте дерево, запускає тести й typecheck, будує (`bun scripts/build.ts`), звіряє sha256 з `dist/latest.json`, відмовляє, якщо реліз уже існує або `gh` відсутній, і публікує `gh release create <tag> --target <sha>` лише з файлами з `latest.json` (+ `latest.json`, `install.sh`). Див. розділ «Випуск релізу».
+> - **Перевірка наживо:** у цьому зрізі (0.16.1) автоматичні тести не торкаються справжнього Chrome. Чого не перевірено — див. розділ «Що не перевірено наживо».
 > - **Безпека та права Chrome MV3:** розширення використовує `host_permissions` для `instagram.com`, `facebook.com`, `fb.com`, `youtube.com` та дозвіл `debugger` (виключно для надійного розгортання вкладених коментарів без блокувань сайтом).
 
 ## Швидкий старт
@@ -49,6 +49,12 @@ sh scripts/install.sh
    socmedia service status
    ```
 
+## Статус, порт і коди виходу
+
+- `socmedia service status` завжди показує `extensionUrl` (готова адреса для поля порту в popup розширення), `extensionId` (ID з ключа маніфесту), `extensionPinned` (чи збігається він із закріпленим `ingpbbhdgldgomideaihffffiinjgifj`) і `pinnedId`.
+- Порт зайнятий чужим процесом: `PORT_IN_USE`, код виходу **8** (усі інші помилки — 1), у JSON-помилці `port`, `ownerPid` (best-effort через `lsof`) і `hint`; `service status` показує `portInUse`, `ownerPid`, `hint`. Змінити порт: `socmedia config set port <PORT>` і ввести той самий у popup.
+- Сервіс старої версії без поля `identity` у привітанні вважається своїм, якщо процес — демон socmedia (`legacy: true` у `status`); `service stop` зупиняє його сигналом SIGTERM.
+
 ## Формати виводу для користувачів та агентів
 
 - **Автовизначення TTY**: при запуску в інтерактивному терміналі виводиться зручний для читання текст. У пайпах, скриптах або викликах від AI-агентів (де немає TTY) вивід автоматично форматується у `JSON`.
@@ -65,12 +71,39 @@ sh scripts/install.sh
   socmedia service resume
   ```
 
+## Випуск релізу (два пуші)
+
+Одноразово в клоні: `sh scripts/install-hooks.sh` (`git config core.hooksPath .githooks`). Піднімайте версію разом у `package.json` і `extension/manifest.json`.
+
+1. `git push origin main` — коміт має бути на віддаленому репозиторії (`gh` створює реліз і тег на GitHub з цього коміту).
+2. `git tag vX.Y.Z` (легкий тег, HEAD = позначений коміт) і `git push origin vX.Y.Z`. Хук збирає артефакти й створює реліз.
+
+Після цього git може вивести `reference already exists` для тегу: **це очікувано**, тег уже створено релізом на GitHub, реліз не зламано.
+
+Змінні: `SKIP_RELEASE=1` пропускає хук; `RELEASE_DRY_RUN=1` робить усе, крім публікації, і друкує команду `gh`; `RELEASE_TARGETS=host|all` (типово `host` — лише архітектура цієї машини, `all` додає x64 і потребує мережі); хук повідомляє, які архітектури зібрано. Без `gh` хук падає (не пропускає мовчки). Існуючий реліз ніколи не перезаписується. Перевірка хука: `tests/release.test.ts` (копія репозиторію, заглушка `gh`).
+
+## Skill для Claude Code
+
+`skills/socmedia-cli-usage/SKILL.md` — інструкція для агента (правила `--confirm`, HALT, формати). Встановлення копією:
+
+```sh
+mkdir -p ~/.claude/skills/socmedia-cli-usage && cp skills/socmedia-cli-usage/SKILL.md ~/.claude/skills/socmedia-cli-usage/
+```
+
+## Що не перевірено наживо
+
+- Справжній Chrome із розширенням 0.16.1, у тому числі обробник `{type:"reload"}` у `extension/background.js` (покрито лише тестом коду та мок-сокетом).
+- Instagram, Facebook і YouTube Studio на живих сторінках у цьому зрізі.
+- Справжні `socmedia update` з GitHub і `gh release create` (усе перевірено на локальному http-сервері та заглушці `gh`).
+- Збірка x64 (`RELEASE_TARGETS=all`) та запуск бінарників на інших машинах.
+- Ліцензію не обрано; підпис і нотаризація відсутні (лише ad-hoc `codesign`).
+
 ## Основні команди
 
 Докладний опис усіх прапорців і форматів дивіться через `socmedia <command> --help` (або `socmedia --help --json`):
 
 - `socmedia doctor` — повна діагностика середовища (Chrome, Bun, права каталогу 0700, SQLite integrity, порт, сервіс, розширення) з підказками `fix`.
-- `socmedia update [--check]` — перевірка та встановлення оновлень бінарника з GitHub Releases.
+- `socmedia update [--check]` — перевірка та встановлення оновлень (бінарник + розширення) з GitHub Releases або з `SOCMEDIA_CLI_UPDATE_URL`.
 - `socmedia service <start|stop|status|resume>` — керування фоновим сервісом та зняттям режиму HALT.
 - `socmedia config <get|set|unset> port [value]` — налаштування порту сервісу.
 - `socmedia queue <list|get|cancel|enqueue>` — інспекція та керування чергою завдань.

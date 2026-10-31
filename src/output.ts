@@ -1,3 +1,5 @@
+export const EXIT_PORT_IN_USE = 8; // documented exit code for PORT_IN_USE (all other errors exit 1)
+
 export function getOutputFormat(): "json" | "text" {
   if (Bun.argv.includes("--json")) return "json";
   if (Bun.argv.includes("--text")) return "text";
@@ -51,9 +53,10 @@ export function printError(error: unknown, defaultCode?: string) {
     hint = "Limit resets daily; adjust SOCMEDIA_MAX_MESSAGES_PER_DAY if higher volume is needed";
   }
 
-  process.exitCode = 1;
+  const extra = (error as { extra?: Record<string, unknown> } | null)?.extra;
+  process.exitCode = code === "PORT_IN_USE" ? EXIT_PORT_IN_USE : 1;
   if (fmt === "json") {
-    console.error(JSON.stringify({ error: message, hint, ...(code ? { code } : {}) }));
+    console.error(JSON.stringify({ error: message, hint, ...(code ? { code } : {}), ...extra }));
   } else {
     console.error(`Error: ${message}`);
     if (hint) console.error(`Hint: ${hint}`);

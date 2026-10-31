@@ -33,7 +33,8 @@
 | Поточна операція | Запланована команда | Основні параметри | Результат / поведінка |
 |---|---|---|---|
 | — | `socmedia doctor` | `--json`, `--text` | Діагностика Chrome, Bun, прав каталогу 0700, цілісності SQLite, доступності порту (повертає код `PORT_IN_USE` при конфлікті), статусу сервісу та актуальності розширення. Повертає `{ ok, checks: [{ check, ok, message, fix, code? }] }` з кодом 1 при збоях. |
-| — | `socmedia update` | `--check`, `--json`, `--text` | Перевірка або встановлення оновлень автономного бінарника через GitHub Releases. Блокує оновлення за наявності активних завдань у черзі; звіряє sha256 суми; використовує атомарну заміну з резервною копією `.old` та автоматичним відновленням у разі збою. |
+| — | `socmedia update` | `--check`, `--json`, `--text`; env `SOCMEDIA_CLI_UPDATE_URL` (база `latest.json`, https або localhost) | Читає `latest.json`; `--check` лише порівнює версії. Без `--check`: відмовляє за наявності завдання `running`; завантажує й звіряє sha256 бінарника та розширення до будь-яких змін; бінарник замінюється атомарно (попередній — `<binary>.old`), `~/.socmedia-cli/extension` оновлюється (попередня — `extension.bak`), і лише після успіху сервіс перезапускається, а розширення отримує `{type:"reload"}`. Результат: `{ updated, binary, extension, service, extensionReload }`. |
+| — | `socmedia service status` | `--json`, `--text` | Стан сервісу + `extensionUrl`, `extensionId`, `extensionPinned`, `pinnedId`, порт; при конфлікті `portInUse`, `ownerPid`, `hint`. `PORT_IN_USE` = код виходу 8 (JSON-помилка містить `port`, `ownerPid`). |
 | — | `socmedia config` | `get\|set\|unset port [value]` | Перегляд, збереження або скидання фіксованого порту сервісу у `~/.socmedia-cli/config.json`. |
 | — | `socmedia service resume` | `--json`, `--text` | Зняття статусу HALT після вирішення чекпоінту або авторизації в Chrome та відновлення черги. |
 

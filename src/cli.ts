@@ -54,8 +54,10 @@ export const PINNED_EXTENSION_ID = "ingpbbhdgldgomideaihffffiinjgifj";
 export class CliError extends Error {
   hint?: string;
   code?: string;
-  constructor(message: string, hint?: string, code?: string) {
+  extra?: Record<string, unknown>;
+  constructor(message: string, hint?: string, code?: string, extra?: Record<string, unknown>) {
     super(message);
+    this.extra = extra;
     this.name = "CliError";
     this.hint = hint;
     this.code = code;
@@ -71,6 +73,16 @@ async function isPortInUse(port: number): Promise<boolean> {
     s.listen(port, "127.0.0.1");
   });
 }
+
+// Best-effort PID of the process listening on a TCP port (lsof may be absent).
+function portOwnerPid(port: number): number | null {
+  const r = spawnSync("lsof", ["-nP", `-iTCP:${port}`, "-sTCP:LISTEN", "-t"], { encoding: "utf8" });
+  const pid = Number((r.stdout ?? "").split("\n").find(Boolean));
+  return Number.isInteger(pid) && pid > 0 ? pid : null;
+}
+// A service from a version without the identity field is still ours if its process is a socmedia daemon.
+const isOwnProcess = (pid: number) => /--service-daemon|socmedia/.test(spawnSync("ps", ["-o", "command=", "-p", String(pid)], { encoding: "utf8" }).stdout ?? "");
+const portHint = "Stop the process holding the port, or choose another: socmedia config set port <PORT> (then enter it in the extension popup)";
 
 const CHANNEL_ID_RE = /^UC[\w-]{22}$/;
 function studioUrl(id: string): string {
@@ -157,7 +169,7 @@ function writeConfig(config: Record<string, unknown>) {
 
 declare const EXT_BUNDLE_JSON: string | undefined;
 
-function installExtension() {
+function bundledExtension() {
   let manifest: any;
   let sourceFiles: Record<string, Buffer> | null = null;
   if (typeof EXT_BUNDLE_JSON !== "undefined") {
@@ -169,9 +181,17 @@ function installExtension() {
     const source = fileURLToPath(new URL("../extension/", import.meta.url));
     manifest = JSON.parse(readFileSync(join(source, "manifest.json"), "utf8"));
   }
-  if (manifest.version !== extensionVersion || typeof manifest.key !== "string" || !manifest.key) throw new Error("Extension manifest version or public key is invalid");
-  const hash = createHash("sha256").update(Buffer.from(manifest.key, "base64")).digest("hex").slice(0, 32);
-  const id = [...hash].map((nibble) => String.fromCharCode(97 + parseInt(nibble, 16))).join("");
+  const id = typeof manifest.key === "string" && manifest.key
+    ? [...createHash("sha256").update(Buffer.from(manifest.key, "base64")).digest("hex").slice(0, 32)].map((nibble) => String.fromCharCode(97 + parseInt(nibble, 16))).join("")
+    : null;
+  return { manifest, sourceFiles, id };
+}
+// Extension identity shown by status: the ID Chrome derives from the manifest key, and whether it is the pinned one.
+const extensionIdentity = () => { const { id } = bundledExtension(); return { extensionId: id, extensionPinned: id === PINNED_EXTENSION_ID }; };
+
+function installExtension() {
+  const { manifest, sourceFiles, id } = bundledExtension();
+  if (manifest.version !== extensionVersion || !id) throw new Error("Extension manifest version or public key is invalid");
   mkdirSync(stateDir, { recursive: true, mode: 0o700 });
   if (existsSync(extensionPath) && !lstatSync(extensionPath).isDirectory()) throw new Error("Extension path exists and is not a directory");
   const staged = mkdtempSync(join(stateDir, ".extension-install-"));
@@ -496,7 +516,7 @@ function validateJob(value: unknown) {
   return job;
 }
 
-async function status(): Promise<{ running: boolean; pid?: number; version?: string; extension?: unknown; halted?: unknown; extensionUrl?: string; portSource?: string; port: number; pinnedId: string; portInUse?: boolean; code?: string }> {
+async function status(): Promise<{ running: boolean; pid?: number; version?: string; extension?: unknown; halted?: unknown; extensionUrl?: string; portSource?: string; port: number; pinnedId: string; portInUse?: boolean; code?: string; ownerPid?: number | null; hint?: string; legacy?: boolean; extensionId?: string | null; extensionPinned?: boolean }> {
   const pCfg = effectivePort();
   const configuredPort = pCfg.port;
   return new Promise((resolve) => {
@@ -509,7 +529,9 @@ async function status(): Promise<{ running: boolean; pid?: number; version?: str
         port: configuredPort,
         portSource: pCfg.source,
         pinnedId: PINNED_EXTENSION_ID,
-        ...(inUse ? { portInUse: true, code: "PORT_IN_USE" } : {}),
+        ...extensionIdentity(),
+        extensionUrl: `ws://127.0.0.1:${configuredPort}/extension`,
+        ...(inUse ? { portInUse: true, code: "PORT_IN_USE", ownerPid: portOwnerPid(configuredPort), hint: portHint } : {}),
       });
     };
     const timer = setTimeout(() => { socket.destroy(); finishAbsent(); }, 1000);
@@ -521,7 +543,8 @@ async function status(): Promise<{ running: boolean; pid?: number; version?: str
       socket.destroy();
       try {
         const response = JSON.parse(data.split("\n")[0]!);
-        if (response.identity === identity && Number.isInteger(response.pid) && response.pid > 0) {
+        const legacy = response.identity === undefined && Number.isInteger(response.pid) && response.pid > 0 && isOwnProcess(response.pid);
+        if ((response.identity === identity || legacy) && Number.isInteger(response.pid) && response.pid > 0) {
           const ext = response.extension as { port?: number } | undefined;
           resolve({
             running: true,
@@ -533,6 +556,8 @@ async function status(): Promise<{ running: boolean; pid?: number; version?: str
             portSource: response.portSource,
             port: ext?.port ?? configuredPort,
             pinnedId: PINNED_EXTENSION_ID,
+            ...extensionIdentity(),
+            ...(legacy ? { legacy: true } : {}),
           });
           return;
         }
@@ -547,7 +572,7 @@ async function start() {
   const existing = await status();
   if (existing.running) return existing;
   if (existing.portInUse) {
-    throw new CliError(`Port ${existing.port} is already in use by another service`, "Choose another port with `socmedia config set port <PORT>` or stop the conflicting service", "PORT_IN_USE");
+    throw new CliError(`PORT_IN_USE: port ${existing.port} is held by another process${existing.ownerPid ? ` (pid ${existing.ownerPid})` : ""}, not by socmedia`, portHint, "PORT_IN_USE", { port: existing.port, ownerPid: existing.ownerPid ?? null });
   }
   mkdirSync(stateDir, { recursive: true, mode: 0o700 });
   const isCompiled = import.meta.path.startsWith("/$bunfs");
@@ -565,8 +590,10 @@ async function start() {
 }
 
 async function stop() {
-  if (!(await status()).running) return { running: false };
-  await new Promise<void>((resolve, reject) => {
+  const current = await status();
+  if (!current.running) return { running: false };
+  if (current.legacy && current.pid) process.kill(current.pid, "SIGTERM"); // older service: no identity, no stop protocol guarantee
+  else await new Promise<void>((resolve, reject) => {
     const socket = createConnection(socketPath);
     let data = "";
     const timer = setTimeout(() => { socket.destroy(); reject(new Error("Service stop timed out")); }, 1000);
@@ -669,9 +696,12 @@ async function runUpdate(checkOnly = false) {
     {
       currentVersion: extensionVersion,
       stateDir,
+      extensionPath,
       isCompiled: import.meta.path.startsWith("/$bunfs"),
       status,
       queueRequest,
+      stopService: stop,
+      startService: start,
     },
     checkOnly
   );
@@ -955,6 +985,12 @@ if (Bun.argv[2] === "--service-daemon") {
         const timer = setTimeout(() => { pending.delete(id); finish({ error: "Extension request timed out" }); }, extensionTimeout);
         pending.set(id, { ws, finish, timer });
         ws.send(JSON.stringify(command === "tabs list" ? { type: "request", id, action: "tabs.list" } : { type: "request", id, action: "tabs.use", args: { tabId } }));
+      }
+      else if (command === "extension reload") {
+        // Asks the connected extension to chrome.runtime.reload(); extensions without a handler ignore the message.
+        if (!extensionSocket) { socket.end(JSON.stringify({ error: "Extension not connected" }) + "\n"); return; }
+        extensionSocket.send(JSON.stringify({ type: "reload" }));
+        socket.end(JSON.stringify({ sent: true }) + "\n");
       }
       else if (command === "queue list") {
         const rows = db.query("SELECT id, data FROM jobs ORDER BY id DESC").all() as { id: number; data: string }[];

@@ -174,14 +174,11 @@ The CLI's `--help` is the source of truth; this skill mirrors and summarizes its
   ```bash
   socmedia inbox read --url https://www.instagram.com/direct/t/THREAD_ID/ [--json]
   ```
-- **Send direct message (Dry-run preview)**:
+- **Send direct message (preview, no `--confirm`)**:
   ```bash
   socmedia message send --to https://www.instagram.com/direct/t/THREAD_ID/ --text "Hello!" [--json]
   ```
-- **Send direct message (Confirmed)**:
-  ```bash
-  socmedia message send --to https://www.instagram.com/direct/t/THREAD_ID/ --text "Hello!" --confirm [--json]
-  ```
+- Only after the user explicitly approves this exact preview, re-run the identical command with `--confirm` appended; never before.
 
 ### YouTube Studio Integration
 - **List configured channels**:
@@ -192,14 +189,11 @@ The CLI's `--help` is the source of truth; this skill mirrors and summarizes its
   ```bash
   socmedia youtube studio status --open [--channel KEY] [--json]
   ```
-- **Upload video draft (Dry-run preview)**:
+- **Upload video draft (preview, no `--confirm`)**:
   ```bash
   socmedia youtube upload ~/Videos/intro.mp4 --title "Introduction" --privacy private [--json]
   ```
-- **Upload video draft (Confirmed)**:
-  ```bash
-  socmedia youtube upload ~/Videos/intro.mp4 --title "Introduction" --privacy private --confirm [--json]
-  ```
+- Same rule: re-run the identical upload with `--confirm` appended only after the user explicitly approves the preview.
 
 ### Queue Management
 - **Inspect and cancel jobs**:
