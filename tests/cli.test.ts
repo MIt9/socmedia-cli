@@ -1786,6 +1786,14 @@ test("extension install uses a stable path and public-key ID without changing pa
     expect(second.path).toBe(path); expect(second.id).toBe(expectedId);
     expect(await readFile(join(stateDir, "extension-pairing.json"), "utf8")).toBe(marker);
     expect(await readdir(path)).not.toContain("stale-file");
+
+    const humanInstall = await run("extension", "install");
+    expect(humanInstall.stdout).toContain("Extension unpacked to: " + path);
+    expect(humanInstall.stdout).toContain("Steps to load in Chrome:");
+    expect(humanInstall.stdout.trim()).not.toMatch(/^\{.*\}$/);
+
+    const humanPath = await run("extension", "path");
+    expect(humanPath.stdout.trim()).toBe(path);
   } finally { await rm(stateDir, { recursive: true, force: true }); }
 });
 
@@ -2548,6 +2556,16 @@ test("service status reports an absent service without starting it", async () =>
     expect(await cli.exited).toBe(0);
     expect(JSON.parse(output)).toEqual({ running: false });
     expect(await readdir(stateDir)).toEqual([]);
+
+    const humanCli = Bun.spawn(["bun", "run", "src/cli.ts", "service", "status"], {
+      cwd: import.meta.dir + "/..",
+      env: { ...process.env, SOCMEDIA_STATE_DIR: stateDir, SOCMEDIA_EXTENSION_PORT: "0" },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const humanOutput = await new Response(humanCli.stdout).text();
+    expect(await humanCli.exited).toBe(0);
+    expect(humanOutput.trim()).toBe("Service: stopped");
   } finally {
     await rm(stateDir, { recursive: true, force: true });
   }

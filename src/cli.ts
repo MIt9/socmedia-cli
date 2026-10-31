@@ -1634,6 +1634,7 @@ if (Bun.argv[2] === "--service-daemon") {
   try {
     const options = Bun.argv.slice(4);
     const install = Bun.argv[3] === "install";
+    const json = options.includes("--json");
     if (options.some((option) => option !== "--json" && !(install && option === "--open"))) throw new Error("Unknown extension option");
     const result = install ? installExtension() : { path: extensionPath };
     if (install && options.includes("--open")) {
@@ -1641,7 +1642,17 @@ if (Bun.argv[2] === "--service-daemon") {
       const opened = spawnSync("open", ["-a", "Google Chrome", "chrome://extensions"]);
       if (opened.error || opened.status !== 0) throw new Error("Extension copied, but Chrome could not be opened; open chrome://extensions manually");
     }
-    console.log(JSON.stringify(result));
+    if (json) {
+      console.log(JSON.stringify(result));
+    } else if (install) {
+      const res = result as { path: string; id: string; steps: string[] };
+      console.log(`Extension unpacked to: ${res.path}`);
+      console.log(`Extension ID:         ${res.id}\n`);
+      console.log("Steps to load in Chrome:");
+      res.steps.forEach((step, idx) => console.log(`  ${idx + 1}. ${step}`));
+    } else {
+      console.log(result.path);
+    }
   } catch (error) { console.error(error instanceof Error ? error.message : String(error)); process.exitCode = 1; }
 } else if (Bun.argv[2] === "extension" && Bun.argv[3] === "pair") {
   try {
@@ -1653,16 +1664,36 @@ if (Bun.argv[2] === "--service-daemon") {
       writeFileSync(temporary, JSON.stringify(pairing), { mode: 0o600, flag: "wx" });
       renameSync(temporary, pairingPath);
     } finally { rmSync(temporary, { force: true }); }
-    console.log(JSON.stringify(pairing));
+    if (Bun.argv.includes("--json")) console.log(JSON.stringify(pairing));
+    else console.log(`Extension paired: ${pairing.id}`);
   } catch (error) { console.error(error instanceof Error ? error.message : String(error)); process.exitCode = 1; }
 } else if (Bun.argv[2] === "service" && Bun.argv[3] === "status") {
-  console.log(JSON.stringify(await status()));
+  const json = Bun.argv.includes("--json");
+  const res = await status();
+  if (json) {
+    console.log(JSON.stringify(res));
+  } else if (!res.running) {
+    console.log("Service: stopped");
+  } else {
+    const ext = res.extension as { connected?: boolean; version?: string } | undefined;
+    console.log(`Service:   running (PID ${res.pid}, v${res.version})`);
+    console.log(`Extension: ${ext?.connected ? `connected (v${ext.version})` : "not connected"}`);
+    if (res.halted) console.log(`Halted:    ${JSON.stringify(res.halted)}`);
+  }
 } else if (Bun.argv[2] === "service" && Bun.argv[3] === "start") {
-  try { console.log(JSON.stringify(await start())); }
-  catch (error) { console.error(error instanceof Error ? error.message : String(error)); process.exitCode = 1; }
+  try {
+    const json = Bun.argv.includes("--json");
+    const res = await start();
+    if (json) console.log(JSON.stringify(res));
+    else console.log(`Service running (PID ${res.pid}, v${res.version})`);
+  } catch (error) { console.error(error instanceof Error ? error.message : String(error)); process.exitCode = 1; }
 } else if (Bun.argv[2] === "service" && Bun.argv[3] === "stop") {
-  try { console.log(JSON.stringify(await stop())); }
-  catch (error) { console.error(error instanceof Error ? error.message : String(error)); process.exitCode = 1; }
+  try {
+    const json = Bun.argv.includes("--json");
+    const res = await stop();
+    if (json) console.log(JSON.stringify(res));
+    else console.log("Service stopped");
+  } catch (error) { console.error(error instanceof Error ? error.message : String(error)); process.exitCode = 1; }
 } else if (Bun.argv[2] === "service" && Bun.argv[3] === "resume") {
   try { console.log(JSON.stringify(await queueRequest("service resume"))); }
   catch (error) { console.error(error instanceof Error ? error.message : String(error)); process.exitCode = 1; }
