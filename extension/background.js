@@ -552,6 +552,127 @@ async function getComments({ url, limit = 20 }) {
   return { platform: isIg ? "ig" : "fb", url: current.url, comments: execution?.result || [] };
 }
 
+function extractInstagramPost() {
+  const num = (s) => {
+    if (s == null) return null;
+    const match = String(s).replace(/,/g, "").match(/([\d.]+)\s*([KkMmBb])?/);
+    if (!match) return null;
+    const value = parseFloat(match[1]);
+    if (isNaN(value)) return null;
+    return Math.round(value * ({ k: 1e3, m: 1e6, b: 1e9 }[(match[2] || "").toLowerCase()] || 1));
+  };
+  const ogTitle = document.querySelector('meta[property="og:title"]')?.content || "";
+  const ogDesc = document.querySelector('meta[property="og:description"]')?.content || "";
+  const username = location.pathname.match(/^\/([^/]+)\/(?:p|reel|tv)\//)?.[1] || ogDesc.match(/ - ([\w.]+) on /)?.[1] || null;
+  const name = ogTitle.match(/^(.*?) on Instagram/)?.[1]?.trim() || null;
+  const authorUrl = username ? `https://www.instagram.com/${username}/` : null;
+  const quoted = (s) => s.match(/:\s*"([\s\S]*)"\s*$/)?.[1]?.trim() || null;
+  const caption = document.querySelector("main h1")?.innerText?.trim() || quoted(ogTitle) || quoted(ogDesc) || null;
+  const timeEl = document.querySelector("time[datetime]");
+  const ogDay = ogDesc.match(/ on (\w+ \d{1,2}, \d{4})/)?.[1];
+  const date = timeEl ? timeEl.getAttribute("datetime") : (ogDay && !isNaN(new Date(`${ogDay} UTC`).getTime()) ? new Date(`${ogDay} UTC`).toISOString() : null);
+  const likes = num(document.querySelector('a[href*="/liked_by/"]')?.innerText) ?? num(ogDesc.match(/([\d.,]+[KkMmBb]?)\s+likes/i)?.[1]);
+  const commentsCount = num(ogDesc.match(/([\d.,]+[KkMmBb]?)\s+comments/i)?.[1]) ?? num([...document.querySelectorAll("span, button")].map((e) => e.innerText).find((t) => /\b[\d.,]+\s+comments\b/i.test(t || "")));
+  const views = num([...document.querySelectorAll("span")].map((e) => e.innerText).find((t) => /\b[\d.,]+\s+views\b/i.test(t || "")));
+  const place = document.querySelector('a[href*="/explore/locations/"]')?.innerText?.trim() || null;
+
+  const images = [...document.querySelectorAll("main img[src]")]
+    .filter((img) => (img.clientWidth || 0) >= 250 && !/profile picture/i.test(img.alt || "") && !img.closest('a[href*="/p/"], a[href*="/reel/"]'))
+    .map((img) => ({ type: "image", url: img.currentSrc || img.src, alt: img.alt?.trim() || null }));
+  const videos = [...document.querySelectorAll("main video[src], main video source[src]")]
+    .map((v) => ({ type: "video", url: v.src })).filter((v) => /^https?:/.test(v.url));
+  const ogImage = document.querySelector('meta[property="og:image"]')?.content;
+  let media = [...new Map([...images, ...videos].map((m) => [m.url, m])).values()];
+  if (!media.length && ogImage) media.push({ type: "image", url: ogImage });
+
+  const hashtags = [...new Set((caption || "").match(/#([\p{L}\p{N}_]+)/gu)?.map((t) => t.slice(1)) || [])];
+  const mentions = [...new Set((caption || "").match(/@([\p{L}\p{N}_.]+)/gu)?.map((t) => t.slice(1).replace(/\.+$/, "")) || [])];
+
+  return {
+    platform: "ig",
+    url: location.href,
+    author: { username, name, url: authorUrl },
+    caption,
+    date,
+    likes,
+    commentsCount,
+    views,
+    location: place,
+    media,
+    hashtags,
+    mentions,
+  };
+}
+
+function extractFacebookPost() {
+  const num = (s) => {
+    if (s == null) return null;
+    const match = String(s).replace(/,/g, "").match(/([\d.]+)\s*([KkMmBb])?/);
+    if (!match) return null;
+    const value = parseFloat(match[1]);
+    if (isNaN(value)) return null;
+    return Math.round(value * ({ k: 1e3, m: 1e6, b: 1e9 }[(match[2] || "").toLowerCase()] || 1));
+  };
+  const MSG = '[data-ad-preview="message"], [data-ad-comet-preview="message"]';
+  const root = [...document.querySelectorAll('[role=dialog]')].find((d) => d.querySelector(`${MSG}, a[href*="/photo"] img, video`)) || document;
+  const outside = (sel) => [...root.querySelectorAll(sel)].filter((e) => !e.closest("[role=article], [role=banner], [role=navigation]"));
+
+  const authorEl = outside("h2 a, h3 a, strong a")[0];
+  const authorLink = authorEl?.closest?.("a") || authorEl?.querySelector?.("a") || authorEl;
+  const authorUrl = authorLink?.href ? authorLink.href.split("?")[0] : null;
+  const name = authorEl?.innerText?.trim() || null;
+  let username = null;
+  if (authorUrl) {
+    try { username = new URL(authorUrl).pathname.replace(/^\/+|\/+$/g, "").split("/")[0] || null; } catch {}
+  }
+
+  const texts = outside('[data-ad-preview="message"], [data-ad-comet-preview="message"], span[dir="auto"], div[dir="auto"]')
+    .map((e) => (e.innerText || "").trim()).filter((t) => t && t !== "Facebook" && t !== name && !/^(\S͏?\n){4,}/.test(t));
+  const msgEl = root.querySelector(MSG);
+  const domCaption = msgEl?.innerText?.replace(/…\s*See more\s*$/, "").trim() || texts.reduce((a, b) => (b.length > a.length ? b : a), "") || null;
+  const caption = domCaption;
+  const date = root.querySelector("time[datetime]")?.getAttribute("datetime") || null;
+
+  const counters = texts.slice(Math.max(0, texts.indexOf(domCaption)) + 1).filter((t) => /^[\d.,]+[KkMm]?$/.test(t)).map(num);
+  const likes = counters[0] ?? null;
+  const commentsCount = counters[1] ?? null;
+  const views = num(texts.find((t) => /^[\d.,]+[KkMm]?\s+views$/i.test(t)));
+
+  const images = outside("img[src]").filter((img) => (img.width || 0) > 300).map((img) => ({ type: "image", url: img.currentSrc || img.src }));
+  const videos = outside("video[src], video source[src]").map((v) => ({ type: "video", url: v.src })).filter((v) => /^https?:/.test(v.url));
+  const media = [...new Map([...images, ...videos].map((m) => [m.url, m])).values()];
+
+  const hashtags = [...new Set((caption || "").match(/#([\p{L}\p{N}_]+)/gu)?.map((t) => t.slice(1)) || [])];
+  const mentions = [...new Set((caption || "").match(/@([\p{L}\p{N}_.]+)/gu)?.map((t) => t.slice(1).replace(/\.+$/, "")) || [])];
+
+  return {
+    platform: "fb",
+    url: location.href,
+    author: { username, name, url: authorUrl },
+    caption,
+    date,
+    likes,
+    commentsCount,
+    views,
+    location: null,
+    media,
+    hashtags,
+    mentions,
+  };
+}
+
+async function getPost({ url }) {
+  const target = postUrl(url);
+  const tab = await navigateSocial(target);
+  const tabId = tab.id;
+  const isIg = new URL(target).hostname.includes("instagram.com");
+  const current = await safeTab(tabId);
+  if (postUrl(current.url) !== target) throw new Error(`Redirected to a different ${isIg ? "Instagram" : "Facebook"} post`);
+  const extractor = isIg ? extractInstagramPost : extractFacebookPost;
+  const [execution] = await chrome.scripting.executeScript({ target: { tabId }, func: extractor });
+  return execution?.result || null;
+}
+
 async function readPage({ maxLines = 200 }) {
   if (!Number.isInteger(maxLines) || maxLines < 1 || maxLines > 1000) throw new Error("maxLines must be an integer from 1 to 1000");
   const tab = await safeWorkTab();
@@ -615,9 +736,9 @@ async function connect() {
       } else if (message.type === "hello" && verified) {
         authenticated = message.compatible === true;
         if (!authenticated) console.warn("Socmedia service version is incompatible", message.version);
-      } else if (authenticated && message.type === "request" && (message.action === "tabs.list" || message.action === "tabs.use" || message.action === "readPage" || message.action === "snapshot" || message.action === "getProfile" || message.action === "getComments" || message.action === "getPosts")) {
+      } else if (authenticated && message.type === "request" && (message.action === "tabs.list" || message.action === "tabs.use" || message.action === "readPage" || message.action === "snapshot" || message.action === "getProfile" || message.action === "getComments" || message.action === "getPosts" || message.action === "getPost")) {
         const reply = (result) => { if (connection.readyState === WebSocket.OPEN) connection.send(JSON.stringify({ type: "result", id: message.id, ...result })); };
-        const task = browserAction.then(() => message.action === "tabs.list" ? listTabs() : message.action === "tabs.use" ? useTab(message.args || {}) : message.action === "snapshot" ? snapshot() : message.action === "getProfile" ? getProfile(message.args || {}) : message.action === "getComments" ? getComments(message.args || {}) : message.action === "getPosts" ? getPosts(message.args || {}) : readPage(message.args || {}));
+        const task = browserAction.then(() => message.action === "tabs.list" ? listTabs() : message.action === "tabs.use" ? useTab(message.args || {}) : message.action === "snapshot" ? snapshot() : message.action === "getProfile" ? getProfile(message.args || {}) : message.action === "getComments" ? getComments(message.args || {}) : message.action === "getPosts" ? getPosts(message.args || {}) : message.action === "getPost" ? getPost(message.args || {}) : readPage(message.args || {}));
         browserAction = task.then(() => undefined, () => undefined);
         task.then((result) => reply({ result }), (error) => reply({ error: error.code === "HALT" ? { code: "HALT", reason: error.reason } : error.message }));
       }

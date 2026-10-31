@@ -1,4 +1,4 @@
-import { closeSync, constants, cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { closeSync, constants, cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, renameSync, rmSync, writeFileSync, writeSync } from "node:fs";
 import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { createConnection, createServer } from "node:net";
 import { homedir } from "node:os";
@@ -119,6 +119,139 @@ function exportContactFile(path: unknown, format: string, contacts: Record<strin
     renameSync(temporary, file);
   } finally { if (fd !== undefined) closeSync(fd); rmSync(temporary, { force: true }); }
   return { path: file, count: contacts.length };
+}
+
+const isPrivateHost = (h: string) => /^(localhost|.*\.(local|internal|localdomain))$/i.test(h)
+  || /^(127\.|10\.|0\.|169\.254\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/.test(h) || h.startsWith("[");
+
+const isMediaHost = (h: string) => /\.(cdninstagram\.com|fbcdn\.net)$/i.test(String(h));
+
+const NOT_VIDEO_BRANDS = /^(avif|avis|heic|heix|hevc|hevx|mif1|msf1|M4A |M4B )$/;
+function mediaExt(b: Buffer): "jpg" | "png" | "webp" | "mp4" | null {
+  if (b.length < 12) return null;
+  const h = b.toString("hex", 0, 4);
+  if (h.startsWith("ffd8ff")) return "jpg";
+  if (h === "89504e47") return "png";
+  if (b.toString("latin1", 0, 4) === "RIFF" && b.toString("latin1", 8, 12) === "WEBP") return "webp";
+  if (b.toString("latin1", 4, 8) === "ftyp" && !NOT_VIDEO_BRANDS.test(b.toString("latin1", 8, 12))) return "mp4";
+  return null;
+}
+
+function safeSeg(s: unknown, max = 60, keepCase = false): string | null {
+  const raw = String(s ?? "").normalize("NFKC");
+  const v = (keepCase ? raw : raw.toLowerCase()).replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^[-.]+/, "").slice(0, max).replace(/[-.]+$/, "");
+  return v || (/[\p{L}\p{N}]/u.test(raw) ? `x-${createHash("sha1").update(raw).digest("hex").slice(0, 8)}` : null);
+}
+
+function authorSeg(author: any): string {
+  let a = safeSeg(author?.username);
+  if (!a && author?.url) {
+    try {
+      const u = new URL(author.url);
+      const seg = u.pathname.split("/").filter(Boolean)[0];
+      if (seg) a = safeSeg(seg);
+    } catch {}
+  }
+  return a || "_unknown";
+}
+
+function postId(url: string): string | null {
+  let x: URL;
+  try { x = new URL(url); } catch { return null; }
+  const q = x.searchParams.get("v") || x.searchParams.get("story_fbid") || x.searchParams.get("fbid");
+  const segs = x.pathname.split("/").filter(Boolean);
+  const i = segs.findIndex((s) => /^(p|reels?|tv|posts|videos)$/i.test(s));
+  const id = q || (i >= 0 ? segs[i + 1] : segs.at(-1));
+  const seg = safeSeg(id, 60, true);
+  return seg && /[A-Z]/.test(seg) ? `${seg}-${createHash("sha1").update(id!).digest("hex").slice(0, 6)}` : seg;
+}
+
+function postDir(post: any, url: string): string {
+  const home = resolve(homedir());
+  const root = join(home, "socmedia-data");
+  const platform = safeSeg(post?.platform) || "_unknown";
+  const author = authorSeg(post?.author);
+  const pid = postId(url) || "_unknown";
+  const target = resolve(root, platform, author, pid);
+  const rel = relative(home, target);
+  if (!rel || rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) throw new Error("Path must be inside home");
+  return target;
+}
+
+const MAX_MEDIA_BYTES = 15 * 1024 * 1024;
+const MAX_VIDEO_BYTES = 200 * 1024 * 1024;
+const mediaMax = (type?: string) => (type === "video" ? MAX_VIDEO_BYTES : MAX_MEDIA_BYTES);
+
+async function fetchBody(url: string, options: { max: number; timeout?: number; allow?: (h: string) => boolean; file?: string }) {
+  let u = new URL(url);
+  for (let hop = 0; hop < 6; hop++) {
+    if (!/^https?:$/.test(u.protocol) || isPrivateHost(u.hostname) || (options.allow && !options.allow(u.hostname))) {
+      throw new Error(`Refusing to fetch ${u.href}`);
+    }
+    const res = await fetch(u.href, { redirect: "manual", signal: AbortSignal.timeout(options.timeout ?? 10000), headers: { accept: "*/*" } });
+    const loc = res.headers.get("location");
+    if (res.status >= 300 && res.status < 400 && loc) {
+      u = new URL(loc, u);
+      await res.body?.cancel();
+      continue;
+    }
+    if (Number(res.headers.get("content-length")) > options.max) {
+      await res.body?.cancel();
+      return { status: res.status, url: u.href, headers: res.headers, body: Buffer.alloc(0), truncated: true };
+    }
+    const chunks: Uint8Array[] = [];
+    let n = 0;
+    let truncated = false;
+    const fd = options.file ? openSync(options.file, constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC, 0o600) : null;
+    try {
+      if (res.body) {
+        // @ts-ignore
+        for await (const chunk of res.body) {
+          const c = chunk as Uint8Array;
+          n += c.length;
+          if (n > options.max) { truncated = true; break; }
+          if (fd !== null) writeSync(fd, c);
+          if (fd === null || n - c.length < 16) chunks.push(c);
+        }
+      }
+    } finally {
+      if (fd !== null) closeSync(fd);
+    }
+    return { status: res.status, url: u.href, headers: res.headers, body: Buffer.concat(chunks), truncated };
+  }
+  throw new Error("Too many redirects");
+}
+
+async function downloadPostMedia(result: any, postUrl: string) {
+  if (!result || typeof result !== "object") return result;
+  if (!["ig", "fb"].includes(result.platform) || !Array.isArray(result.media)) return result;
+  const dir = postDir(result, postUrl || result.url);
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const downloadedFiles: string[] = [];
+  for (let i = 0; i < result.media.length; i++) {
+    const m = result.media[i];
+    m.path = null;
+    if (!m.url) { m.error ??= "no media url"; continue; }
+    const max = mediaMax(m.type);
+    const nn = String(i + 1).padStart(2, "0");
+    const tmp = join(dir, `${nn}.part`);
+    try {
+      const f = await fetchBody(m.url, { max, timeout: m.type === "video" ? 600000 : 60000, allow: isMediaHost, file: tmp });
+      const ext = f.status === 200 && !f.truncated ? mediaExt(f.body) : null;
+      if (!ext) throw new Error(`not jpg/png/webp/mp4, or over ${max / 1048576} MB`);
+      for (const e of ["jpg", "png", "webp", "mp4"]) if (e !== ext) rmSync(join(dir, `${nn}.${e}`), { force: true });
+      const file = join(dir, `${nn}.${ext}`);
+      renameSync(tmp, file);
+      m.path = file;
+      downloadedFiles.push(file);
+    } catch (e: any) {
+      rmSync(tmp, { force: true });
+      m.error = e?.message || String(e);
+    }
+  }
+  result.files = downloadedFiles;
+  writeFileSync(join(dir, "post.json"), JSON.stringify({ ...result, savedAt: new Date().toISOString() }, null, 2));
+  return result;
 }
 
 function instagramProfileUrl(value: unknown): string {
@@ -248,6 +381,12 @@ function validateJob(value: unknown) {
     args.url = profileUrl(args.url);
     if (args.limit !== undefined && (!Number.isInteger(args.limit) || Number(args.limit) < 1 || Number(args.limit) > 100)) throw new Error("Post limit must be an integer from 1 to 100");
   }
+  if (job.action === "getPost") {
+    const args = job.args as Record<string, unknown>;
+    if (Object.keys(args).some((key) => key !== "url" && key !== "download")) throw new Error("getPost accepts only url and download");
+    args.url = postUrl(args.url);
+    if (args.download !== undefined && typeof args.download !== "boolean") throw new Error("--download must be a boolean");
+  }
   if (job.action === "getComments") {
     const args = job.args as Record<string, unknown>;
     if (Object.keys(args).some((key) => key !== "url" && key !== "limit")) throw new Error("getComments accepts only url and limit");
@@ -355,7 +494,7 @@ async function queueRequest(command: string): Promise<unknown> {
   });
 }
 
-async function runPageJob(action: "snapshot" | "readPage" | "getProfile" | "getComments" | "getPosts", args: Record<string, unknown>): Promise<unknown> {
+async function runPageJob(action: "snapshot" | "readPage" | "getProfile" | "getComments" | "getPosts" | "getPost", args: Record<string, unknown>): Promise<unknown> {
   const current = await status();
   if (!current.running) throw new Error("Service not running");
   if (current.halted) {
@@ -366,7 +505,7 @@ async function runPageJob(action: "snapshot" | "readPage" | "getProfile" | "getC
   if (!extension?.connected) throw new Error("Extension not connected");
   if (!extension.compatible) throw new Error("Extension version incompatible");
   const created = await queueRequest(`queue enqueue ${JSON.stringify({ action, args })}`) as { id: number };
-  const deadline = Date.now() + (action === "getComments" || action === "getPosts" ? 75000 : action === "getProfile" ? 60000 : 30000);
+  const deadline = Date.now() + (action === "getComments" || action === "getPosts" || action === "getPost" ? 75000 : action === "getProfile" ? 60000 : 30000);
   while (Date.now() < deadline) {
     let job = await queueRequest(`queue get ${created.id}`) as { status: string; result?: unknown; error?: string | { code?: string; reason?: string } };
     if (!["done", "failed", "cancelled"].includes(job.status)) {
@@ -416,11 +555,11 @@ if (Bun.argv[2] === "--service-daemon") {
   db.run("CREATE TABLE IF NOT EXISTS service_state (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
   const haltRow = db.query("SELECT value FROM service_state WHERE key = 'halted'").get() as { value: string } | null;
   let halted: { code: string; reason: string } | null = haltRow ? JSON.parse(haltRow.value) : null;
-  db.run("UPDATE jobs SET data = json_set(data, '$.status', 'queued') WHERE json_extract(data, '$.action') IN ('readPage','snapshot','getProfile','getComments','getPosts') AND json_extract(data, '$.status') = 'running'");
+  db.run("UPDATE jobs SET data = json_set(data, '$.status', 'queued') WHERE json_extract(data, '$.action') IN ('readPage','snapshot','getProfile','getComments','getPosts','getPost') AND json_extract(data, '$.status') = 'running'");
   type ExtensionData = { token: string; challenge?: { clientNonce: string; serverNonce: string; version: string } };
   let extensionSocket: Bun.ServerWebSocket<ExtensionData> | null = null;
   let connectedVersion: string | null = null;
-  const pending = new Map<string, { ws: Bun.ServerWebSocket<ExtensionData>; finish: (reply: unknown) => void; timer: ReturnType<typeof setTimeout> }>();
+  const pending = new Map<string, { ws: Bun.ServerWebSocket<ExtensionData>; finish: (reply: unknown) => void | Promise<void>; timer: ReturnType<typeof setTimeout> }>();
   let browserBusy = false;
   let workerWake: ReturnType<typeof setTimeout> | undefined;
   const extensionTimeout = Number(process.env.SOCMEDIA_EXTENSION_TIMEOUT_MS ?? "10000");
@@ -479,7 +618,7 @@ if (Bun.argv[2] === "--service-daemon") {
   function pump() {
     if (workerWake) { clearTimeout(workerWake); workerWake = undefined; }
     if (halted || browserBusy || !extensionSocket || !connectedVersion || !compatibleVersion(connectedVersion)) return;
-    const rows = db.query("SELECT id, data FROM jobs WHERE json_extract(data, '$.action') IN ('readPage','snapshot','getProfile','getComments','getPosts') AND json_extract(data, '$.status') = 'queued' ORDER BY id").all() as { id: number; data: string }[];
+    const rows = db.query("SELECT id, data FROM jobs WHERE json_extract(data, '$.action') IN ('readPage','snapshot','getProfile','getComments','getPosts','getPost') AND json_extract(data, '$.status') = 'queued' ORDER BY id").all() as { id: number; data: string }[];
     const now = Date.now();
     let wakeAt = Infinity;
     const row = rows.find((candidate) => {
@@ -498,13 +637,19 @@ if (Bun.argv[2] === "--service-daemon") {
     browserBusy = true;
     const ws = extensionSocket;
     const id = randomBytes(16).toString("hex");
-    const finish = (reply: unknown) => {
+    const finish = async (reply: unknown) => {
       const halt = reply && typeof reply === "object" && "halt" in reply ? (reply as { halt: { code: string; reason: string } }).halt : null;
       const error = reply && typeof reply === "object" && "error" in reply ? String((reply as { error: unknown }).error) : null;
       if (halt) { halted = halt; job.status = "failed"; job.error = halt; }
       else if (error === "Extension disconnected") { job.status = "queued"; }
       else if (error) { job.status = "failed"; job.error = error; }
-      else { job.status = "done"; job.result = reply; }
+      else {
+        let finalResult = reply;
+        if (job.action === "getPost" && job.args?.download) {
+          try { finalResult = await downloadPostMedia(reply, job.args.url); } catch {}
+        }
+        job.status = "done"; job.result = finalResult;
+      }
       try {
         db.transaction(() => {
           if (halt) db.query("INSERT INTO service_state (key, value) VALUES ('halted', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").run(JSON.stringify(halt));
@@ -669,7 +814,7 @@ if (Bun.argv[2] === "--service-daemon") {
   } else if (Bun.argv[2] === "contacts") {
     console.log("Usage: socmedia contacts <list|update|export> [options]\n\nCommands:\n  list              List locally stored contacts\n  update <id>       Update a contact by its ID; provide --status and/or --note\n  export            Export filtered contacts to a file inside home\n\nOptions:\n  --status STATUS   Filter list/export or set status: new, messaged, replied, won, rejected, skip\n  --platform NAME   Filter list/export by ig or fb\n  --note TEXT       Set note on update (maximum 2000 characters; empty clears it)\n  --format FORMAT   Export as csv, json or jsonl (default: csv)\n  --path PATH       Export destination inside home (default: ~/socmedia-data/contacts-<date>.<format>)\n  --json            Print the command result as JSON\n  --help            Show this help message\n\nInstagram and Facebook profile reads populate contacts; import is not implemented yet.");
   } else if (Bun.argv[2] === "post") {
-    console.log("Usage: socmedia post comments <url> [--limit N] [--json]\n\nCommands:\n  comments <url>  Read Instagram or Facebook post comments\n\nOptions:\n  --limit N       Maximum comments, 1-500 (default: 20)\n  --json          Print the result as JSON\n  --help          Show this help message\n\nExpands available comments through Chrome debugger and reads visible English UI; results may be incomplete.");
+    console.log("Usage: socmedia post <get|comments> <url> [options]\n\nCommands:\n  get <url>       Read a post from Instagram or Facebook\n  comments <url>  Read Instagram or Facebook post comments\n\nOptions:\n  --download      With get, download media files to ~/socmedia-data\n  --slides        Alias for --download\n  --limit N       With comments, maximum comments from 1 to 500 (default: 20)\n  --json          Print the result as JSON\n  --help          Show this help message\n\nExpands available comments through Chrome debugger and reads visible English UI; results may be incomplete.");
   } else if (Bun.argv[2] === "page") {
     console.log("Usage: socmedia page <read|snapshot> [options]\n\nCommands:\n  read            Queue and return visible page text and URL\n  snapshot        Queue and return visible interactive elements\n\nOptions:\n  --max-lines N   With read, limit output to 1-1000 lines (default: 200)\n  --json          Print the result as JSON\n  --help          Show this help message");
   } else if (Bun.argv[2] === "config") {
@@ -679,6 +824,18 @@ if (Bun.argv[2] === "--service-daemon") {
   } else {
     console.log("Usage: socmedia [options]\n\nCommands:\n  service    Start or inspect the local service\n  queue      Inspect the service queue\n  extension  Pair the Chrome extension\n  tabs       Inspect extension work tabs\n  page       Inspect the work page\n  post       Inspect a social post\n  profile    Read a social profile\n  contacts   List local contacts\n  config     Configure the service\n\nOptions:\n  --version  Show the CLI version\n  --help     Show this help message");
   }
+} else if (Bun.argv[2] === "post" && Bun.argv[3] === "get") {
+  try {
+    const url = postUrl(Bun.argv[4]);
+    const args: { url: string; download?: boolean } = { url };
+    for (let i = 5; i < Bun.argv.length; i++) {
+      const option = Bun.argv[i];
+      if (option === "--json") continue;
+      if (option === "--download" || option === "--slides") args.download = true;
+      else throw new Error(`Unknown post option: ${option}`);
+    }
+    console.log(JSON.stringify(await runPageJob("getPost", args)));
+  } catch (error) { console.error(error instanceof Error ? error.message : String(error)); process.exitCode = 1; }
 } else if (Bun.argv[2] === "post" && Bun.argv[3] === "comments") {
   try {
     const url = postUrl(Bun.argv[4]);
@@ -874,3 +1031,5 @@ if (Bun.argv[2] === "--service-daemon") {
   }
   catch (error) { console.error(error instanceof Error ? error.message : String(error)); process.exitCode = 1; }
 }
+
+export { isPrivateHost, isMediaHost, mediaExt, safeSeg, postId, postDir, downloadPostMedia };

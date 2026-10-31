@@ -8,10 +8,10 @@ socmedia (CLI)  --HTTP+токен-->  локальний сервіс (Bun)  --W
 
 Сервіс — єдиний власник черги (SQLite), стану зупинки (HALT), відновлення завдань та з'єднання з розширенням.
 
-> **Статус реалізації (v0.6.0):**
-> - Реалізовано й перевірено автоматичними тестами: життєвий цикл сервісу, SQLite-черга з відновленням незавершених завдань після перезапуску та обриву WebSocket, сполучення розширення (HMAC-SHA256, фіксований ID), керування вкладками (`tabs list|use|clear`), читання сторінки й snapshot (`page read|snapshot`), читання профілів Instagram і Facebook (`profile get`), читання списку постів профілю (`profile posts`), локальні контакти (`contacts list|update|export`), коментарі до постів Instagram та Facebook (`post comments`).
+> **Статус реалізації (v0.7.0):**
+> - Реалізовано й перевірено автоматичними тестами: життєвий цикл сервісу, SQLite-черга з відновленням незавершених завдань після перезапуску та обриву WebSocket, сполучення розширення (HMAC-SHA256, фіксований ID), керування вкладками (`tabs list|use|clear`), читання сторінки й snapshot (`page read|snapshot`), читання профілів Instagram і Facebook (`profile get`), читання списку постів профілю (`profile posts`), деталі постів Instagram і Facebook із завантаженням медіа (`post get` з `--download`/`--slides`), локальні контакти (`contacts list|update|export`), коментарі до постів Instagram та Facebook (`post comments`).
 > - **Не перевірено наживо:** живий Chrome, реальні сайти Instagram, Facebook та YouTube ще не перевірялися.
-> - **Ще не реалізовано:** завантаження постів/медіа (`post get --download`), скриншоти, повідомлення inbox, YouTube через Studio UI.
+> - **Ще не реалізовано:** скриншоти (`screenshot`), пошук (`search`), завантаження профілю (`profile download`), повідомлення inbox, YouTube через Studio UI.
 
 ## Швидкий старт
 

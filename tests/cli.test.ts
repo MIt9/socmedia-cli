@@ -8,6 +8,7 @@ import { createHash, createHmac, randomBytes, webcrypto } from "node:crypto";
 import packageInfo from "../package.json";
 import manifest from "../extension/manifest.json";
 import { Database } from "bun:sqlite";
+import { isPrivateHost, isMediaHost, mediaExt, safeSeg, postId, postDir } from "../src/cli";
 
 const projectVersion = packageInfo.version;
 
@@ -175,6 +176,204 @@ test("profile posts extraction uses real extension DOM logic with HALT checks", 
 
   tab.url = "https://www.facebook.com/checkpoint/";
   await expect(runInNewContext('getPosts({url:"https://www.facebook.com/samplepage/"})', contextFb)).rejects.toMatchObject({ code: "HALT" });
+});
+
+test("post get extraction uses real extension DOM logic with HALT checks", async () => {
+  const script = await Bun.file(new URL("../extension/background.js", import.meta.url)).text();
+  const stored: Record<string, unknown> = { cliSelectedTab: 42 };
+  const tab = { id: 42, windowId: 4, active: true, status: "complete", url: "https://www.instagram.com/p/Cx_123/" };
+  const location = { href: tab.url, pathname: "/p/Cx_123/", hostname: "www.instagram.com" };
+
+  const ogTitle = { content: "NASA on Instagram: \"Exploring the universe #space @astronaut\"" };
+  const ogDesc = { content: "10K likes, 500 comments - nasa on October 21, 2026: \"Exploring the universe #space @astronaut\"" };
+  const timeEl = { getAttribute: (attr: string) => attr === "datetime" ? "2026-10-21T18:00:00Z" : null };
+  const imgEl = { clientWidth: 400, src: "https://cdn.example/post.jpg", currentSrc: "https://cdn.example/post.jpg", alt: "Nebula view", closest: () => null };
+
+  const documentIg = {
+    body: { innerText: "" },
+    querySelector: (sel: string) => {
+      if (sel === 'meta[property="og:title"]') return ogTitle;
+      if (sel === 'meta[property="og:description"]') return ogDesc;
+      if (sel === 'time[datetime]') return timeEl;
+      if (sel === 'main h1') return { innerText: "Exploring the universe #space @astronaut" };
+      return null;
+    },
+    querySelectorAll: (sel: string) => {
+      if (sel.includes("main img")) return [imgEl];
+      return [];
+    },
+  };
+
+  const ignore = { addListener() {} };
+  const chrome = {
+    storage: { local: { get: async (keys: string | string[]) => Object.fromEntries((Array.isArray(keys) ? keys : [keys]).map((key) => [key, stored[key]])), set: async (values: Record<string, unknown>) => Object.assign(stored, values) }, onChanged: ignore },
+    tabs: { get: async () => tab, query: async () => [], update: async (_id: number, values: { url?: string }) => { if (values.url) { tab.url = values.url; location.href = values.url; location.pathname = new URL(values.url).pathname; } } },
+    tabGroups: { query: async () => [] }, windows: { get: async () => ({ state: "normal" }) },
+    scripting: { executeScript: async ({ func, args = [] }: any) => [{ result: func(...args) }] },
+    alarms: { create() {}, onAlarm: ignore }, runtime: { onStartup: ignore },
+  };
+
+  const contextIg = { chrome, WebSocket, console, URL, document: documentIg, location, setTimeout: (fn: () => void, ms?: number) => { if ((ms ?? 0) < 10000) { fn(); return 0; } return setTimeout(fn, ms); }, clearTimeout: (id: any) => clearTimeout(id), Date, Math };
+  runInNewContext(script, contextIg);
+  const resultIg = await runInNewContext('getPost({url:"https://www.instagram.com/p/Cx_123/"})', contextIg);
+  expect(resultIg).toMatchObject({
+    platform: "ig",
+    url: "https://www.instagram.com/p/Cx_123/",
+    author: { username: "nasa", name: "NASA" },
+    caption: "Exploring the universe #space @astronaut",
+    date: "2026-10-21T18:00:00Z",
+    likes: 10000,
+    commentsCount: 500,
+    hashtags: ["space"],
+    mentions: ["astronaut"],
+    media: [{ type: "image", url: "https://cdn.example/post.jpg" }],
+  });
+
+  const fbAuthor = { innerText: "Sample Page", href: "https://www.facebook.com/samplepage?id=1", closest: () => null, querySelector: () => null };
+  const fbMsg = { innerText: "Facebook post caption #news" };
+  const fbImg = { width: 400, src: "https://cdn.example/fbpost.jpg", currentSrc: "https://cdn.example/fbpost.jpg", closest: () => null };
+  const documentFb = {
+    body: { innerText: "" },
+    querySelector: (sel: string) => sel.includes("message") ? fbMsg : null,
+    querySelectorAll: (sel: string) => {
+      if (sel === '[role=dialog]') return [];
+      if (sel.includes("h2 a")) return [fbAuthor];
+      if (sel.includes("img[src]")) return [fbImg];
+      if (sel.includes("span[dir")) return [{ innerText: "Facebook post caption #news", closest: () => null }, { innerText: "50", closest: () => null }, { innerText: "12", closest: () => null }];
+      return [];
+    },
+  };
+  tab.url = "https://www.facebook.com/samplepage/posts/123456789/";
+  location.href = tab.url;
+  location.pathname = "/samplepage/posts/123456789/";
+  location.hostname = "www.facebook.com";
+  const contextFb = { chrome, WebSocket, console, URL, document: documentFb, location, setTimeout: (fn: () => void, ms?: number) => { if ((ms ?? 0) < 10000) { fn(); return 0; } return setTimeout(fn, ms); }, clearTimeout: (id: any) => clearTimeout(id), Date, Math };
+  runInNewContext(script, contextFb);
+  const resultFb = await runInNewContext('getPost({url:"https://www.facebook.com/samplepage/posts/123456789/"})', contextFb);
+  expect(resultFb).toMatchObject({
+    platform: "fb",
+    url: "https://www.facebook.com/samplepage/posts/123456789/",
+    author: { username: "samplepage", name: "Sample Page" },
+    caption: "Facebook post caption #news",
+    likes: 50,
+    commentsCount: 12,
+    hashtags: ["news"],
+    media: [{ type: "image", url: "https://cdn.example/fbpost.jpg" }],
+  });
+
+  tab.url = "https://www.facebook.com/checkpoint/";
+  await expect(runInNewContext('getPost({url:"https://www.facebook.com/samplepage/posts/123456789/"})', contextFb)).rejects.toMatchObject({ code: "HALT" });
+});
+
+test("post get validates post URL and returns queued result", async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), "socmedia-post-get-"));
+  const run = async (...args: string[]) => {
+    const cli = Bun.spawn(["bun", "run", "src/cli.ts", ...args], { cwd: import.meta.dir + "/..", env: { ...process.env, SOCMEDIA_STATE_DIR: stateDir, SOCMEDIA_EXTENSION_PORT: "0" }, stdout: "pipe", stderr: "pipe" });
+    const [stdout, stderr, exit] = await Promise.all([new Response(cli.stdout).text(), new Response(cli.stderr).text(), cli.exited]); return { stdout, stderr, exit };
+  };
+  let pid: number | undefined; let ws: WebSocket | undefined;
+  try {
+    const help = await run("post", "--help"); expect(help.stdout).toContain("get <url>"); expect(help.stdout).toContain("comments <url>"); expect(help.stdout).toContain("--json");
+    for (const args of [["https://instagram.com/sample/"], ["https://facebook.com/sample/"], ["https://instagram.com.evil.test/p/123/"]]) {
+      expect((await run("post", "get", ...args, "--json")).exit).not.toBe(0);
+    }
+    const id = "g".repeat(32);
+    const pairing = JSON.parse((await run("extension", "pair", "--id", id, "--json")).stdout);
+    const started = JSON.parse((await run("service", "start", "--json")).stdout); pid = started.pid;
+    ws = new WebSocket(`ws://127.0.0.1:${started.extension.port}/extension`, { headers: { Origin: `chrome-extension://${id}` } } as unknown as string[]);
+    await authenticateMock(ws, pairing.token);
+    const expected = { platform: "ig", url: "https://www.instagram.com/p/Cx_123/", author: { username: "nasa" }, caption: "Exploring #space", media: [] };
+    ws.onmessage = (event) => { const request = JSON.parse(String(event.data)); expect(request).toMatchObject({ action: "getPost", args: { url: "https://www.instagram.com/p/Cx_123/" } }); ws!.send(JSON.stringify({ type: "result", id: request.id, result: expected })); };
+    const result = await run("post", "get", "https://instagram.com/p/Cx_123/?ignored=yes", "--json");
+    expect(result.exit).toBe(0); expect(JSON.parse(result.stdout)).toEqual(expected);
+    const jobs = JSON.parse((await run("queue", "list", "--json")).stdout).jobs;
+    expect(jobs[0]).toMatchObject({ action: "getPost", status: "done", result: expected });
+  } finally {
+    ws?.close(); if (pid) { try { process.kill(pid, "SIGTERM"); } catch {} for (let i = 0; i < 100; i++) { try { process.kill(pid, 0); } catch { break; } await Bun.sleep(20); } }
+    await rm(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("post get with --download downloads media files and writes post.json inside home", async () => {
+  const fakeHome = await mkdtemp(join(tmpdir(), "socmedia-home-"));
+  const stateDir = await mkdtemp(join(tmpdir(), "socmedia-post-dl-"));
+  const run = async (...args: string[]) => {
+    const cli = Bun.spawn(["bun", "run", "src/cli.ts", ...args], { cwd: import.meta.dir + "/..", env: { ...process.env, HOME: fakeHome, SOCMEDIA_STATE_DIR: stateDir, SOCMEDIA_EXTENSION_PORT: "0" }, stdout: "pipe", stderr: "pipe" });
+    const [stdout, stderr, exit] = await Promise.all([new Response(cli.stdout).text(), new Response(cli.stderr).text(), cli.exited]); return { stdout, stderr, exit };
+  };
+  let pid: number | undefined; let ws: WebSocket | undefined;
+  try {
+    const id = "g".repeat(32);
+    const pairing = JSON.parse((await run("extension", "pair", "--id", id, "--json")).stdout);
+    const started = JSON.parse((await run("service", "start", "--json")).stdout); pid = started.pid;
+    ws = new WebSocket(`ws://127.0.0.1:${started.extension.port}/extension`, { headers: { Origin: `chrome-extension://${id}` } } as unknown as string[]);
+    await authenticateMock(ws, pairing.token);
+    const postData = {
+      platform: "ig",
+      url: "https://www.instagram.com/p/Cx_123/",
+      author: { username: "nasa" },
+      caption: "Space post",
+      media: [
+        { type: "image", url: "https://evil.example/malicious.jpg" },
+        { type: "image", url: "https://127.0.0.1/private.png" },
+      ],
+    };
+    ws.onmessage = (event) => {
+      const request = JSON.parse(String(event.data));
+      expect(request).toMatchObject({ action: "getPost", args: { url: "https://www.instagram.com/p/Cx_123/", download: true } });
+      ws!.send(JSON.stringify({ type: "result", id: request.id, result: postData }));
+    };
+    const result = await run("post", "get", "https://instagram.com/p/Cx_123/", "--download", "--json");
+    expect(result.exit).toBe(0);
+    const parsed = JSON.parse(result.stdout);
+    expect(parsed.media[0].path).toBeNull();
+    expect(parsed.media[0].error).toMatch(/Refusing/);
+    expect(parsed.media[1].path).toBeNull();
+    expect(parsed.media[1].error).toMatch(/Refusing/);
+
+    const postDir = join(fakeHome, "socmedia-data", "ig", "nasa");
+    const entries = await readdir(postDir);
+    expect(entries.length).toBe(1);
+    const postFolder = join(postDir, entries[0]);
+    const files = await readdir(postFolder);
+    expect(files).toContain("post.json");
+    const savedPost = JSON.parse(await Bun.file(join(postFolder, "post.json")).text());
+    expect(savedPost.caption).toBe("Space post");
+  } finally {
+    ws?.close(); if (pid) { try { process.kill(pid, "SIGTERM"); } catch {} for (let i = 0; i < 100; i++) { try { process.kill(pid, 0); } catch { break; } await Bun.sleep(20); } }
+    await rm(stateDir, { recursive: true, force: true });
+    await rm(fakeHome, { recursive: true, force: true });
+  }
+});
+
+test("media helpers validate magic bytes, hosts and paths safely", () => {
+  expect(isMediaHost("scontent.cdninstagram.com")).toBe(true);
+  expect(isMediaHost("scontent.xx.fbcdn.net")).toBe(true);
+  expect(isMediaHost("evil.example")).toBe(false);
+  expect(isMediaHost("cdninstagram.com.evil.example")).toBe(false);
+  expect(isMediaHost("localhost")).toBe(false);
+
+  expect(isPrivateHost("localhost")).toBe(true);
+  expect(isPrivateHost("sub.local")).toBe(true);
+  expect(isPrivateHost("127.0.0.1")).toBe(true);
+  expect(isPrivateHost("10.0.0.1")).toBe(true);
+  expect(isPrivateHost("192.168.1.1")).toBe(true);
+  expect(isPrivateHost("172.16.0.1")).toBe(true);
+  expect(isPrivateHost("[::1]")).toBe(true);
+  expect(isPrivateHost("scontent.cdninstagram.com")).toBe(false);
+
+  expect(mediaExt(Buffer.from("ffd8ffe000104a4649460001", "hex"))).toBe("jpg");
+  expect(mediaExt(Buffer.from("89504e470d0a1a0a0000000d", "hex"))).toBe("png");
+  expect(mediaExt(Buffer.concat([Buffer.from("RIFF"), Buffer.alloc(4), Buffer.from("WEBPVP8 "), Buffer.alloc(8)]))).toBe("webp");
+  expect(mediaExt(Buffer.concat([Buffer.alloc(4), Buffer.from("ftypisom"), Buffer.alloc(8)]))).toBe("mp4");
+  expect(mediaExt(Buffer.concat([Buffer.alloc(4), Buffer.from("ftypavif"), Buffer.alloc(8)]))).toBeNull();
+  expect(mediaExt(Buffer.from("4749463839610100", "hex"))).toBeNull();
+  expect(mediaExt(Buffer.from("short"))).toBeNull();
+
+  expect(safeSeg("John.Doe-123_456")).toBe("john.doe-123_456");
+  expect(safeSeg("../../../evil")).toBe("evil");
+  expect(postId("https://www.instagram.com/p/Cx_123/")).toMatch(/^Cx_123/);
+  expect(postId("https://www.facebook.com/sample/posts/123456789/")).toBe("123456789");
 });
 
 test("profile posts validates profile URL and limit and returns queued result", async () => {
@@ -1031,7 +1230,7 @@ test("an interrupted readPage recovers on service restart and persists extension
       await authenticateMock(socket, pairing.token); return { socket, request };
     };
     let link = await connect(); ws = link.socket;
-    const inert = await run("queue", "enqueue", "getPost", "--args", "{}", "--json");
+    const inert = await run("queue", "enqueue", "search", "--args", "{}", "--json");
     const job = await run("queue", "enqueue", "readPage", "--json");
     await Promise.race([link.request, Bun.sleep(1500).then(() => { throw new Error("request timeout"); })]);
     expect((await run("queue", "get", String(inert.id), "--json")).status).toBe("queued");
@@ -1370,7 +1569,7 @@ test("enqueue keys are idempotent across restarts and reject conflicting jobs", 
     expect((await run("service", "stop", "--json")).exit).toBe(0);
     pid = JSON.parse((await run("service", "start", "--json")).stdout).pid;
     expect(JSON.parse((await run(...params)).stdout)).toEqual(job);
-    const differentAction = await run("queue", "enqueue", "getPost", "--args", '{"url":"https://www.instagram.com/example/"}', "--key", "same", "--json");
+    const differentAction = await run("queue", "enqueue", "getPost", "--args", '{"url":"https://www.instagram.com/p/ExamplePost/"}', "--key", "same", "--json");
     expect(differentAction.exit).not.toBe(0);
     expect(differentAction.stderr).toContain("key conflict");
     const differentArgs = await run("queue", "enqueue", "getProfile", "--args", '{"url":"https://www.instagram.com/other/"}', "--key", "same", "--json");
