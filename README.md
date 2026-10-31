@@ -122,3 +122,7 @@ mkdir -p ~/.claude/skills/socmedia-cli-usage && cp skills/socmedia-cli-usage/SKI
 - `socmedia youtube <channel|studio status|upload>` — робота з дозволеними каналами YouTube Studio.
 - `socmedia contacts <list|update|export|import>` — керування базою контактів, зміна статусу/нотаток, імпорт зі спадку та експорт у CSV/JSON/JSONL.
 - `socmedia browser <click|scroll>` — прямі взаємодії з сторінкою (клік по елементу чи скрол).
+
+## Розробка
+
+Як влаштовано диспетчер команд, як додати команду, платформу чи дію розширення (чекліст, генератор `bun scripts/new-command.ts <name>`) — у [CONTRIBUTING.md](CONTRIBUTING.md).

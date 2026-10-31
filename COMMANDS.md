@@ -36,6 +36,7 @@
 | — | `socmedia update` | `--check`, `--json`, `--text`; env `SOCMEDIA_CLI_UPDATE_URL` (база `latest.json`, https або localhost) | Читає `latest.json`; `--check` лише порівнює версії. Без `--check`: відмовляє за наявності завдання `running`; завантажує й звіряє sha256 бінарника та розширення до будь-яких змін; бінарник замінюється атомарно (попередній — `<binary>.old`), `~/.socmedia-cli/extension` оновлюється (попередня — `extension.bak`), і лише після успіху сервіс перезапускається, а розширення отримує `{type:"reload"}`. Результат: `{ updated, binary, extension, service, extensionReload }`. |
 | — | `socmedia service status` | `--json`, `--text` | Стан сервісу + `extensionUrl`, `extensionId`, `extensionPinned`, `pinnedId`, порт; при конфлікті `portInUse`, `ownerPid`, `hint`. `PORT_IN_USE` = код виходу 8 (JSON-помилка містить `port`, `ownerPid`). |
 | — | `socmedia config` | `get\|set\|unset port [value]` | Перегляд, збереження або скидання фіксованого порту сервісу у `~/.socmedia-cli/config.json`. |
+| — | `socmedia extension` | `install [--open]`, `path`, `pair --id ID` | `install` копіює вбудоване розширення в `~/.socmedia-cli/extension` і друкує кроки для Chrome (`--open` відкриває `chrome://extensions` на macOS); `path` показує каталог; `pair` генерує секрет парування (виводиться з `--json`, це чутливі дані). |
 | — | `socmedia service resume` | `--json`, `--text` | Зняття статусу HALT після вирішення чекпоінту або авторизації в Chrome та відновлення черги. |
 
 ## YouTube через розширення
