@@ -16,3 +16,5 @@ coverage/
 *.key
 extension-pairing.json
 .socmedia-cli/
+bin/
+
