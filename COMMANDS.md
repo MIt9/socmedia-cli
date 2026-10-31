@@ -21,8 +21,8 @@
 | `social_export` | `socmedia contacts export` | `--status`, `--platform`, `--format csv\|json\|jsonl`, `--path`, `--json` | Реалізовано: шлях і кількість експортованих контактів; файл лише всередині home, символічні посилання на шляху відхиляються. |
 | `social_snapshot` | `socmedia page snapshot` | `--json` | Інтерактивні елементи вкладки з індексами; реалізовано, живий Chrome не перевірено. |
 | `social_read_page` | `socmedia page read` | `--max-lines` (1–1000, типово 200), `--json` | URL і видимий текст сторінки; реалізовано, живий Chrome не перевірено. |
-| `social_click` | `socmedia browser click` | один із `--index`, `--selector`, `--text` | Результат кліку; повторення при невизначеному результаті заборонено. |
-| `social_scroll` | `socmedia browser scroll` | `--selector`, `--times` | Результат прокрутки. |
+| `social_click` | `socmedia browser click` | один із `--index`, `--selector`, `--text` | Реалізовано: клік по інтерактивному елементу за його індексом зі snapshot, CSS-селектором або видимим текстом; повторення при невизначеному результаті заборонено. |
+| `social_scroll` | `socmedia browser scroll` | `--selector`, `--times` | Реалізовано: прокручування вниз робочої сторінки або контейнера (`--times` від 1 до 20, дефолт 3). |
 | `social_tabs` | `socmedia tabs list` | — | Вкладки робочої групи, поточна та вибрана вкладка. |
 | `social_use_tab` | `socmedia tabs use ID` / `socmedia tabs clear` | ID вкладки або clear | Вибір вкладки або повернення до робочої групи. |
 | `social_enqueue` | `socmedia queue enqueue ACTION` | `--args JSON`, `--not-before`, `--key` | ID і стан завдання; повідомлення, публікація коментарів і завантаження відео не обходять окремі перевірки. |

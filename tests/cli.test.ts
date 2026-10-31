@@ -965,6 +965,72 @@ test("contacts import imports legacy contacts.jsonl and messages.jsonl idempoten
   }
 });
 
+test("browser click and scroll commands validate options and execute via queue", async () => {
+  const fakeHome = await mkdtemp(join(tmpdir(), "socmedia-browser-home-"));
+  const stateDir = await mkdtemp(join(tmpdir(), "socmedia-browser-state-"));
+  const run = async (...args: string[]) => {
+    const cli = Bun.spawn(["bun", "run", "src/cli.ts", ...args], {
+      cwd: import.meta.dir + "/..",
+      env: { ...process.env, HOME: fakeHome, SOCMEDIA_STATE_DIR: stateDir, SOCMEDIA_EXTENSION_PORT: "0" },
+      stdout: "pipe", stderr: "pipe",
+    });
+    const [stdout, stderr, exit] = await Promise.all([new Response(cli.stdout).text(), new Response(cli.stderr).text(), cli.exited]);
+    return { stdout, stderr, exit };
+  };
+
+  let pid: number | undefined;
+  let ws: WebSocket | undefined;
+  try {
+    const helpRes = await run("browser", "--help");
+    expect(helpRes.stdout).toContain("click");
+    expect(helpRes.stdout).toContain("scroll");
+
+    const id = "i".repeat(32);
+    const pairing = JSON.parse((await run("extension", "pair", "--id", id, "--json")).stdout);
+    const started = JSON.parse((await run("service", "start", "--json")).stdout);
+    pid = started.pid;
+    ws = new WebSocket(`ws://127.0.0.1:${started.extension.port}/extension`, { headers: { Origin: `chrome-extension://${id}` } } as unknown as string[]);
+    await authenticateMock(ws, pairing.token);
+
+    ws.onmessage = (event) => {
+      const request = JSON.parse(String(event.data));
+      if (request.action === "click") {
+        ws!.send(JSON.stringify({
+          type: "result", id: request.id,
+          result: { clicked: "Follow button" },
+        }));
+      } else if (request.action === "scroll") {
+        ws!.send(JSON.stringify({
+          type: "result", id: request.id,
+          result: { count: 15, height: 3500 },
+        }));
+      }
+    };
+
+    const clickRes = await run("browser", "click", "--selector", "button[name=follow]", "--json");
+    expect(clickRes.exit).toBe(0);
+    const parsedClick = JSON.parse(clickRes.stdout);
+    expect(parsedClick.clicked).toBe("Follow button");
+
+    const scrollRes = await run("browser", "scroll", "--times", "2", "--json");
+    expect(scrollRes.exit).toBe(0);
+    const parsedScroll = JSON.parse(scrollRes.stdout);
+    expect(parsedScroll.count).toBe(15);
+    expect(parsedScroll.height).toBe(3500);
+  } finally {
+    ws?.close();
+    if (pid) {
+      try { process.kill(pid, "SIGTERM"); } catch {}
+      for (let i = 0; i < 100; i++) {
+        try { process.kill(pid, 0); } catch { break; }
+        await Bun.sleep(20);
+      }
+    }
+    await rm(stateDir, { recursive: true, force: true });
+    await rm(fakeHome, { recursive: true, force: true });
+  }
+});
+
 test("screenshot command validates arguments, writes PNG file inside home, and records queued job", async () => {
   const fakeHome = await mkdtemp(join(tmpdir(), "socmedia-screenshot-home-"));
   const stateDir = await mkdtemp(join(tmpdir(), "socmedia-screenshot-state-"));
@@ -1889,7 +1955,7 @@ test("an interrupted readPage recovers on service restart and persists extension
       await authenticateMock(socket, pairing.token); return { socket, request };
     };
     let link = await connect(); ws = link.socket;
-    const inert = await run("queue", "enqueue", "scroll", "--args", "{}", "--json");
+    const inert = await run("queue", "enqueue", "inertTask", "--args", "{}", "--json");
     const job = await run("queue", "enqueue", "readPage", "--json");
     await Promise.race([link.request, Bun.sleep(1500).then(() => { throw new Error("request timeout"); })]);
     expect((await run("queue", "get", String(inert.id), "--json")).status).toBe("queued");

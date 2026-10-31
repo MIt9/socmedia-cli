@@ -128,7 +128,7 @@ const compatibleVersion = (version: string) => {
   const current = /^(\d+)\.(\d+)\.(\d+)$/.exec(extensionVersion);
   return !!requested && !!current && requested[1] === current[1] && requested[2] === current[2];
 };
-const actions = new Set(["getProfile", "getPosts", "getPost", "getComments", "search", "screenshot", "readInbox", "readThread", "sendMessage", "readPage", "snapshot", "scroll", "listTabs", "useTab", "ytStudioRead", "click", "downloadProfile"]);
+const actions = new Set(["getProfile", "getPosts", "getPost", "getComments", "search", "screenshot", "readInbox", "readThread", "sendMessage", "readPage", "snapshot", "scroll", "listTabs", "useTab", "ytStudioRead", "click", "downloadProfile", "inertTask"]);
 const contactStatuses = ["new", "messaged", "replied", "won", "rejected", "skip"];
 const contactColumns = ["id", "platform", "username", "name", "status", "followers", "following", "postsCount", "verified", "private", "isBusiness", "category", "website", "email", "phone", "bio", "url", "note", "firstSeen", "lastSeen", "updatedAt"];
 
@@ -719,6 +719,24 @@ function validateJob(value: unknown) {
     if (typeof args.studioUrl !== "string" || !args.studioUrl) throw new Error("studioUrl is required");
     if (args.open !== undefined && typeof args.open !== "boolean") throw new Error("open must be a boolean");
   }
+  if (job.action === "click") {
+    const args = job.args as Record<string, unknown>;
+    for (const key of Object.keys(args)) {
+      if (!["index", "selector", "text"].includes(key)) throw new Error(`Unknown click option: ${key}`);
+    }
+    if (args.index !== undefined && (!Number.isInteger(args.index) || Number(args.index) < 0)) throw new Error("click index must be a non-negative integer");
+    if (args.selector !== undefined && (typeof args.selector !== "string" || !args.selector)) throw new Error("click selector must be a nonempty string");
+    if (args.text !== undefined && (typeof args.text !== "string" || !args.text)) throw new Error("click text must be a nonempty string");
+    if (args.index === undefined && args.selector === undefined && args.text === undefined) throw new Error("click requires index, selector or text");
+  }
+  if (job.action === "scroll") {
+    const args = job.args as Record<string, unknown>;
+    for (const key of Object.keys(args)) {
+      if (!["selector", "times"].includes(key)) throw new Error(`Unknown scroll option: ${key}`);
+    }
+    if (args.selector !== undefined && (typeof args.selector !== "string" || !args.selector)) throw new Error("scroll selector must be a nonempty string");
+    if (args.times !== undefined && (!Number.isInteger(args.times) || Number(args.times) < 1 || Number(args.times) > 20)) throw new Error("scroll times must be an integer from 1 to 20");
+  }
   if (job.key !== undefined && (typeof job.key !== "string" || !job.key)) throw new Error("--key must be a nonempty string");
   if (job.notBefore !== undefined && (typeof job.notBefore !== "string" || !Number.isFinite(Date.parse(job.notBefore)))) throw new Error("--not-before must be a valid ISO date");
   return job;
@@ -820,7 +838,7 @@ async function queueRequest(command: string): Promise<unknown> {
   });
 }
 
-async function runPageJob(action: "snapshot" | "readPage" | "getProfile" | "getComments" | "getPosts" | "getPost" | "screenshot" | "search" | "readInbox" | "readThread" | "sendMessage" | "ytStudioRead", args: Record<string, unknown>): Promise<unknown> {
+async function runPageJob(action: "snapshot" | "readPage" | "getProfile" | "getComments" | "getPosts" | "getPost" | "screenshot" | "search" | "readInbox" | "readThread" | "sendMessage" | "ytStudioRead" | "click" | "scroll", args: Record<string, unknown>): Promise<unknown> {
   const current = await status();
   if (!current.running) throw new Error("Service not running");
   if (current.halted) {
@@ -882,7 +900,7 @@ if (Bun.argv[2] === "--service-daemon") {
   db.run("CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY, at TEXT NOT NULL, platform TEXT NOT NULL, toUrl TEXT NOT NULL, text TEXT NOT NULL, status TEXT NOT NULL, error TEXT, jobId INTEGER)");
   const haltRow = db.query("SELECT value FROM service_state WHERE key = 'halted'").get() as { value: string } | null;
   let halted: { code: string; reason: string } | null = haltRow ? JSON.parse(haltRow.value) : null;
-  db.run("UPDATE jobs SET data = json_set(data, '$.status', 'queued') WHERE json_extract(data, '$.action') IN ('readPage','snapshot','getProfile','getComments','getPosts','getPost','screenshot','search','downloadProfile','readInbox','readThread','sendMessage','ytStudioRead') AND json_extract(data, '$.status') = 'running'");
+  db.run("UPDATE jobs SET data = json_set(data, '$.status', 'queued') WHERE json_extract(data, '$.action') IN ('readPage','snapshot','getProfile','getComments','getPosts','getPost','screenshot','search','downloadProfile','readInbox','readThread','sendMessage','ytStudioRead','click','scroll') AND json_extract(data, '$.status') = 'running'");
   type ExtensionData = { token: string; challenge?: { clientNonce: string; serverNonce: string; version: string } };
   let extensionSocket: Bun.ServerWebSocket<ExtensionData> | null = null;
   let connectedVersion: string | null = null;
@@ -987,7 +1005,7 @@ if (Bun.argv[2] === "--service-daemon") {
       })();
     }
     if (browserBusy) return;
-    const rows = db.query("SELECT id, data FROM jobs WHERE json_extract(data, '$.action') IN ('readPage','snapshot','getProfile','getComments','getPosts','getPost','screenshot','search','readInbox','readThread','sendMessage','ytStudioRead') AND json_extract(data, '$.status') = 'queued' ORDER BY id").all() as { id: number; data: string }[];
+    const rows = db.query("SELECT id, data FROM jobs WHERE json_extract(data, '$.action') IN ('readPage','snapshot','getProfile','getComments','getPosts','getPost','screenshot','search','readInbox','readThread','sendMessage','ytStudioRead','click','scroll') AND json_extract(data, '$.status') = 'queued' ORDER BY id").all() as { id: number; data: string }[];
     const row = rows.find((candidate) => {
       const job = JSON.parse(candidate.data);
       const at = job.notBefore ? Date.parse(job.notBefore) : 0;
@@ -1343,8 +1361,10 @@ if (Bun.argv[2] === "--service-daemon") {
     console.log("Usage: socmedia message send --to URL --text TEXT [--confirm] [--json]\n\nCommands:\n  send              Send a direct message via Instagram or Facebook\n\nOptions:\n  --to URL          Recipient profile or direct thread URL\n  --text TEXT       Message content (max 1000 characters)\n  --confirm         Confirm send; without this flag, returns a dry-run preview\n  --json            Print the result as JSON\n  --help            Show this help message\n\nDirect messaging enforces daily caps (SOCMEDIA_MAX_MESSAGES_PER_DAY), 7-day duplicate protection, and automated slot pacing.");
   } else if (Bun.argv[2] === "youtube") {
     console.log("Usage: socmedia youtube <channel|studio status|upload|video update> [options]\n\nCommands:\n  channel           Inspect the configured YouTube channel allowlist\n  studio status     Read YouTube Studio tab state and verify against allowlist\n  upload FILE       Upload video to YouTube Studio (draft private video)\n  video update ID   Update video metadata (title, description, privacy)\n\nOptions:\n  --channel KEY     Channel key from youtube.json allowlist\n  --open            With studio status, navigate to Studio URL\n  --title TEXT      Video title\n  --description TXT Video description\n  --privacy PRIV    Video privacy: private, unlisted, public\n  --confirm         Confirm write action; without this flag, returns preview\n  --json            Print the result as JSON\n  --help            Show this help message\n\nChannel allowlist is configured in ~/.socmedia-cli/youtube.json.");
+  } else if (Bun.argv[2] === "browser") {
+    console.log("Usage: socmedia browser <click|scroll> [options]\n\nCommands:\n  click             Click an interactive element by index, selector or text\n  scroll            Scroll page or container down\n\nOptions:\n  --index N         Element index from snapshot\n  --selector SEL    CSS selector to target\n  --text TEXT       Visible text of element to click\n  --times N         Number of times to scroll (1-20, default: 3)\n  --json            Print the result as JSON\n  --help            Show this help message");
   } else {
-    console.log("Usage: socmedia [options]\n\nCommands:\n  service    Start or inspect the local service\n  queue      Inspect the service queue\n  extension  Pair the Chrome extension\n  tabs       Inspect extension work tabs\n  page       Inspect the work page\n  screenshot Take a screenshot of the work page\n  search     Search on Instagram or Facebook\n  post       Inspect a social post\n  profile    Read a social profile\n  contacts   List local contacts\n  inbox      List and read inbox threads\n  message    Send direct messages\n  youtube    Manage YouTube Studio and channels\n  config     Configure the service\n\nOptions:\n  --version  Show the CLI version\n  --help     Show this help message");
+    console.log("Usage: socmedia [options]\n\nCommands:\n  service    Start or inspect the local service\n  queue      Inspect the service queue\n  extension  Pair the Chrome extension\n  tabs       Inspect extension work tabs\n  page       Inspect the work page\n  browser    Interact with page via click or scroll\n  screenshot Take a screenshot of the work page\n  search     Search on Instagram or Facebook\n  post       Inspect a social post\n  profile    Read a social profile\n  contacts   List local contacts\n  inbox      List and read inbox threads\n  message    Send direct messages\n  youtube    Manage YouTube Studio and channels\n  config     Configure the service\n\nOptions:\n  --version  Show the CLI version\n  --help     Show this help message");
   }
 } else if (Bun.argv[2] === "post" && Bun.argv[3] === "get") {
   try {
@@ -1868,6 +1888,47 @@ if (Bun.argv[2] === "--service-daemon") {
     } else {
       console.log(JSON.stringify({ channel: ch, uploaded: true, note: "Studio upload confirmed" }));
     }
+  } catch (error) { console.error(error instanceof Error ? error.message : String(error)); process.exitCode = 1; }
+} else if (Bun.argv[2] === "browser" && Bun.argv[3] === "click") {
+  try {
+    const args: { index?: number; selector?: string; text?: string } = {};
+    for (let i = 4; i < Bun.argv.length; i++) {
+      const option = Bun.argv[i];
+      if (option === "--json") continue;
+      if (option === "--index") {
+        const val = Bun.argv[++i];
+        if (!val || !/^\d+$/.test(val)) throw new Error("--index must be a non-negative integer");
+        args.index = Number(val);
+      } else if (option === "--selector") {
+        const val = Bun.argv[++i];
+        if (!val) throw new Error("Missing value for --selector");
+        args.selector = val;
+      } else if (option === "--text") {
+        const val = Bun.argv[++i];
+        if (!val) throw new Error("Missing value for --text");
+        args.text = val;
+      } else throw new Error(`Unknown browser click option: ${option}`);
+    }
+    if (args.index === undefined && args.selector === undefined && args.text === undefined) throw new Error("Provide --index, --selector or --text");
+    console.log(JSON.stringify(await runPageJob("click", args)));
+  } catch (error) { console.error(error instanceof Error ? error.message : String(error)); process.exitCode = 1; }
+} else if (Bun.argv[2] === "browser" && Bun.argv[3] === "scroll") {
+  try {
+    const args: { selector?: string; times?: number } = {};
+    for (let i = 4; i < Bun.argv.length; i++) {
+      const option = Bun.argv[i];
+      if (option === "--json") continue;
+      if (option === "--selector") {
+        const val = Bun.argv[++i];
+        if (!val) throw new Error("Missing value for --selector");
+        args.selector = val;
+      } else if (option === "--times") {
+        const val = Bun.argv[++i];
+        if (!val || !/^[1-9]\d*$/.test(val) || Number(val) > 20) throw new Error("--times must be an integer from 1 to 20");
+        args.times = Number(val);
+      } else throw new Error(`Unknown browser scroll option: ${option}`);
+    }
+    console.log(JSON.stringify(await runPageJob("scroll", args)));
   } catch (error) { console.error(error instanceof Error ? error.message : String(error)); process.exitCode = 1; }
 } else if (Bun.argv[2] === "queue" && (Bun.argv[3] === "get" || Bun.argv[3] === "cancel")) {
   try {

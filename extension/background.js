@@ -1142,6 +1142,63 @@ async function snapshot() {
   return execution?.result || [];
 }
 
+function pgClick(spec, interactive) {
+  const vis = (e) => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+  const name = (e) => (e.getAttribute("aria-label") || e.innerText || "").replace(/\s+/g, " ").trim();
+  let el = null;
+  for (const s of spec.selectors || []) {
+    el = [...document.querySelectorAll(s)].find(vis);
+    if (el) break;
+  }
+  if (!el && spec.text) {
+    const t = spec.text.toLowerCase();
+    const all = [...document.querySelectorAll(interactive)].filter(vis);
+    el = all.find((e) => name(e).toLowerCase() === t) || all.find((e) => name(e).toLowerCase().includes(t));
+  }
+  if (!el && spec.index != null) el = [...document.querySelectorAll(interactive)].filter(vis)[spec.index];
+  if (!el) return null;
+  el.click();
+  return name(el).slice(0, 80);
+}
+
+function pgScroll(sel) {
+  let el = sel ? document.querySelector(sel) : null;
+  while (el && !(el.scrollHeight > el.clientHeight + 5 && /auto|scroll/.test(getComputedStyle(el).overflowY))) el = el.parentElement;
+  const box = el || document.scrollingElement || document.documentElement || document.body;
+  if (box) box.scrollTop += 500;
+  return {
+    count: document.querySelectorAll("article, [role=article], [data-testid=post]").length,
+    height: box?.scrollHeight || 0,
+  };
+}
+
+async function clickTool({ index, selector, text }) {
+  const tab = await safeWorkTab();
+  const interactive = 'a,button,input,textarea,[role=button],[role=tab],[role=menuitem],[role=menuitemradio],[role=option],[role=link],[contenteditable=true]';
+  const [execution] = await chrome.scripting.executeScript({
+    target: { tabId: tab.id },
+    func: pgClick,
+    args: [{ selectors: selector ? [selector] : [], text, index }, interactive],
+  });
+  if (execution?.result == null) throw new Error("Element not found");
+  return { clicked: execution.result };
+}
+
+async function scrollTool({ selector, times = 3 }) {
+  const tab = await safeWorkTab();
+  let res = { count: 0, height: 0 };
+  for (let i = 0; i < times; i++) {
+    const [execution] = await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      func: pgScroll,
+      args: [selector || "[role=feed]"],
+    });
+    if (execution?.result) res = execution.result;
+    await new Promise((r) => setTimeout(r, 200));
+  }
+  return res;
+}
+
 async function connect() {
   if (socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)) return;
   const epoch = ++connectEpoch;
@@ -1174,9 +1231,9 @@ async function connect() {
       } else if (message.type === "hello" && verified) {
         authenticated = message.compatible === true;
         if (!authenticated) console.warn("Socmedia service version is incompatible", message.version);
-      } else if (authenticated && message.type === "request" && (message.action === "tabs.list" || message.action === "tabs.use" || message.action === "readPage" || message.action === "snapshot" || message.action === "getProfile" || message.action === "getComments" || message.action === "getPosts" || message.action === "getPost" || message.action === "screenshot" || message.action === "search" || message.action === "readInbox" || message.action === "readThread" || message.action === "sendMessage" || message.action === "ytStudioRead")) {
+      } else if (authenticated && message.type === "request" && (message.action === "tabs.list" || message.action === "tabs.use" || message.action === "readPage" || message.action === "snapshot" || message.action === "getProfile" || message.action === "getComments" || message.action === "getPosts" || message.action === "getPost" || message.action === "screenshot" || message.action === "search" || message.action === "readInbox" || message.action === "readThread" || message.action === "sendMessage" || message.action === "ytStudioRead" || message.action === "click" || message.action === "scroll")) {
         const reply = (result) => { if (connection.readyState === WebSocket.OPEN) connection.send(JSON.stringify({ type: "result", id: message.id, ...result })); };
-        const task = browserAction.then(() => message.action === "tabs.list" ? listTabs() : message.action === "tabs.use" ? useTab(message.args || {}) : message.action === "snapshot" ? snapshot() : message.action === "getProfile" ? getProfile(message.args || {}) : message.action === "getComments" ? getComments(message.args || {}) : message.action === "getPosts" ? getPosts(message.args || {}) : message.action === "getPost" ? getPost(message.args || {}) : message.action === "screenshot" ? screenshot(message.args || {}) : message.action === "search" ? search(message.args || {}) : message.action === "readInbox" ? readInbox(message.args || {}) : message.action === "readThread" ? readThread(message.args || {}) : message.action === "sendMessage" ? sendMessage(message.args || {}) : message.action === "ytStudioRead" ? ytStudioReadTool(message.args || {}) : readPage(message.args || {}));
+        const task = browserAction.then(() => message.action === "tabs.list" ? listTabs() : message.action === "tabs.use" ? useTab(message.args || {}) : message.action === "snapshot" ? snapshot() : message.action === "getProfile" ? getProfile(message.args || {}) : message.action === "getComments" ? getComments(message.args || {}) : message.action === "getPosts" ? getPosts(message.args || {}) : message.action === "getPost" ? getPost(message.args || {}) : message.action === "screenshot" ? screenshot(message.args || {}) : message.action === "search" ? search(message.args || {}) : message.action === "readInbox" ? readInbox(message.args || {}) : message.action === "readThread" ? readThread(message.args || {}) : message.action === "sendMessage" ? sendMessage(message.args || {}) : message.action === "ytStudioRead" ? ytStudioReadTool(message.args || {}) : message.action === "click" ? clickTool(message.args || {}) : message.action === "scroll" ? scrollTool(message.args || {}) : readPage(message.args || {}));
         browserAction = task.then(() => undefined, () => undefined);
         task.then((result) => reply({ result }), (error) => reply({ error: error.code === "HALT" ? { code: "HALT", reason: error.reason } : error.message }));
       }
