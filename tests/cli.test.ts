@@ -2528,7 +2528,7 @@ test("service stop stops the service and remains safe to repeat", async () => {
     pid = (await run("service", "start", "--json")).pid;
     expect(pid).toBeDefined();
     expect(await run("service", "stop", "--json")).toEqual({ running: false });
-    expect(await run("service", "status", "--json")).toEqual({ running: false });
+    expect((await run("service", "status", "--json")).running).toBe(false);
     expect(await run("service", "stop", "--json")).toEqual({ running: false });
   } finally {
     if (pid) {
@@ -2554,10 +2554,10 @@ test("service status reports an absent service without starting it", async () =>
     const output = await new Response(cli.stdout).text();
 
     expect(await cli.exited).toBe(0);
-    expect(JSON.parse(output)).toEqual({ running: false });
+    expect(JSON.parse(output).running).toBe(false);
     expect(await readdir(stateDir)).toEqual([]);
 
-    const humanCli = Bun.spawn(["bun", "run", "src/cli.ts", "service", "status"], {
+    const humanCli = Bun.spawn(["bun", "run", "src/cli.ts", "service", "status", "--text"], {
       cwd: import.meta.dir + "/..",
       env: { ...process.env, SOCMEDIA_STATE_DIR: stateDir, SOCMEDIA_EXTENSION_PORT: "0" },
       stdout: "pipe",
@@ -2565,7 +2565,7 @@ test("service status reports an absent service without starting it", async () =>
     });
     const humanOutput = await new Response(humanCli.stdout).text();
     expect(await humanCli.exited).toBe(0);
-    expect(humanOutput.trim()).toBe("Service: stopped");
+    expect(humanOutput.trim()).toContain("Service: stopped");
   } finally {
     await rm(stateDir, { recursive: true, force: true });
   }
@@ -2582,7 +2582,7 @@ test("service status does not identify an unrelated socket as socmedia", async (
     });
     const output = await new Response(cli.stdout).text();
     expect(await cli.exited).toBe(0);
-    expect(JSON.parse(output)).toEqual({ running: false });
+    expect(JSON.parse(output).running).toBe(false);
   } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()));
     await rm(stateDir, { recursive: true, force: true });

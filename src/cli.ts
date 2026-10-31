@@ -18,6 +18,63 @@ const configPath = join(stateDir, "config.json");
 const youtubeConfigPath = join(stateDir, "youtube.json");
 const extensionVersion = packageInfo.version;
 const extensionPath = join(stateDir, "extension");
+export const PINNED_EXTENSION_ID = "ingpbbhdgldgomideaihffffiinjgifj";
+
+export class CliError extends Error {
+  hint?: string;
+  code?: string;
+  constructor(message: string, hint?: string, code?: string) {
+    super(message);
+    this.name = "CliError";
+    this.hint = hint;
+    this.code = code;
+  }
+}
+
+export function getOutputFormat(): "json" | "text" {
+  if (Bun.argv.includes("--json")) return "json";
+  if (Bun.argv.includes("--text")) return "text";
+  const env = process.env.SOCMEDIA_CLI_FORMAT?.toLowerCase();
+  if (env === "json" || env === "text") return env;
+  return process.stdout.isTTY ? "text" : "json";
+}
+
+export function printOutput(data: unknown, textFormatter?: () => string) {
+  const fmt = getOutputFormat();
+  if (fmt === "json") {
+    console.log(JSON.stringify(data));
+  } else if (textFormatter) {
+    console.log(textFormatter());
+  } else if (typeof data === "string") {
+    console.log(data);
+  } else {
+    console.log(JSON.stringify(data, null, 2));
+  }
+}
+
+export function printError(error: unknown) {
+  process.exitCode = 1;
+  const fmt = getOutputFormat();
+  const message = error instanceof Error ? error.message : String(error);
+  const hint = error instanceof CliError ? error.hint : undefined;
+  const code = error instanceof CliError ? error.code : undefined;
+  if (fmt === "json") {
+    console.error(JSON.stringify({ error: message, ...(hint ? { hint } : {}), ...(code ? { code } : {}) }));
+  } else {
+    console.error(`Error: ${message}`);
+    if (hint) console.error(`Hint: ${hint}`);
+  }
+}
+
+async function isPortInUse(port: number): Promise<boolean> {
+  if (!port || port <= 0 || port > 65535) return false;
+  return new Promise((res) => {
+    const s = createServer();
+    s.once("error", () => res(true));
+    s.once("listening", () => { s.close(() => res(false)); });
+    s.listen(port, "127.0.0.1");
+  });
+}
 
 const CHANNEL_ID_RE = /^UC[\w-]{22}$/;
 function studioUrl(id: string): string {
@@ -762,12 +819,24 @@ function validateJob(value: unknown) {
   return job;
 }
 
-async function status(): Promise<{ running: boolean; pid?: number; version?: string; extension?: unknown; halted?: unknown; extensionUrl?: string; portSource?: string }> {
+async function status(): Promise<{ running: boolean; pid?: number; version?: string; extension?: unknown; halted?: unknown; extensionUrl?: string; portSource?: string; port: number; pinnedId: string; portInUse?: boolean; code?: string }> {
+  const pCfg = effectivePort();
+  const configuredPort = pCfg.port;
   return new Promise((resolve) => {
     const socket = createConnection(socketPath);
     let data = "";
-    const timer = setTimeout(() => { socket.destroy(); resolve({ running: false }); }, 1000);
-    socket.once("error", () => { clearTimeout(timer); resolve({ running: false }); });
+    const finishAbsent = async () => {
+      const inUse = await isPortInUse(configuredPort);
+      resolve({
+        running: false,
+        port: configuredPort,
+        portSource: pCfg.source,
+        pinnedId: PINNED_EXTENSION_ID,
+        ...(inUse ? { portInUse: true, code: "PORT_IN_USE" } : {}),
+      });
+    };
+    const timer = setTimeout(() => { socket.destroy(); finishAbsent(); }, 1000);
+    socket.once("error", () => { clearTimeout(timer); finishAbsent(); });
     socket.on("data", (chunk) => {
       data += chunk.toString();
       if (!data.includes("\n")) return;
@@ -776,19 +845,33 @@ async function status(): Promise<{ running: boolean; pid?: number; version?: str
       try {
         const response = JSON.parse(data.split("\n")[0]!);
         if (response.identity === identity && Number.isInteger(response.pid) && response.pid > 0) {
-          resolve({ running: true, pid: response.pid, version: response.version, extension: response.extension, halted: response.halted, extensionUrl: response.extensionUrl, portSource: response.portSource });
+          const ext = response.extension as { port?: number } | undefined;
+          resolve({
+            running: true,
+            pid: response.pid,
+            version: response.version,
+            extension: response.extension,
+            halted: response.halted,
+            extensionUrl: response.extensionUrl,
+            portSource: response.portSource,
+            port: ext?.port ?? configuredPort,
+            pinnedId: PINNED_EXTENSION_ID,
+          });
           return;
         }
       } catch { /* not a socmedia response */ }
-      resolve({ running: false });
+      finishAbsent();
     });
-    socket.once("end", () => { clearTimeout(timer); resolve({ running: false }); });
+    socket.once("end", () => { clearTimeout(timer); finishAbsent(); });
   });
 }
 
 async function start() {
   const existing = await status();
   if (existing.running) return existing;
+  if (existing.portInUse) {
+    throw new CliError(`Port ${existing.port} is already in use by another service`, "Choose another port with `socmedia config set port <PORT>` or stop the conflicting service", "PORT_IN_USE");
+  }
   mkdirSync(stateDir, { recursive: true, mode: 0o700 });
   const isCompiled = import.meta.path.startsWith("/$bunfs");
   const childArgs = isCompiled ? ["--service-daemon"] : [import.meta.path, "--service-daemon"];
@@ -892,6 +975,307 @@ async function runPageJob(action: "snapshot" | "readPage" | "getProfile" | "getC
     await Bun.sleep(50);
   }
   throw new Error(`Job ${created.id} still pending; inspect it with queue get`);
+}
+
+export type CommandMeta = {
+  name: string;
+  usage: string;
+  summary: string;
+  commands?: { name: string; summary: string }[];
+  options?: { flag: string; description: string }[];
+};
+
+export const COMMAND_REGISTRY: CommandMeta[] = [
+  {
+    name: "service",
+    usage: "socmedia service <start|status|stop|resume> [options]",
+    summary: "Start or inspect the local service",
+    commands: [
+      { name: "start", summary: "Start the local service or return the running service" },
+      { name: "status", summary: "Show service, halted state and extension connection status" },
+      { name: "stop", summary: "Stop the local service; succeed if already stopped" },
+      { name: "resume", summary: "Resume the queue after manually resolving a login or security challenge" },
+    ],
+    options: [
+      { flag: "--json", description: "Print the result as JSON" },
+      { flag: "--text", description: "Print the result as plain text" },
+      { flag: "--help", description: "Show this help message" },
+    ],
+  },
+  {
+    name: "queue",
+    usage: "socmedia queue <list|get|cancel|enqueue> [options]",
+    summary: "Inspect or manage the service queue",
+    commands: [
+      { name: "list", summary: "List saved queue jobs" },
+      { name: "get <id>", summary: "Show a job by its positive numeric ID" },
+      { name: "cancel <id>", summary: "Cancel a queued job by ID" },
+      { name: "enqueue <action>", summary: "Queue an action; readPage, snapshot and Instagram/Facebook getProfile execute" },
+    ],
+    options: [
+      { flag: "--args JSON", description: "Action arguments as a JSON object (default: {})" },
+      { flag: "--not-before TIME", description: "Earliest run time as an ISO date" },
+      { flag: "--key KEY", description: "Reuse the same job; changed action, args or time causes a key conflict" },
+      { flag: "--json", description: "Print the result as JSON" },
+      { flag: "--text", description: "Print the result as plain text" },
+      { flag: "--help", description: "Show this help message" },
+    ],
+  },
+  {
+    name: "tabs",
+    usage: "socmedia tabs <list|use|clear> [options]",
+    summary: "Inspect extension work tabs",
+    commands: [
+      { name: "list", summary: "List Socmedia CLI group tabs and the selected tab" },
+      { name: "use <tabId>", summary: "Select an open Instagram, Facebook or YouTube tab by its numeric ID" },
+      { name: "clear", summary: "Clear the selected tab and return to the Socmedia CLI group" },
+    ],
+    options: [
+      { flag: "--json", description: "Print the result as JSON" },
+      { flag: "--text", description: "Print the result as plain text" },
+      { flag: "--help", description: "Show this help message" },
+    ],
+  },
+  {
+    name: "profile",
+    usage: "socmedia profile <get|posts|download> <url> [options]",
+    summary: "Read a social profile",
+    commands: [
+      { name: "get <url>", summary: "Read an Instagram or Facebook profile/page via its HTTPS URL" },
+      { name: "posts <url>", summary: "List posts from an Instagram or Facebook profile/page" },
+      { name: "download <url>", summary: "Collect profile, screenshot, posts and media into ~/socmedia-data" },
+    ],
+    options: [
+      { flag: "--limit N", description: "With posts or download, maximum posts from 1 to 100 (default: 12)" },
+      { flag: "--details", description: "With download, fetch details of each post (default: true)" },
+      { flag: "--no-details", description: "Skip post detail fetch" },
+      { flag: "--max-media N", description: "With download, maximum media files from 0 to 300 (default: 50)" },
+      { flag: "--dir PATH", description: "With download, custom destination inside home" },
+      { flag: "--background", description: "With download, run in background via service queue" },
+      { flag: "--json", description: "Print the result as JSON" },
+      { flag: "--text", description: "Print the result as plain text" },
+      { flag: "--help", description: "Show this help message" },
+    ],
+  },
+  {
+    name: "contacts",
+    usage: "socmedia contacts <list|update|export|import> [options]",
+    summary: "List local contacts",
+    commands: [
+      { name: "list", summary: "List locally stored contacts" },
+      { name: "update <id>", summary: "Update a contact by its ID; provide --status and/or --note" },
+      { name: "export", summary: "Export filtered contacts to a file inside home" },
+      { name: "import", summary: "Import contacts and message history from legacy ~/.socmedia-mcp" },
+    ],
+    options: [
+      { flag: "--status STATUS", description: "Filter list/export or set status: new, messaged, replied, won, rejected, skip" },
+      { flag: "--platform NAME", description: "Filter list/export by ig or fb" },
+      { flag: "--note TEXT", description: "Set note on update (maximum 2000 characters; empty clears it)" },
+      { flag: "--format FORMAT", description: "Export as csv, json or jsonl (default: csv)" },
+      { flag: "--path PATH", description: "Export destination inside home" },
+      { flag: "--from DIR", description: "With import, source directory containing contacts.jsonl / messages.jsonl" },
+      { flag: "--json", description: "Print the command result as JSON" },
+      { flag: "--text", description: "Print the result as plain text" },
+      { flag: "--help", description: "Show this help message" },
+    ],
+  },
+  {
+    name: "post",
+    usage: "socmedia post <get|comments> <url> [options]",
+    summary: "Inspect a social post",
+    commands: [
+      { name: "get <url>", summary: "Read a post from Instagram or Facebook" },
+      { name: "comments <url>", summary: "Read Instagram or Facebook post comments" },
+    ],
+    options: [
+      { flag: "--download", description: "With get, download media files to ~/socmedia-data" },
+      { flag: "--slides", description: "Alias for --download" },
+      { flag: "--limit N", description: "With comments, maximum comments from 1 to 500 (default: 20)" },
+      { flag: "--json", description: "Print the result as JSON" },
+      { flag: "--text", description: "Print the result as plain text" },
+      { flag: "--help", description: "Show this help message" },
+    ],
+  },
+  {
+    name: "page",
+    usage: "socmedia page <read|snapshot> [options]",
+    summary: "Inspect the work page",
+    commands: [
+      { name: "read", summary: "Queue and return visible page text and URL" },
+      { name: "snapshot", summary: "Queue and return visible interactive elements" },
+    ],
+    options: [
+      { flag: "--max-lines N", description: "With read, limit output to 1-1000 lines (default: 200)" },
+      { flag: "--json", description: "Print the result as JSON" },
+      { flag: "--text", description: "Print the result as plain text" },
+      { flag: "--help", description: "Show this help message" },
+    ],
+  },
+  {
+    name: "screenshot",
+    usage: "socmedia screenshot [options]",
+    summary: "Take a screenshot of the work page",
+    options: [
+      { flag: "--url URL", description: "Navigate to URL first" },
+      { flag: "--selector SEL", description: "CSS selector to crop" },
+      { flag: "--target TARGET", description: "viewport, post, or profile (default: viewport)" },
+      { flag: "--path PATH", description: "Output file destination inside home" },
+      { flag: "--json", description: "Print the result as JSON" },
+      { flag: "--text", description: "Print the result as plain text" },
+      { flag: "--help", description: "Show this help message" },
+    ],
+  },
+  {
+    name: "search",
+    usage: "socmedia search <platform> <query> [options]",
+    summary: "Search on Instagram or Facebook",
+    options: [
+      { flag: "--type TYPE", description: "users, hashtag, pages, places (default: users)" },
+      { flag: "--limit N", description: "Maximum results from 1 to 50 (default: 20)" },
+      { flag: "--json", description: "Print the result as JSON" },
+      { flag: "--text", description: "Print the result as plain text" },
+      { flag: "--help", description: "Show this help message" },
+    ],
+  },
+  {
+    name: "config",
+    usage: "socmedia config <get|set|unset> port [value] [options]",
+    summary: "Configure the service",
+    commands: [
+      { name: "get port", summary: "Show the effective port and configuration source" },
+      { name: "set port <value>", summary: "Save a port from 1 to 65535" },
+      { name: "unset port", summary: "Remove the saved port" },
+    ],
+    options: [
+      { flag: "--json", description: "Print the result as JSON" },
+      { flag: "--text", description: "Print the result as plain text" },
+      { flag: "--help", description: "Show this help message" },
+    ],
+  },
+  {
+    name: "extension",
+    usage: "socmedia extension <install|path|pair> [options]",
+    summary: "Pair the Chrome extension",
+    commands: [
+      { name: "install", summary: "Copy the extension to its stable state directory and show Chrome setup steps" },
+      { name: "path", summary: "Show the stable extension directory" },
+      { name: "pair", summary: "Generate a pairing secret for the Chrome extension" },
+    ],
+    options: [
+      { flag: "--open", description: "With install, open chrome://extensions in Google Chrome" },
+      { flag: "--id ID", description: "With pair, set the Chrome extension ID" },
+      { flag: "--json", description: "Print the result as JSON; pairing output contains a sensitive secret" },
+      { flag: "--text", description: "Print the result as plain text" },
+      { flag: "--help", description: "Show this help message" },
+    ],
+  },
+  {
+    name: "inbox",
+    usage: "socmedia inbox <list|read> [options]",
+    summary: "List and read inbox threads",
+    commands: [
+      { name: "list <platform>", summary: "List conversation threads from Instagram or Facebook" },
+      { name: "read", summary: "Read messages from a thread by URL or recipient profile" },
+    ],
+    options: [
+      { flag: "--url URL", description: "Thread URL on Instagram or Facebook" },
+      { flag: "--to PROFILE", description: "Recipient profile URL to open thread" },
+      { flag: "--limit N", description: "Maximum threads or messages to fetch (default: 20 for list, 30 for read)" },
+      { flag: "--json", description: "Print the result as JSON" },
+      { flag: "--text", description: "Print the result as plain text" },
+      { flag: "--help", description: "Show this help message" },
+    ],
+  },
+  {
+    name: "message",
+    usage: "socmedia message send --to URL --text TEXT [--confirm] [options]",
+    summary: "Send direct messages",
+    commands: [
+      { name: "send", summary: "Send a direct message via Instagram or Facebook" },
+    ],
+    options: [
+      { flag: "--to URL", description: "Recipient profile or direct thread URL" },
+      { flag: "--text TEXT", description: "Message content (max 1000 characters)" },
+      { flag: "--confirm", description: "Confirm send; without this flag, returns a dry-run preview" },
+      { flag: "--json", description: "Print the result as JSON" },
+      { flag: "--text", description: "Print the result as plain text" },
+      { flag: "--help", description: "Show this help message" },
+    ],
+  },
+  {
+    name: "youtube",
+    usage: "socmedia youtube <channel|studio status|upload|video update> [options]",
+    summary: "Manage YouTube Studio and channels",
+    commands: [
+      { name: "channel", summary: "Inspect the configured YouTube channel allowlist" },
+      { name: "studio status", summary: "Read YouTube Studio tab state and verify against allowlist" },
+      { name: "upload FILE", summary: "Upload video to YouTube Studio (draft private video)" },
+      { name: "video update ID", summary: "Update video metadata (title, description, privacy)" },
+    ],
+    options: [
+      { flag: "--channel KEY", description: "Channel key from youtube.json allowlist" },
+      { flag: "--open", description: "With studio status, navigate to Studio URL" },
+      { flag: "--title TEXT", description: "Video title" },
+      { flag: "--description TXT", description: "Video description" },
+      { flag: "--privacy PRIV", description: "Video privacy: private, unlisted, public" },
+      { flag: "--confirm", description: "Confirm write action; without this flag, returns preview" },
+      { flag: "--json", description: "Print the result as JSON" },
+      { flag: "--text", description: "Print the result as plain text" },
+      { flag: "--help", description: "Show this help message" },
+    ],
+  },
+  {
+    name: "browser",
+    usage: "socmedia browser <click|scroll> [options]",
+    summary: "Interact with page via click or scroll",
+    commands: [
+      { name: "click", summary: "Click an interactive element by index, selector or text" },
+      { name: "scroll", summary: "Scroll page or container down" },
+    ],
+    options: [
+      { flag: "--index N", description: "Element index from snapshot" },
+      { flag: "--selector SEL", description: "CSS selector to target" },
+      { flag: "--text TEXT", description: "Visible text of element to click" },
+      { flag: "--times N", description: "Number of times to scroll (1-20, default: 3)" },
+      { flag: "--json", description: "Print the result as JSON" },
+      { flag: "--text", description: "Print the result as plain text" },
+      { flag: "--help", description: "Show this help message" },
+    ],
+  },
+];
+
+function formatCommandHelp(meta: CommandMeta): string {
+  const lines: string[] = [];
+  lines.push(`Usage: ${meta.usage}\n`);
+  if (meta.commands && meta.commands.length > 0) {
+    lines.push("Commands:");
+    for (const cmd of meta.commands) {
+      lines.push(`  ${cmd.name.padEnd(18)} ${cmd.summary}`);
+    }
+    lines.push("");
+  }
+  if (meta.options && meta.options.length > 0) {
+    lines.push("Options:");
+    for (const opt of meta.options) {
+      lines.push(`  ${opt.flag.padEnd(18)} ${opt.description}`);
+    }
+  }
+  return lines.join("\n");
+}
+
+function formatRootHelp(): string {
+  const lines: string[] = [];
+  lines.push("Usage: socmedia [options]\n");
+  lines.push("Commands:");
+  for (const cmd of COMMAND_REGISTRY) {
+    lines.push(`  ${cmd.name.padEnd(12)} ${cmd.summary}`);
+  }
+  lines.push("\nOptions:");
+  lines.push("  --version    Show the CLI version");
+  lines.push("  --help       Show this help message");
+  lines.push("  --json       Print the result as JSON");
+  lines.push("  --text       Print the result as plain text");
+  return lines.join("\n");
 }
 
 if (Bun.argv[2] === "--service-daemon") {
@@ -1354,39 +1738,26 @@ if (Bun.argv[2] === "--service-daemon") {
   process.on("SIGINT", shutdown);
 } else if (Bun.argv[2] === "--version") {
   console.log(extensionVersion);
+
 } else if (Bun.argv.includes("--help")) {
-  if (Bun.argv[2] === "service") {
-    console.log("Usage: socmedia service <start|status|stop|resume> [--json]\n\nCommands:\n  start   Start the local service or return the running service\n  status  Show service, halted state and extension connection status\n  stop    Stop the local service; succeed if already stopped\n  resume  Resume the queue after manually resolving a login or security challenge\n\nOptions:\n  --json  Print the result as JSON\n  --help  Show this help message\n\nEnvironment:\n  SOCMEDIA_STATE_DIR             Service data directory\n  SOCMEDIA_EXTENSION_PORT        Overrides saved config port (default: 47842; 0 selects an available port)\n  SOCMEDIA_EXTENSION_TIMEOUT_MS  Extension request timeout in milliseconds (default: 10000, range: 1-12000; profile requests use at least 45000)\n\nPort changes apply after the service restarts.");
-  } else if (Bun.argv[2] === "queue") {
-    console.log("Usage: socmedia queue <list|get|cancel|enqueue> [options]\n\nCommands:\n  list              List saved queue jobs\n  get <id>          Show a job by its positive numeric ID\n  cancel <id>       Cancel a queued job by ID; cancelling twice returns the same job\n  enqueue <action>  Queue an action; readPage, snapshot and Instagram/Facebook getProfile execute\n\nOptions:\n  --args JSON       Action arguments as a JSON object (default: {})\n  --not-before TIME Earliest run time as an ISO date\n  --key KEY         Reuse the same job; changed action, args or time causes a key conflict\n  --json            Print the result as JSON\n  --help            Show this help message");
-  } else if (Bun.argv[2] === "tabs") {
-    console.log("Usage: socmedia tabs <list|use|clear> [options]\n\nCommands:\n  list         List Socmedia CLI group tabs and the selected tab\n  use <tabId>  Select an open Instagram, Facebook or YouTube tab by its numeric ID\n  clear        Clear the selected tab and return to the Socmedia CLI group\n\nOptions:\n  --json       Print the result as JSON\n  --help       Show this help message");
-  } else if (Bun.argv[2] === "profile") {
-    console.log("Usage: socmedia profile <get|posts|download> <url> [options]\n\nCommands:\n  get <url>         Read an Instagram or Facebook profile/page via its HTTPS URL\n  posts <url>       List posts from an Instagram or Facebook profile/page\n  download <url>    Collect profile, screenshot, posts and media into ~/socmedia-data\n\nOptions:\n  --limit N         With posts or download, maximum posts from 1 to 100 (default: 12)\n  --details         With download, fetch details of each post (default: true)\n  --no-details      With download, skip post detail fetch\n  --max-media N     With download, maximum media files from 0 to 300 (default: 50)\n  --dir PATH        With download, custom destination inside home\n  --background      With download, run in background via service queue\n  --json            Print the result as JSON\n  --help            Show this help message\n\nSuccessful profile reads update local contacts. Fields may be null or incomplete.");
-  } else if (Bun.argv[2] === "contacts") {
-    console.log("Usage: socmedia contacts <list|update|export|import> [options]\n\nCommands:\n  list              List locally stored contacts\n  update <id>       Update a contact by its ID; provide --status and/or --note\n  export            Export filtered contacts to a file inside home\n  import            Import contacts and message history from legacy ~/.socmedia-mcp\n\nOptions:\n  --status STATUS   Filter list/export or set status: new, messaged, replied, won, rejected, skip\n  --platform NAME   Filter list/export by ig or fb\n  --note TEXT       Set note on update (maximum 2000 characters; empty clears it)\n  --format FORMAT   Export as csv, json or jsonl (default: csv)\n  --path PATH       Export destination inside home (default: ~/socmedia-data/contacts-<date>.<format>)\n  --from DIR        With import, source directory containing contacts.jsonl / messages.jsonl\n  --json            Print the command result as JSON\n  --help            Show this help message\n\nInstagram and Facebook profile reads populate contacts.");
-  } else if (Bun.argv[2] === "post") {
-    console.log("Usage: socmedia post <get|comments> <url> [options]\n\nCommands:\n  get <url>       Read a post from Instagram or Facebook\n  comments <url>  Read Instagram or Facebook post comments\n\nOptions:\n  --download      With get, download media files to ~/socmedia-data\n  --slides        Alias for --download\n  --limit N       With comments, maximum comments from 1 to 500 (default: 20)\n  --json          Print the result as JSON\n  --help          Show this help message\n\nExpands available comments through Chrome debugger and reads visible English UI; results may be incomplete.");
-  } else if (Bun.argv[2] === "page") {
-    console.log("Usage: socmedia page <read|snapshot> [options]\n\nCommands:\n  read            Queue and return visible page text and URL\n  snapshot        Queue and return visible interactive elements\n\nOptions:\n  --max-lines N   With read, limit output to 1-1000 lines (default: 200)\n  --json          Print the result as JSON\n  --help          Show this help message");
-  } else if (Bun.argv[2] === "screenshot") {
-    console.log("Usage: socmedia screenshot [options]\n\nOptions:\n  --url URL         Navigate to URL first\n  --selector SEL    CSS selector to crop\n  --target TARGET   viewport, post, or profile (default: viewport)\n  --path PATH       Output file destination inside home\n  --json            Print the result as JSON\n  --help            Show this help message");
-  } else if (Bun.argv[2] === "search") {
-    console.log("Usage: socmedia search <platform> <query> [options]\n\nSearch for profiles, pages, places or hashtags on Instagram or Facebook\n\nArguments:\n  platform       Social network: ig (instagram) or fb (facebook)\n  query          Search keyword or hashtag (1-200 characters)\n\nOptions:\n  --type TYPE    users, hashtag, pages, places (default: users)\n  --limit N      Maximum results from 1 to 50 (default: 20)\n  --json         Print the result as JSON\n  --help         Show this help message");
-  } else if (Bun.argv[2] === "config") {
-    console.log("Usage: socmedia config <get|set|unset> port [value] [--json]\n\nCommands:\n  get port          Show the effective port and configuration source\n  set port <value>  Save a port from 1 to 65535\n  unset port        Remove the saved port\n\nOptions:\n  --json            Print the result as JSON\n  --help            Show this help message\n\nSOCMEDIA_EXTENSION_PORT overrides the saved port; changes apply when the service restarts.");
-  } else if (Bun.argv[2] === "extension") {
-    console.log("Usage: socmedia extension <install|path|pair> [options]\n\nCommands:\n  install    Copy the extension to its stable state directory and show Chrome setup steps\n  path       Show the stable extension directory\n  pair       Generate a pairing secret for the Chrome extension\n\nOptions:\n  --open     With install, open chrome://extensions in Google Chrome\n  --id ID    With pair, set the Chrome extension ID\n  --json     Print the result as JSON; pairing output contains a sensitive secret\n  --help     Show this help message\n\nPairing replaces any previous pairing; restart the service to disconnect existing clients.");
-  } else if (Bun.argv[2] === "inbox") {
-    console.log("Usage: socmedia inbox <list|read> [options]\n\nCommands:\n  list <platform>   List conversation threads from Instagram or Facebook\n  read              Read messages from a thread by URL or recipient profile\n\nOptions:\n  --url URL         Thread URL on Instagram or Facebook\n  --to PROFILE      Recipient profile URL to open thread\n  --limit N         Maximum threads or messages to fetch (default: 20 for list, 30 for read)\n  --json            Print the result as JSON\n  --help            Show this help message");
-  } else if (Bun.argv[2] === "message") {
-    console.log("Usage: socmedia message send --to URL --text TEXT [--confirm] [--json]\n\nCommands:\n  send              Send a direct message via Instagram or Facebook\n\nOptions:\n  --to URL          Recipient profile or direct thread URL\n  --text TEXT       Message content (max 1000 characters)\n  --confirm         Confirm send; without this flag, returns a dry-run preview\n  --json            Print the result as JSON\n  --help            Show this help message\n\nDirect messaging enforces daily caps (SOCMEDIA_MAX_MESSAGES_PER_DAY), 7-day duplicate protection, and automated slot pacing.");
-  } else if (Bun.argv[2] === "youtube") {
-    console.log("Usage: socmedia youtube <channel|studio status|upload|video update> [options]\n\nCommands:\n  channel           Inspect the configured YouTube channel allowlist\n  studio status     Read YouTube Studio tab state and verify against allowlist\n  upload FILE       Upload video to YouTube Studio (draft private video)\n  video update ID   Update video metadata (title, description, privacy)\n\nOptions:\n  --channel KEY     Channel key from youtube.json allowlist\n  --open            With studio status, navigate to Studio URL\n  --title TEXT      Video title\n  --description TXT Video description\n  --privacy PRIV    Video privacy: private, unlisted, public\n  --confirm         Confirm write action; without this flag, returns preview\n  --json            Print the result as JSON\n  --help            Show this help message\n\nChannel allowlist is configured in ~/.socmedia-cli/youtube.json.");
-  } else if (Bun.argv[2] === "browser") {
-    console.log("Usage: socmedia browser <click|scroll> [options]\n\nCommands:\n  click             Click an interactive element by index, selector or text\n  scroll            Scroll page or container down\n\nOptions:\n  --index N         Element index from snapshot\n  --selector SEL    CSS selector to target\n  --text TEXT       Visible text of element to click\n  --times N         Number of times to scroll (1-20, default: 3)\n  --json            Print the result as JSON\n  --help            Show this help message");
+  const json = Bun.argv.includes("--json");
+  const cmdName = Bun.argv.slice(2).find((arg) => !arg.startsWith("-"));
+  if (json) {
+    if (cmdName) {
+      const found = COMMAND_REGISTRY.find((c) => c.name === cmdName);
+      if (found) console.log(JSON.stringify(found));
+      else console.log(JSON.stringify({ error: `Unknown command: ${cmdName}` }));
+    } else {
+      console.log(JSON.stringify(COMMAND_REGISTRY));
+    }
   } else {
-    console.log("Usage: socmedia [options]\n\nCommands:\n  service    Start or inspect the local service\n  queue      Inspect the service queue\n  extension  Pair the Chrome extension\n  tabs       Inspect extension work tabs\n  page       Inspect the work page\n  browser    Interact with page via click or scroll\n  screenshot Take a screenshot of the work page\n  search     Search on Instagram or Facebook\n  post       Inspect a social post\n  profile    Read a social profile\n  contacts   List local contacts\n  inbox      List and read inbox threads\n  message    Send direct messages\n  youtube    Manage YouTube Studio and channels\n  config     Configure the service\n\nOptions:\n  --version  Show the CLI version\n  --help     Show this help message");
+    if (cmdName) {
+      const found = COMMAND_REGISTRY.find((c) => c.name === cmdName);
+      if (found) console.log(formatCommandHelp(found));
+      else console.log(formatRootHelp());
+    } else {
+      console.log(formatRootHelp());
+    }
   }
 } else if (Bun.argv[2] === "post" && Bun.argv[3] === "get") {
   try {
@@ -1399,7 +1770,7 @@ if (Bun.argv[2] === "--service-daemon") {
       else throw new Error(`Unknown post option: ${option}`);
     }
     console.log(JSON.stringify(await runPageJob("getPost", args)));
-  } catch (error) { console.error(error instanceof Error ? error.message : String(error)); process.exitCode = 1; }
+  } catch (error) { printError(error); }
 } else if (Bun.argv[2] === "post" && Bun.argv[3] === "comments") {
   try {
     const url = postUrl(Bun.argv[4]);
@@ -1413,7 +1784,7 @@ if (Bun.argv[2] === "--service-daemon") {
       args.limit = Number(value);
     }
     console.log(JSON.stringify(await runPageJob("getComments", args)));
-  } catch (error) { console.error(error instanceof Error ? error.message : String(error)); process.exitCode = 1; }
+  } catch (error) { printError(error); }
 } else if (Bun.argv[2] === "contacts" && Bun.argv[3] === "export") {
   try {
     const args: { status?: string; platform?: string; format?: string; path?: string } = {};
@@ -1429,7 +1800,7 @@ if (Bun.argv[2] === "--service-daemon") {
       else args.path = value;
     }
     console.log(JSON.stringify(await queueRequest(`contacts export ${JSON.stringify(args)}`)));
-  } catch (error) { console.error(error instanceof Error ? error.message : String(error)); process.exitCode = 1; }
+  } catch (error) { printError(error); }
 } else if (Bun.argv[2] === "contacts" && Bun.argv[3] === "update") {
   try {
     const id = Bun.argv[4];
@@ -1451,7 +1822,7 @@ if (Bun.argv[2] === "--service-daemon") {
     }
     if (update.status === undefined && update.note === undefined) throw new Error("Provide --status or --note");
     console.log(JSON.stringify(await queueRequest(`contacts update ${JSON.stringify(update)}`)));
-  } catch (error) { console.error(error instanceof Error ? error.message : String(error)); process.exitCode = 1; }
+  } catch (error) { printError(error); }
 } else if (Bun.argv[2] === "contacts" && Bun.argv[3] === "list") {
   try {
     const filters: { status?: string; platform?: string } = {};
@@ -1480,7 +1851,7 @@ if (Bun.argv[2] === "--service-daemon") {
       db.close();
       console.log(JSON.stringify({ count: contacts.length, file: join(stateDir, "state.sqlite"), contacts }));
     }
-  } catch (error) { console.error(error instanceof Error ? error.message : String(error)); process.exitCode = 1; }
+  } catch (error) { printError(error); }
 } else if (Bun.argv[2] === "contacts" && Bun.argv[3] === "import") {
   try {
     let from: string | undefined;
@@ -1545,13 +1916,13 @@ if (Bun.argv[2] === "--service-daemon") {
       db.close();
       console.log(JSON.stringify({ contactsImported, messagesImported, source: sourceDir }));
     }
-  } catch (error) { console.error(error instanceof Error ? error.message : String(error)); process.exitCode = 1; }
+  } catch (error) { printError(error); }
 } else if (Bun.argv[2] === "profile" && Bun.argv[3] === "get") {
   try {
     if (Bun.argv.slice(5).some((option) => option !== "--json")) throw new Error("Unknown profile option");
     const url = profileUrl(Bun.argv[4]);
     console.log(JSON.stringify(await runPageJob("getProfile", { url })));
-  } catch (error) { console.error(error instanceof Error ? error.message : String(error)); process.exitCode = 1; }
+  } catch (error) { printError(error); }
 } else if (Bun.argv[2] === "profile" && Bun.argv[3] === "posts") {
   try {
     const url = profileUrl(Bun.argv[4]);
@@ -1565,7 +1936,7 @@ if (Bun.argv[2] === "--service-daemon") {
       args.limit = Number(value);
     }
     console.log(JSON.stringify(await runPageJob("getPosts", args)));
-  } catch (error) { console.error(error instanceof Error ? error.message : String(error)); process.exitCode = 1; }
+  } catch (error) { printError(error); }
 } else if (Bun.argv[2] === "profile" && Bun.argv[3] === "download") {
   try {
     const url = profileUrl(Bun.argv[4]);
@@ -1602,7 +1973,7 @@ if (Bun.argv[2] === "--service-daemon") {
     } else {
       console.log(JSON.stringify(await downloadProfile(args, (act, a) => runPageJob(act, a))));
     }
-  } catch (error) { console.error(error instanceof Error ? error.message : String(error)); process.exitCode = 1; }
+  } catch (error) { printError(error); }
 } else if (Bun.argv[2] === "page" && (Bun.argv[3] === "snapshot" || Bun.argv[3] === "read")) {
   try {
     const args: Record<string, number> = {};
@@ -1616,7 +1987,7 @@ if (Bun.argv[2] === "--service-daemon") {
       } else throw new Error(`Unknown page option: ${option}`);
     }
     console.log(JSON.stringify(await runPageJob(Bun.argv[3] === "read" ? "readPage" : "snapshot", args)));
-  } catch (error) { console.error(error instanceof Error ? error.message : String(error)); process.exitCode = 1; }
+  } catch (error) { printError(error); }
 } else if (Bun.argv[2] === "config") {
   try {
     const action = Bun.argv[3];
@@ -1631,20 +2002,19 @@ if (Bun.argv[2] === "--service-daemon") {
       const config = readConfig(); delete config.port; writeConfig(config);
     }
     console.log(JSON.stringify({ ...effectivePort(), ...(action !== "get" && { note: "Changes apply after the service restarts" }) }));
-  } catch (error) { console.error(error instanceof Error ? error.message : String(error)); process.exitCode = 1; }
+  } catch (error) { printError(error); }
 } else if (Bun.argv[2] === "extension" && (Bun.argv[3] === "install" || Bun.argv[3] === "path")) {
   try {
     const options = Bun.argv.slice(4);
     const install = Bun.argv[3] === "install";
-    const json = options.includes("--json");
-    if (options.some((option) => option !== "--json" && !(install && option === "--open"))) throw new Error("Unknown extension option");
+    if (options.some((option) => option !== "--json" && option !== "--text" && !(install && option === "--open"))) throw new Error("Unknown extension option");
     const result = install ? installExtension() : { path: extensionPath };
     if (install && options.includes("--open")) {
       if (process.platform !== "darwin") throw new Error("--open is currently supported on macOS only");
       const opened = spawnSync("open", ["-a", "Google Chrome", "chrome://extensions"]);
       if (opened.error || opened.status !== 0) throw new Error("Extension copied, but Chrome could not be opened; open chrome://extensions manually");
     }
-    if (json) {
+    if (options.includes("--json")) {
       console.log(JSON.stringify(result));
     } else if (install) {
       const res = result as { path: string; id: string; steps: string[] };
@@ -1655,10 +2025,10 @@ if (Bun.argv[2] === "--service-daemon") {
     } else {
       console.log(result.path);
     }
-  } catch (error) { console.error(error instanceof Error ? error.message : String(error)); process.exitCode = 1; }
+  } catch (error) { printError(error); }
 } else if (Bun.argv[2] === "extension" && Bun.argv[3] === "pair") {
   try {
-    if (Bun.argv[4] !== "--id" || !/^[a-p]{32}$/.test(Bun.argv[5] ?? "") || Bun.argv.slice(6).some((arg) => arg !== "--json")) throw new Error("Provide --id followed by the 32-character Chrome extension ID");
+    if (Bun.argv[4] !== "--id" || !/^[a-p]{32}$/.test(Bun.argv[5] ?? "") || Bun.argv.slice(6).some((arg) => arg !== "--json" && arg !== "--text")) throw new Error("Provide --id followed by the 32-character Chrome extension ID");
     const pairing = { id: Bun.argv[5]!, token: randomBytes(32).toString("hex") };
     mkdirSync(stateDir, { recursive: true, mode: 0o700 });
     const temporary = join(stateDir, `.pairing-${randomBytes(8).toString("hex")}`);
@@ -1671,40 +2041,40 @@ if (Bun.argv[2] === "--service-daemon") {
     }
     if (Bun.argv.includes("--json")) console.log(JSON.stringify(pairing));
     else console.log(`Extension paired: ${pairing.id}`);
-  } catch (error) { console.error(error instanceof Error ? error.message : String(error)); process.exitCode = 1; }
+  } catch (error) { printError(error); }
 } else if (Bun.argv[2] === "service" && Bun.argv[3] === "status") {
-  const json = Bun.argv.includes("--json");
   const res = await status();
-  if (json) {
-    console.log(JSON.stringify(res));
-  } else if (!res.running) {
-    console.log("Service: stopped");
-  } else {
+  printOutput(res, () => {
+    if (!res.running) {
+      const inUseMsg = res.portInUse ? ` (PORT_IN_USE on port ${res.port})` : "";
+      return `Service: stopped${inUseMsg}\nPort: ${res.port} (source: ${res.portSource})\nPinned ID: ${res.pinnedId}`;
+    }
     const ext = res.extension as { connected?: boolean; version?: string } | undefined;
-    console.log(`Service:   running (PID ${res.pid}, v${res.version})`);
-    console.log(`Extension: ${ext?.connected ? `connected (v${ext.version})` : "not connected"}`);
-    if (res.halted) console.log(`Halted:    ${JSON.stringify(res.halted)}`);
-  }
+    const lines = [
+      `Service: running (PID ${res.pid}, v${res.version})`,
+      `Extension: ${ext?.connected ? `connected (v${ext.version})` : "not connected"}`,
+      `Port: ${res.port} (source: ${res.portSource})`,
+      `Pinned ID: ${res.pinnedId}`,
+    ];
+    if (res.halted) lines.push(`Halted:    ${JSON.stringify(res.halted)}`);
+    return lines.join("\n");
+  });
 } else if (Bun.argv[2] === "service" && Bun.argv[3] === "start") {
   try {
-    const json = Bun.argv.includes("--json");
     const res = await start();
-    if (json) console.log(JSON.stringify(res));
-    else console.log(`Service running (PID ${res.pid}, v${res.version})`);
-  } catch (error) { console.error(error instanceof Error ? error.message : String(error)); process.exitCode = 1; }
+    printOutput(res, () => `Service running (PID ${res.pid}, v${res.version})`);
+  } catch (error) { printError(error); }
 } else if (Bun.argv[2] === "service" && Bun.argv[3] === "stop") {
   try {
-    const json = Bun.argv.includes("--json");
     const res = await stop();
-    if (json) console.log(JSON.stringify(res));
-    else console.log("Service stopped");
-  } catch (error) { console.error(error instanceof Error ? error.message : String(error)); process.exitCode = 1; }
+    printOutput(res, () => "Service stopped");
+  } catch (error) { printError(error); }
 } else if (Bun.argv[2] === "service" && Bun.argv[3] === "resume") {
   try { console.log(JSON.stringify(await queueRequest("service resume"))); }
-  catch (error) { console.error(error instanceof Error ? error.message : String(error)); process.exitCode = 1; }
+  catch (error) { printError(error); }
 } else if (Bun.argv[2] === "tabs" && Bun.argv[3] === "list") {
   try { console.log(JSON.stringify(await queueRequest("tabs list"))); }
-  catch (error) { console.error(error instanceof Error ? error.message : String(error)); process.exitCode = 1; }
+  catch (error) { printError(error); }
 } else if (Bun.argv[2] === "tabs" && (Bun.argv[3] === "use" || Bun.argv[3] === "clear")) {
   try {
     const rawId = Bun.argv[4];
@@ -1712,10 +2082,10 @@ if (Bun.argv[2] === "--service-daemon") {
     const rest = Bun.argv.slice(Bun.argv[3] === "use" ? 5 : 4);
     if (rest.some((arg) => arg !== "--json")) throw new Error("Unknown tabs option");
     console.log(JSON.stringify(await queueRequest(Bun.argv[3] === "use" ? `tabs use ${rawId}` : "tabs clear")));
-  } catch (error) { console.error(error instanceof Error ? error.message : String(error)); process.exitCode = 1; }
+  } catch (error) { printError(error); }
 } else if (Bun.argv[2] === "queue" && Bun.argv[3] === "list") {
   try { console.log(JSON.stringify(await queueRequest("queue list"))); }
-  catch (error) { console.error(error instanceof Error ? error.message : String(error)); process.exitCode = 1; }
+  catch (error) { printError(error); }
 } else if (Bun.argv[2] === "queue" && Bun.argv[3] === "enqueue") {
   try {
     const action = Bun.argv[4];
@@ -1733,7 +2103,7 @@ if (Bun.argv[2] === "--service-daemon") {
     }
     const job = validateJob({ action, args, key, notBefore });
     console.log(JSON.stringify(await queueRequest(`queue enqueue ${JSON.stringify(job)}`)));
-  } catch (error) { console.error(error instanceof Error ? error.message : String(error)); process.exitCode = 1; }
+  } catch (error) { printError(error); }
 } else if (Bun.argv[2] === "screenshot") {
   try {
     const args: { url?: string; selector?: string; target?: string; path?: string } = {};
@@ -1760,7 +2130,7 @@ if (Bun.argv[2] === "--service-daemon") {
     }
     if (!args.target) args.target = "viewport";
     console.log(JSON.stringify(await runPageJob("screenshot", args)));
-  } catch (error) { console.error(error instanceof Error ? error.message : String(error)); process.exitCode = 1; }
+  } catch (error) { printError(error); }
 } else if (Bun.argv[2] === "search") {
   try {
     const platform = Bun.argv[3];
@@ -1783,7 +2153,7 @@ if (Bun.argv[2] === "--service-daemon") {
       } else throw new Error(`Unknown search option: ${option}`);
     }
     console.log(JSON.stringify(await runPageJob("search", args)));
-  } catch (error) { console.error(error instanceof Error ? error.message : String(error)); process.exitCode = 1; }
+  } catch (error) { printError(error); }
 } else if (Bun.argv[2] === "inbox" && Bun.argv[3] === "list") {
   try {
     const platform = Bun.argv[4];
@@ -1801,7 +2171,7 @@ if (Bun.argv[2] === "--service-daemon") {
       } else throw new Error(`Unknown inbox option: ${option}`);
     }
     console.log(JSON.stringify(await runPageJob("readInbox", args)));
-  } catch (error) { console.error(error instanceof Error ? error.message : String(error)); process.exitCode = 1; }
+  } catch (error) { printError(error); }
 } else if (Bun.argv[2] === "inbox" && Bun.argv[3] === "read") {
   try {
     const args: { url?: string; to?: string; limit?: number } = { limit: 30 };
@@ -1824,7 +2194,7 @@ if (Bun.argv[2] === "--service-daemon") {
     }
     if (!args.url && !args.to) throw new Error("Provide --url or --to");
     console.log(JSON.stringify(await runPageJob("readThread", args)));
-  } catch (error) { console.error(error instanceof Error ? error.message : String(error)); process.exitCode = 1; }
+  } catch (error) { printError(error); }
 } else if (Bun.argv[2] === "message" && Bun.argv[3] === "send") {
   try {
     let to: string | undefined;
@@ -1853,7 +2223,7 @@ if (Bun.argv[2] === "--service-daemon") {
       const cleanText = checkMessageText(text);
       console.log(JSON.stringify(await runPageJob("sendMessage", { to: parsed.url, text: cleanText })));
     }
-  } catch (error) { console.error(error instanceof Error ? error.message : String(error)); process.exitCode = 1; }
+  } catch (error) { printError(error); }
 } else if (Bun.argv[2] === "youtube" && Bun.argv[3] === "channel") {
   try {
     let channelKey: string | undefined;
@@ -1868,7 +2238,7 @@ if (Bun.argv[2] === "--service-daemon") {
     const cfg = readYoutubeConfig();
     const ch = resolveChannel(cfg, channelKey);
     console.log(JSON.stringify({ channel: ch }));
-  } catch (error) { console.error(error instanceof Error ? error.message : String(error)); process.exitCode = 1; }
+  } catch (error) { printError(error); }
 } else if (Bun.argv[2] === "youtube" && Bun.argv[3] === "studio" && Bun.argv[4] === "status") {
   try {
     let channelKey: string | undefined;
@@ -1895,7 +2265,7 @@ if (Bun.argv[2] === "--service-daemon") {
       tab: { url: res?.url ?? null, title: res?.title ?? null, section: res?.section ?? null },
       account: probe.account ?? null,
     }));
-  } catch (error) { console.error(error instanceof Error ? error.message : String(error)); process.exitCode = 1; }
+  } catch (error) { printError(error); }
 } else if (Bun.argv[2] === "youtube" && Bun.argv[3] === "upload") {
   try {
     const file = Bun.argv[4];
@@ -1944,7 +2314,7 @@ if (Bun.argv[2] === "--service-daemon") {
     } else {
       console.log(JSON.stringify({ channel: ch, uploaded: true, note: "Studio upload confirmed" }));
     }
-  } catch (error) { console.error(error instanceof Error ? error.message : String(error)); process.exitCode = 1; }
+  } catch (error) { printError(error); }
 } else if (Bun.argv[2] === "browser" && Bun.argv[3] === "click") {
   try {
     const args: { index?: number; selector?: string; text?: string } = {};
@@ -1967,7 +2337,7 @@ if (Bun.argv[2] === "--service-daemon") {
     }
     if (args.index === undefined && args.selector === undefined && args.text === undefined) throw new Error("Provide --index, --selector or --text");
     console.log(JSON.stringify(await runPageJob("click", args)));
-  } catch (error) { console.error(error instanceof Error ? error.message : String(error)); process.exitCode = 1; }
+  } catch (error) { printError(error); }
 } else if (Bun.argv[2] === "browser" && Bun.argv[3] === "scroll") {
   try {
     const args: { selector?: string; times?: number } = {};
@@ -1985,14 +2355,14 @@ if (Bun.argv[2] === "--service-daemon") {
       } else throw new Error(`Unknown browser scroll option: ${option}`);
     }
     console.log(JSON.stringify(await runPageJob("scroll", args)));
-  } catch (error) { console.error(error instanceof Error ? error.message : String(error)); process.exitCode = 1; }
+  } catch (error) { printError(error); }
 } else if (Bun.argv[2] === "queue" && (Bun.argv[3] === "get" || Bun.argv[3] === "cancel")) {
   try {
     const id = Bun.argv[4];
     if (!id || !/^[1-9]\d*$/.test(id) || !Number.isSafeInteger(Number(id))) throw new Error("Job ID must be a positive integer");
     console.log(JSON.stringify(await queueRequest(`queue ${Bun.argv[3]} ${id}`)));
   }
-  catch (error) { console.error(error instanceof Error ? error.message : String(error)); process.exitCode = 1; }
+  catch (error) { printError(error); }
 }
 
 export { isPrivateHost, isMediaHost, mediaExt, safeSeg, postId, postDir, downloadPostMedia, parseDataUrl, screenshotPath, resolveHomePath, profileDir, downloadProfile, profileMarkdown };
