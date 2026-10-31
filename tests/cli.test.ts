@@ -11,6 +11,150 @@ import { Database } from "bun:sqlite";
 
 const projectVersion = packageInfo.version;
 
+test("Instagram comments use real extension extraction and trusted expansion with HALT checks", async () => {
+  const script = await Bun.file(new URL("../extension/background.js", import.meta.url)).text();
+  const stored: Record<string, unknown> = { cliSelectedTab: 42 };
+  const tab = { id: 42, windowId: 4, active: true, status: "complete", url: "https://www.instagram.com/previous/" };
+  const location = { href: tab.url, pathname: "/previous/", hostname: "www.instagram.com" };
+  let expanded = false;
+  const inputs: string[] = [];
+  const button = { innerText: "View more comments", getAttribute: () => null, scrollIntoView: () => {}, getBoundingClientRect: () => ({ left: 100, top: 100, width: 100, height: 30 }) };
+  const time: any = { innerText: "2d", getAttribute: () => "2026-01-01T00:00:00Z" };
+  const item = { innerText: "person\n2d\nHello there\n2 likes\nReply", parentElement: null, querySelectorAll: () => [time], querySelector: () => ({ innerText: "person", href: "https://www.instagram.com/person/" }) };
+  time.parentElement = item;
+  const document = { body: { innerText: "" }, querySelector: () => null, querySelectorAll: (selector: string) => selector === "time[datetime]" ? [time] : selector === "button, [role=button], a[role=button]" && !expanded ? [button] : [] };
+  const ignore = { addListener() {} };
+  const chrome = {
+    storage: { local: { get: async (keys: string | string[]) => Object.fromEntries((Array.isArray(keys) ? keys : [keys]).map((key) => [key, stored[key]])), set: async (values: Record<string, unknown>) => Object.assign(stored, values) }, onChanged: ignore },
+    tabs: { get: async () => tab, query: async () => [], update: async (_id: number, values: { url?: string }) => { if (values.url) { tab.url = values.url; location.href = values.url; location.pathname = new URL(values.url).pathname; } } },
+    tabGroups: { query: async () => [] }, windows: { get: async () => ({ state: "normal" }) },
+    scripting: { executeScript: async ({ func, args = [] }: any) => [{ result: func(...args) }] },
+    debugger: { attach: async () => {}, detach: async () => {}, sendCommand: async (_target: unknown, _method: string, params: { type: string }) => { inputs.push(params.type); if (params.type === "mouseReleased") expanded = true; } },
+    alarms: { create() {}, onAlarm: ignore }, runtime: { onStartup: ignore },
+  };
+  const context = { chrome, WebSocket, console, URL, document, location, setTimeout: (fn: () => void, ms?: number) => { if ((ms ?? 0) < 10000) { fn(); return 0; } return setTimeout(fn, ms); }, clearTimeout: (id: any) => clearTimeout(id), Date, Math, resetExpanded: () => { expanded = false; } };
+  runInNewContext(script, context);
+  const result = await runInNewContext('getComments({url:"https://www.instagram.com/p/Cx_123/",limit:1})', context);
+  expect(result).toEqual({ platform: "ig", url: "https://www.instagram.com/p/Cx_123/", comments: [{ author: "person", authorUrl: "https://www.instagram.com/person/", text: "Hello there", date: "2026-01-01T00:00:00Z", likes: 2 }] });
+  expect(inputs).toContain("mousePressed"); expect(inputs).toContain("mouseReleased");
+  tab.url = "https://www.instagram.com/checkpoint/";
+  await expect(runInNewContext('getComments({url:"https://www.instagram.com/p/Cx_123/"})', context)).rejects.toMatchObject({ code: "HALT" });
+  tab.url = "https://www.instagram.com/p/Cx_123/";
+  await expect(runInNewContext('getComments({url:"https://www.instagram.com/p/Cx_123/",limit:0})', context)).rejects.toThrow("Comment limit must be an integer from 1 to 500");
+  await expect(runInNewContext('getComments({url:"https://www.instagram.com/p/Cx_123/",limit:501})', context)).rejects.toThrow("Comment limit must be an integer from 1 to 500");
+  context.resetExpanded();
+  chrome.windows.get = async () => ({ state: "minimized" });
+  await expect(runInNewContext('getComments({url:"https://www.instagram.com/p/Cx_123/",limit:1})', context)).rejects.toThrow("Restore the work window before expanding comments");
+  chrome.windows.get = async () => ({ state: "normal" });
+  tab.url = "https://www.instagram.com/p/PreviousPost/";
+  chrome.tabs.update = async () => { tab.url = "https://www.instagram.com/p/DifferentPost/"; location.href = tab.url; location.pathname = "/p/DifferentPost/"; };
+  await expect(runInNewContext('getComments({url:"https://www.instagram.com/p/Cx_123/",limit:1})', context)).rejects.toThrow("different Instagram post");
+});
+
+test("post comments validates Instagram URL and limit and returns queued result", async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), "socmedia-comments-"));
+  const run = async (...args: string[]) => {
+    const cli = Bun.spawn(["bun", "run", "src/cli.ts", ...args], { cwd: import.meta.dir + "/..", env: { ...process.env, SOCMEDIA_STATE_DIR: stateDir, SOCMEDIA_EXTENSION_PORT: "0" }, stdout: "pipe", stderr: "pipe" });
+    const [stdout, stderr, exit] = await Promise.all([new Response(cli.stdout).text(), new Response(cli.stderr).text(), cli.exited]); return { stdout, stderr, exit };
+  };
+  let pid: number | undefined; let ws: WebSocket | undefined;
+  try {
+    const help = await run("post", "comments", "--help"); expect(help.stdout).toContain("comments <url>"); expect(help.stdout).toContain("--limit"); expect(help.stdout).toContain("--json");
+    for (const args of [["https://instagram.com/example/"], ["https://facebook.com/example/posts/123"], ["https://instagram.com.evil.test/p/123/"], ["https://instagram.com/p/123/", "--limit", "501"], ["https://instagram.com/p/123/", "--limit", "0"]]) {
+      expect((await run("post", "comments", ...args, "--json")).exit).not.toBe(0);
+    }
+    const id = "o".repeat(32);
+    const pairing = JSON.parse((await run("extension", "pair", "--id", id, "--json")).stdout);
+    const started = JSON.parse((await run("service", "start", "--json")).stdout); pid = started.pid;
+    ws = new WebSocket(`ws://127.0.0.1:${started.extension.port}/extension`, { headers: { Origin: `chrome-extension://${id}` } } as unknown as string[]);
+    await authenticateMock(ws, pairing.token);
+    const expected = { platform: "ig", url: "https://www.instagram.com/p/Cx_123/", comments: [{ author: "person", authorUrl: "https://www.instagram.com/person/", text: "Hello", date: null, likes: 0 }] };
+    ws.onmessage = (event) => { const request = JSON.parse(String(event.data)); expect(request).toMatchObject({ action: "getComments", args: { url: expected.url, limit: 1 } }); ws!.send(JSON.stringify({ type: "result", id: request.id, result: expected })); };
+    const result = await run("post", "comments", "https://instagram.com/p/Cx_123/?ignored=yes", "--limit", "1", "--json");
+    expect(result.exit).toBe(0); expect(JSON.parse(result.stdout)).toEqual(expected);
+    const jobs = JSON.parse((await run("queue", "list", "--json")).stdout).jobs;
+    expect(jobs[0]).toMatchObject({ action: "getComments", status: "done", result: expected });
+  } finally {
+    ws?.close(); if (pid) { try { process.kill(pid, "SIGTERM"); } catch {} for (let i = 0; i < 100; i++) { try { process.kill(pid, 0); } catch { break; } await Bun.sleep(20); } }
+    await rm(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("getComments validates enqueue arguments, requeues on disconnect and recovers on restart", async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), "socmedia-comments-recovery-"));
+  const run = async (...args: string[]) => {
+    const cli = Bun.spawn(["bun", "run", "src/cli.ts", ...args], { cwd: import.meta.dir + "/..", env: { ...process.env, SOCMEDIA_STATE_DIR: stateDir, SOCMEDIA_EXTENSION_PORT: "0" }, stdout: "pipe", stderr: "pipe" });
+    const [stdout, stderr, exit] = await Promise.all([new Response(cli.stdout).text(), new Response(cli.stderr).text(), cli.exited]);
+    return { stdout, stderr, exit };
+  };
+  let pid: number | undefined;
+  let ws: WebSocket | undefined;
+  try {
+    expect((await run("queue", "enqueue", "getComments", "--args", '{"url":"https://facebook.com/post/1"}', "--json")).exit).not.toBe(0);
+    expect((await run("queue", "enqueue", "getComments", "--args", '{"url":"https://instagram.com/p/123/","extra":1}', "--json")).exit).not.toBe(0);
+    expect((await run("queue", "enqueue", "getComments", "--args", '{"url":"https://instagram.com/p/123/","limit":0}', "--json")).exit).not.toBe(0);
+    expect((await run("queue", "enqueue", "getComments", "--args", '{"url":"https://instagram.com/p/123/","limit":600}', "--json")).exit).not.toBe(0);
+
+    const extId = "k".repeat(32);
+    const pairing = JSON.parse((await run("extension", "pair", "--id", extId, "--json")).stdout);
+    let started = JSON.parse((await run("service", "start", "--json")).stdout);
+    pid = started.pid;
+
+    const connect = async () => {
+      const socket = new WebSocket(`ws://127.0.0.1:${started.extension.port}/extension`, { headers: { Origin: `chrome-extension://${extId}` } } as unknown as string[]);
+      const request = new Promise<any>((resolve) => socket.addEventListener("message", (event) => { const msg = JSON.parse(String(event.data)); if (msg.type === "request") resolve(msg); }));
+      await authenticateMock(socket, pairing.token);
+      return { socket, request };
+    };
+
+    let link = await connect();
+    ws = link.socket;
+
+    const job = JSON.parse((await run("queue", "enqueue", "getComments", "--args", '{"url":"https://instagram.com/p/Cx_123/","limit":10}', "--json")).stdout);
+    const req = await Promise.race([link.request, Bun.sleep(1500).then(() => { throw new Error("timeout"); })]);
+    expect(req).toMatchObject({ action: "getComments", args: { url: "https://www.instagram.com/p/Cx_123/", limit: 10 } });
+
+    ws.close();
+    for (let i = 0; i < 50; i++) {
+      const check = JSON.parse((await run("queue", "get", String(job.id), "--json")).stdout);
+      if (check.status === "queued") break;
+      await Bun.sleep(20);
+    }
+    expect(JSON.parse((await run("queue", "get", String(job.id), "--json")).stdout).status).toBe("queued");
+
+    link = await connect();
+    ws = link.socket;
+    await Promise.race([link.request, Bun.sleep(1500).then(() => { throw new Error("retry timeout"); })]);
+    expect(JSON.parse((await run("queue", "get", String(job.id), "--json")).stdout).status).toBe("running");
+
+    process.kill(pid!, "SIGKILL");
+    ws.close();
+    for (let i = 0; i < 100; i++) { if (!(await run("service", "status", "--json")).stdout.includes('"running":true')) break; await Bun.sleep(20); }
+    started = JSON.parse((await run("service", "start", "--json")).stdout);
+    pid = started.pid;
+
+    expect(JSON.parse((await run("queue", "get", String(job.id), "--json")).stdout).status).toBe("queued");
+
+    link = await connect();
+    ws = link.socket;
+    const finalReq = await Promise.race([link.request, Bun.sleep(1500).then(() => { throw new Error("final retry timeout"); })]);
+    const mockResult = { platform: "ig", url: "https://www.instagram.com/p/Cx_123/", comments: [] };
+    ws.send(JSON.stringify({ type: "result", id: finalReq.id, result: mockResult }));
+
+    let result: any;
+    for (let i = 0; i < 50; i++) {
+      result = JSON.parse((await run("queue", "get", String(job.id), "--json")).stdout);
+      if (result.status === "done") break;
+      await Bun.sleep(20);
+    }
+    expect(result).toMatchObject({ status: "done", result: mockResult });
+  } finally {
+    ws?.close();
+    if (pid) { try { process.kill(pid, "SIGTERM"); } catch {} for (let i = 0; i < 100; i++) { try { process.kill(pid, 0); } catch { break; } await Bun.sleep(20); } }
+    await rm(stateDir, { recursive: true, force: true });
+  }
+});
+
 test("contacts export writes filtered CSV JSON and JSONL inside home safely", async () => {
   const home = await mkdtemp(join(tmpdir(), "socmedia-export-home-"));
   const outside = await mkdtemp(join(tmpdir(), "socmedia-export-outside-"));

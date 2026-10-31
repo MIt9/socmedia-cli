@@ -145,6 +145,15 @@ function profileUrl(value) {
   return `https://www.facebook.com/${parts.join("/")}`;
 }
 
+function instagramPostUrl(value) {
+  if (typeof value !== "string") throw new Error("Instagram post or reel URL is required");
+  let url;
+  try { url = new URL(value); } catch { throw new Error("Invalid Instagram post or reel URL"); }
+  const parts = url.pathname.split("/").filter(Boolean);
+  if (url.protocol !== "https:" || !["instagram.com", "www.instagram.com"].includes(url.hostname.toLowerCase()) || url.username || url.password || url.port || parts.length !== 2 || !["p", "reel"].includes(parts[0]) || !/^[a-zA-Z0-9_-]{1,64}$/.test(parts[1])) throw new Error("Provide an HTTPS Instagram post or reel URL; Facebook comments are not supported yet");
+  return `https://www.instagram.com/${parts[0]}/${parts[1]}/`;
+}
+
 function extractInstagramProfile() {
   const num = (s) => {
     if (s == null) return null;
@@ -247,8 +256,7 @@ let lastProfileNavigation = 0;
 let nextProfileGap = 3000;
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-async function getProfile({ url }) {
-  const target = profileUrl(url);
+async function navigateSocial(target) {
   const { tabId } = await getWorkTab();
   const current = await chrome.tabs.get(tabId);
   if (current.url !== "about:blank") await safeTab(tabId);
@@ -267,15 +275,102 @@ async function getProfile({ url }) {
       if (tab.status === "complete") { loaded = true; break; }
       await delay(300);
     }
-    if (!loaded) throw new Error("Profile navigation timed out");
+    if (!loaded) throw new Error("Social page navigation timed out");
     await delay(800 + Math.floor(Math.random() * 701));
   }
-  const tab = await safeTab(tabId);
+  return safeTab(tabId);
+}
+
+async function getProfile({ url }) {
+  const target = profileUrl(url);
+  const tab = await navigateSocial(target);
+  const tabId = tab.id;
   if (profileUrl(tab.url).toLowerCase() !== target.toLowerCase()) throw new Error("Redirected to a different profile");
   const extractor = new URL(target).hostname === "www.instagram.com" ? extractInstagramProfile : extractFacebookProfile;
   const [execution] = await chrome.scripting.executeScript({ target: { tabId }, func: extractor });
   if (!execution?.result) throw new Error("Could not read profile");
   return execution.result;
+}
+
+function findMoreComments() {
+  const buttons = [...document.querySelectorAll("button, [role=button], a[role=button]")];
+  const button = buttons.find((item) => (/View (more|previous) comments|Load more comments/i.test(item.innerText || "") || /View (more|previous) comments|Load more comments/i.test(item.getAttribute("aria-label") || "")) && item.getBoundingClientRect().width > 0);
+  if (!button) return null;
+  button.scrollIntoView({ block: "center" });
+  const rect = button.getBoundingClientRect();
+  if (!rect.width || !rect.height) return null;
+  return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+}
+
+function extractInstagramComments(limit) {
+  const num = (s) => {
+    if (s == null) return null;
+    const match = String(s).replace(/,/g, "").match(/([\d.]+)\s*([KkMmBb])?/);
+    if (!match) return null;
+    const value = parseFloat(match[1]);
+    if (isNaN(value)) return null;
+    return Math.round(value * ({ k: 1e3, m: 1e6, b: 1e9 }[(match[2] || "").toLowerCase()] || 1));
+  };
+  const comments = [];
+  for (const time of document.querySelectorAll("time[datetime]")) {
+    let item = time.parentElement;
+    for (let i = 0; item && i < 10; i++, item = item.parentElement) {
+      if (item.querySelectorAll("time[datetime]").length > 1) { item = null; break; }
+      if (/(^|\n)Reply(\n|$)/.test(item.innerText || "")) break;
+    }
+    if (!item || !/(^|\n)Reply(\n|$)/.test(item.innerText || "")) continue;
+    const author = item.querySelector('a[href^="/"]:not([href*="/p/"]):not([href*="/reel/"])');
+    const lines = item.innerText.split("\n").map((line) => line.trim()).filter(Boolean);
+    const ti = lines.indexOf(time.innerText.trim());
+    const body = lines.slice(ti + 1).filter((line) => !/^(Reply|[\d.,]+[KkMm]?\s+likes?|View all \d+ repl(y|ies)|Hide replies|See translation)$/i.test(line));
+    const text = body.join("\n") || null;
+    if (!text) continue;
+    comments.push({ author: author?.innerText?.trim() || lines[0] || null, authorUrl: author?.href || null, text, date: time.getAttribute("datetime"), likes: num(lines.find((line) => /^[\d.,]+[KkMm]?\s+likes?$/i.test(line))) ?? 0 });
+    if (comments.length >= limit) break;
+  }
+  return comments;
+}
+
+async function getComments({ url, limit = 20 }) {
+  const target = instagramPostUrl(url);
+  if (!Number.isInteger(limit) || limit < 1 || limit > 500) throw new Error("Comment limit must be an integer from 1 to 500");
+  const tab = await navigateSocial(target);
+  const tabId = tab.id;
+  const checkTarget = async () => {
+    const current = await safeTab(tabId);
+    if (instagramPostUrl(current.url) !== target) throw new Error("Redirected to a different Instagram post");
+    return current;
+  };
+  await checkTarget();
+  let attached = false;
+  try {
+    for (let i = 0; i < 5; i++) {
+      await checkTarget();
+      const [located] = await chrome.scripting.executeScript({ target: { tabId }, func: findMoreComments });
+      const point = located?.result;
+      if (!point) break;
+      await checkTarget();
+      if (!attached) {
+        const win = await chrome.windows.get(tab.windowId);
+        if (win.state === "minimized") throw new Error("Restore the work window before expanding comments");
+        await chrome.debugger.attach({ tabId }, "1.3"); attached = true;
+      }
+      for (const type of ["mouseMoved", "mousePressed", "mouseReleased"]) {
+        let timer;
+        try {
+          await Promise.race([
+            chrome.debugger.sendCommand({ tabId }, "Input.dispatchMouseEvent", { type, x: point.x, y: point.y, ...(type !== "mouseMoved" && { button: "left", clickCount: 1 }) }),
+            new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("Chrome debugger input timed out")), 15000); }),
+          ]);
+        } finally { clearTimeout(timer); }
+      }
+      await delay(1000 + Math.floor(Math.random() * 1001));
+      await checkTarget();
+    }
+  } finally { if (attached) await chrome.debugger.detach({ tabId }).catch(() => {}); }
+  const current = await checkTarget();
+  const [execution] = await chrome.scripting.executeScript({ target: { tabId }, func: extractInstagramComments, args: [limit] });
+  return { platform: "ig", url: current.url, comments: execution?.result || [] };
 }
 
 async function readPage({ maxLines = 200 }) {
@@ -341,9 +436,9 @@ async function connect() {
       } else if (message.type === "hello" && verified) {
         authenticated = message.compatible === true;
         if (!authenticated) console.warn("Socmedia service version is incompatible", message.version);
-      } else if (authenticated && message.type === "request" && (message.action === "tabs.list" || message.action === "tabs.use" || message.action === "readPage" || message.action === "snapshot" || message.action === "getProfile")) {
+      } else if (authenticated && message.type === "request" && (message.action === "tabs.list" || message.action === "tabs.use" || message.action === "readPage" || message.action === "snapshot" || message.action === "getProfile" || message.action === "getComments")) {
         const reply = (result) => { if (connection.readyState === WebSocket.OPEN) connection.send(JSON.stringify({ type: "result", id: message.id, ...result })); };
-        const task = browserAction.then(() => message.action === "tabs.list" ? listTabs() : message.action === "tabs.use" ? useTab(message.args || {}) : message.action === "snapshot" ? snapshot() : message.action === "getProfile" ? getProfile(message.args || {}) : readPage(message.args || {}));
+        const task = browserAction.then(() => message.action === "tabs.list" ? listTabs() : message.action === "tabs.use" ? useTab(message.args || {}) : message.action === "snapshot" ? snapshot() : message.action === "getProfile" ? getProfile(message.args || {}) : message.action === "getComments" ? getComments(message.args || {}) : readPage(message.args || {}));
         browserAction = task.then(() => undefined, () => undefined);
         task.then((result) => reply({ result }), (error) => reply({ error: error.code === "HALT" ? { code: "HALT", reason: error.reason } : error.message }));
       }

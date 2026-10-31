@@ -152,6 +152,15 @@ function profileUrl(value: unknown): string {
   return `https://www.facebook.com/${parts.join("/")}`;
 }
 
+function instagramPostUrl(value: unknown): string {
+  if (typeof value !== "string") throw new Error("Instagram post or reel URL is required");
+  let url: URL;
+  try { url = new URL(value); } catch { throw new Error("Invalid Instagram post or reel URL"); }
+  const parts = url.pathname.split("/").filter(Boolean);
+  if (url.protocol !== "https:" || !["instagram.com", "www.instagram.com"].includes(url.hostname.toLowerCase()) || url.username || url.password || url.port || parts.length !== 2 || !["p", "reel"].includes(parts[0]!) || !/^[a-zA-Z0-9_-]{1,64}$/.test(parts[1]!)) throw new Error("Provide an HTTPS Instagram post or reel URL; Facebook comments are not supported yet");
+  return `https://www.instagram.com/${parts[0]}/${parts[1]}/`;
+}
+
 function upsertProfileContact(db: Database, value: unknown, requestedUrl: string) {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Invalid social profile result");
   const profile = value as Record<string, any>;
@@ -191,6 +200,12 @@ function validateJob(value: unknown) {
     const args = job.args as Record<string, unknown>;
     if (Object.keys(args).some((key) => key !== "url")) throw new Error("getProfile accepts only a profile URL");
     args.url = profileUrl(args.url);
+  }
+  if (job.action === "getComments") {
+    const args = job.args as Record<string, unknown>;
+    if (Object.keys(args).some((key) => key !== "url" && key !== "limit")) throw new Error("getComments accepts only url and limit");
+    args.url = instagramPostUrl(args.url);
+    if (args.limit !== undefined && (!Number.isInteger(args.limit) || Number(args.limit) < 1 || Number(args.limit) > 500)) throw new Error("Comment limit must be an integer from 1 to 500");
   }
   if (job.key !== undefined && (typeof job.key !== "string" || !job.key)) throw new Error("--key must be a nonempty string");
   if (job.notBefore !== undefined && (typeof job.notBefore !== "string" || !Number.isFinite(Date.parse(job.notBefore)))) throw new Error("--not-before must be a valid ISO date");
@@ -293,7 +308,7 @@ async function queueRequest(command: string): Promise<unknown> {
   });
 }
 
-async function runPageJob(action: "snapshot" | "readPage" | "getProfile", args: Record<string, unknown>): Promise<unknown> {
+async function runPageJob(action: "snapshot" | "readPage" | "getProfile" | "getComments", args: Record<string, unknown>): Promise<unknown> {
   const current = await status();
   if (!current.running) throw new Error("Service not running");
   if (current.halted) {
@@ -304,7 +319,7 @@ async function runPageJob(action: "snapshot" | "readPage" | "getProfile", args: 
   if (!extension?.connected) throw new Error("Extension not connected");
   if (!extension.compatible) throw new Error("Extension version incompatible");
   const created = await queueRequest(`queue enqueue ${JSON.stringify({ action, args })}`) as { id: number };
-  const deadline = Date.now() + (action === "getProfile" ? 60000 : 30000);
+  const deadline = Date.now() + (action === "getComments" ? 75000 : action === "getProfile" ? 60000 : 30000);
   while (Date.now() < deadline) {
     let job = await queueRequest(`queue get ${created.id}`) as { status: string; result?: unknown; error?: string | { code?: string; reason?: string } };
     if (!["done", "failed", "cancelled"].includes(job.status)) {
@@ -354,7 +369,7 @@ if (Bun.argv[2] === "--service-daemon") {
   db.run("CREATE TABLE IF NOT EXISTS service_state (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
   const haltRow = db.query("SELECT value FROM service_state WHERE key = 'halted'").get() as { value: string } | null;
   let halted: { code: string; reason: string } | null = haltRow ? JSON.parse(haltRow.value) : null;
-  db.run("UPDATE jobs SET data = json_set(data, '$.status', 'queued') WHERE json_extract(data, '$.action') IN ('readPage','snapshot','getProfile') AND json_extract(data, '$.status') = 'running'");
+  db.run("UPDATE jobs SET data = json_set(data, '$.status', 'queued') WHERE json_extract(data, '$.action') IN ('readPage','snapshot','getProfile','getComments') AND json_extract(data, '$.status') = 'running'");
   type ExtensionData = { token: string; challenge?: { clientNonce: string; serverNonce: string; version: string } };
   let extensionSocket: Bun.ServerWebSocket<ExtensionData> | null = null;
   let connectedVersion: string | null = null;
@@ -417,7 +432,7 @@ if (Bun.argv[2] === "--service-daemon") {
   function pump() {
     if (workerWake) { clearTimeout(workerWake); workerWake = undefined; }
     if (halted || browserBusy || !extensionSocket || !connectedVersion || !compatibleVersion(connectedVersion)) return;
-    const rows = db.query("SELECT id, data FROM jobs WHERE json_extract(data, '$.action') IN ('readPage','snapshot','getProfile') AND json_extract(data, '$.status') = 'queued' ORDER BY id").all() as { id: number; data: string }[];
+    const rows = db.query("SELECT id, data FROM jobs WHERE json_extract(data, '$.action') IN ('readPage','snapshot','getProfile','getComments') AND json_extract(data, '$.status') = 'queued' ORDER BY id").all() as { id: number; data: string }[];
     const now = Date.now();
     let wakeAt = Infinity;
     const row = rows.find((candidate) => {
@@ -456,7 +471,8 @@ if (Bun.argv[2] === "--service-daemon") {
       browserBusy = false;
       queueMicrotask(pump);
     };
-    const timer = setTimeout(() => { pending.delete(id); finish({ error: "Extension request timed out" }); }, job.action === "getProfile" ? Math.max(extensionTimeout, 45000) : extensionTimeout);
+    const timeout = job.action === "getComments" ? Math.max(extensionTimeout, 60000) : job.action === "getProfile" ? Math.max(extensionTimeout, 45000) : extensionTimeout;
+    const timer = setTimeout(() => { pending.delete(id); finish({ error: "Extension request timed out" }); }, timeout);
     pending.set(id, { ws, finish, timer });
     ws.send(JSON.stringify({ type: "request", id, action: job.action, args: job.args }));
   }
@@ -605,6 +621,8 @@ if (Bun.argv[2] === "--service-daemon") {
     console.log("Usage: socmedia profile get <url> [--json]\n\nCommands:\n  get <url>  Read an Instagram or Facebook profile/page via its HTTPS URL\n\nOptions:\n  --json     Print the result as JSON\n  --help     Show this help message\n\nSuccessful reads update local contacts. Fields may be null or incomplete.");
   } else if (Bun.argv[2] === "contacts") {
     console.log("Usage: socmedia contacts <list|update|export> [options]\n\nCommands:\n  list              List locally stored contacts\n  update <id>       Update a contact by its ID; provide --status and/or --note\n  export            Export filtered contacts to a file inside home\n\nOptions:\n  --status STATUS   Filter list/export or set status: new, messaged, replied, won, rejected, skip\n  --platform NAME   Filter list/export by ig or fb\n  --note TEXT       Set note on update (maximum 2000 characters; empty clears it)\n  --format FORMAT   Export as csv, json or jsonl (default: csv)\n  --path PATH       Export destination inside home (default: ~/socmedia-data/contacts-<date>.<format>)\n  --json            Print the command result as JSON\n  --help            Show this help message\n\nInstagram and Facebook profile reads populate contacts; import is not implemented yet.");
+  } else if (Bun.argv[2] === "post") {
+    console.log("Usage: socmedia post comments <url> [--limit N] [--json]\n\nCommands:\n  comments <url>  Read Instagram post/reel comments; Facebook is not supported yet\n\nOptions:\n  --limit N       Maximum comments, 1-500 (default: 20)\n  --json          Print the result as JSON\n  --help          Show this help message\n\nExpands available comments through Chrome debugger and reads visible English UI; results may be incomplete.");
   } else if (Bun.argv[2] === "page") {
     console.log("Usage: socmedia page <read|snapshot> [options]\n\nCommands:\n  read            Queue and return visible page text and URL\n  snapshot        Queue and return visible interactive elements\n\nOptions:\n  --max-lines N   With read, limit output to 1-1000 lines (default: 200)\n  --json          Print the result as JSON\n  --help          Show this help message");
   } else if (Bun.argv[2] === "config") {
@@ -612,8 +630,22 @@ if (Bun.argv[2] === "--service-daemon") {
   } else if (Bun.argv[2] === "extension") {
     console.log("Usage: socmedia extension <install|path|pair> [options]\n\nCommands:\n  install    Copy the extension to its stable state directory and show Chrome setup steps\n  path       Show the stable extension directory\n  pair       Generate a pairing secret for the Chrome extension\n\nOptions:\n  --open     With install, open chrome://extensions in Google Chrome\n  --id ID    With pair, set the Chrome extension ID\n  --json     Print the result as JSON; pairing output contains a sensitive secret\n  --help     Show this help message\n\nPairing replaces any previous pairing; restart the service to disconnect existing clients.");
   } else {
-    console.log("Usage: socmedia [options]\n\nCommands:\n  service    Start or inspect the local service\n  queue      Inspect the service queue\n  extension  Pair the Chrome extension\n  tabs       Inspect extension work tabs\n  page       Inspect the work page\n  profile    Read a social profile\n  contacts   List local contacts\n  config     Configure the service\n\nOptions:\n  --version  Show the CLI version\n  --help     Show this help message");
+    console.log("Usage: socmedia [options]\n\nCommands:\n  service    Start or inspect the local service\n  queue      Inspect the service queue\n  extension  Pair the Chrome extension\n  tabs       Inspect extension work tabs\n  page       Inspect the work page\n  post       Inspect a social post\n  profile    Read a social profile\n  contacts   List local contacts\n  config     Configure the service\n\nOptions:\n  --version  Show the CLI version\n  --help     Show this help message");
   }
+} else if (Bun.argv[2] === "post" && Bun.argv[3] === "comments") {
+  try {
+    const url = instagramPostUrl(Bun.argv[4]);
+    const args: { url: string; limit?: number } = { url };
+    for (let i = 5; i < Bun.argv.length; i++) {
+      const option = Bun.argv[i];
+      if (option === "--json") continue;
+      if (option !== "--limit") throw new Error(`Unknown post option: ${option}`);
+      const value = Bun.argv[++i];
+      if (!value || !/^[1-9]\d*$/.test(value) || Number(value) > 500) throw new Error("--limit must be an integer from 1 to 500");
+      args.limit = Number(value);
+    }
+    console.log(JSON.stringify(await runPageJob("getComments", args)));
+  } catch (error) { console.error(error instanceof Error ? error.message : String(error)); process.exitCode = 1; }
 } else if (Bun.argv[2] === "contacts" && Bun.argv[3] === "export") {
   try {
     const args: { status?: string; platform?: string; format?: string; path?: string } = {};

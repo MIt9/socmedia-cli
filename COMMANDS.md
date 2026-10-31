@@ -1,6 +1,6 @@
 # Відповідність операцій CLI
 
-Це таблиця цільової відповідності, а не перелік уже реалізованих команд. `page read`, `page snapshot` і `profile get` для Instagram та Facebook реалізовані й перевірені автоматично з імітованим розширенням; їх ще не перевірено наживо в Chrome. Джерела: `soc-media-ex/mcp-server/index.js` (32 реєстрації), `README.md` і `SPEC.md`. Форматування параметрів і результатів можна уточнити під час реалізації; `--json` передбачає структурований результат. Для запису `--confirm` означає явне підтвердження; без нього повертається preview.
+Це таблиця цільової відповідності, а не перелік уже реалізованих команд. `page read`, `page snapshot`, `profile get` для Instagram та Facebook, а також `post comments` для Instagram реалізовані й перевірені автоматично з імітованим розширенням; їх ще не перевірено наживо в Chrome. Джерела: `soc-media-ex/mcp-server/index.js` (32 реєстрації), `README.md` і `SPEC.md`. Форматування параметрів і результатів можна уточнити під час реалізації; `--json` передбачає структурований результат. Для запису `--confirm` означає явне підтвердження; без нього повертається preview.
 
 ## Instagram, Facebook, браузер і черга
 
@@ -10,7 +10,7 @@
 | `social_get_profile` | `socmedia profile get URL` | `--json` | Instagram і Facebook: дані профілю й доступні показники, поля можуть бути `null`; успішне читання додає або оновлює контакт. Facebook URL: slug, `profile.php?id=<число>`, або `/people/<slug>/<id>` / `/pages/<slug>/<id>`. Redirect на інший профіль відхиляється. Наживо в Chrome не перевірено. |
 | `social_get_posts` | `socmedia profile posts URL` | `--limit` | Список постів із посиланнями, типами, зображеннями та доступними метриками. |
 | `social_get_post` | `socmedia post get URL` | `--download` (`--slides` як сумісний alias) | Пост, автор, медіа, хештеги, згадки; при завантаженні — шляхи або помилки окремих файлів. |
-| `social_get_comments` | `socmedia post comments URL` | `--limit` | Коментарі, автори, текст, дати та вподобання. |
+| `social_get_comments` | `socmedia post comments URL` | `--limit` | Instagram реалізовано: URL поста/рілса, розгортання через Chrome debugger, коментарі, автори, текст, дати та вподобання; Facebook ще не підтримується. Наживо в Chrome не перевірено. |
 | `social_search` | `socmedia search PLATFORM QUERY` | `--type users\|hashtag\|pages\|places`, `--limit` | Список знайдених профілів або інших доступних результатів. |
 | `social_screenshot` | `socmedia screenshot` | `--url`, `--selector`, `--target viewport\|post\|profile`, `--path` | Шлях PNG, розміри, URL і `truncated` за потреби; MCP inline image замінюється шляхом до файлу. |
 | `social_download_profile` | `socmedia profile download URL` | `--limit`, `--details`, `--max-media`, `--dir`, `--background` | Каталог профілю, кількість постів і медіа, скриншот, попередження. |

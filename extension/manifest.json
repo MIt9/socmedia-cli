@@ -1,11 +1,11 @@
 {
   "manifest_version": 3,
   "name": "Socmedia CLI Bridge",
-  "version": "0.4.4",
+  "version": "0.5.0",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA1Um1tAfWNm7pSxb9Uyo9RRymAv062ZYMXWJzLKGV0FM1CnzLNMIYFvSEgUJLCIKPG+ifRS9mBFejj3OCMqgR8uxMgov1ELhOuLmcX51on2M5HSgOl+MQIDiV5fAYKzyKZzRBsRZBXW3xubKhNciyvvP3wsXsJ2rAWRMHEhKpXFQPE6Z8K+LyYUI87OKAyBiV4eqzutHzwgkbbWrssgnQweTmryHd4q+CzysTGds4H2ReqejDvUa+9lpN/gRt1P/96GHmwbt5+OwRF2Ert1v1kuJIKppzu5ZByBEui2glokqrOgwEmZV7vjJpnz6o/5N4Kgghcm+VQgDNFiTZzzhzoQIDAQAB",
   "description": "Connects the local Socmedia CLI service to Chrome.",
   "background": { "service_worker": "background.js" },
-  "permissions": ["alarms", "storage", "tabs", "tabGroups", "scripting"],
+  "permissions": ["alarms", "storage", "tabs", "tabGroups", "scripting", "debugger"],
   "host_permissions": ["https://*.instagram.com/*", "https://*.facebook.com/*", "https://*.fb.com/*", "https://*.youtube.com/*"],
   "icons": {
     "16": "icons/icon16.png",
