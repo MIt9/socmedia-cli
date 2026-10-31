@@ -1,60 +1,92 @@
 #!/bin/sh
-# Release validation hook: runs only when pushing version tags (v*)
-while read local_ref local_sha remote_ref remote_sha; do
-  case "$local_ref" in
-    refs/tags/v*) ;;
-    *) continue ;;
+# pre-push: publishes a GitHub Release when a v* tag is pushed. Any other push exits 0 silently.
+# Flow (two pushes): `git push origin main` first, then `git push origin vX.Y.Z`. gh creates the tag on GitHub from the
+# commit, so the tag push then prints "reference already exists" for the tag: that message is expected, not an error.
+# Env: SKIP_RELEASE=1 skips; RELEASE_DRY_RUN=1 does everything except publish and prints the gh command;
+#      RELEASE_TARGETS=host|all (default host = this machine's arch; "all" also builds x64 and needs network);
+#      RELEASE_TEST_CMD / RELEASE_TYPECHECK_CMD / RELEASE_BUILD_CMD / RELEASE_GH override the steps (tests use stubs).
+remote="$1"
+refs="$(cat)" # read stdin first: the commands below must not consume it
+tags=""
+while read -r lref lsha rref rsha; do
+  case "$lref" in refs/tags/v*) [ "$lsha" = 0000000000000000000000000000000000000000 ] || tags="$tags $lref" ;; esac
+done <<EOT
+$refs
+EOT
+[ -n "$tags" ] || exit 0
+if [ -n "${SKIP_RELEASE:-}" ]; then echo "pre-push: SKIP_RELEASE set, not creating a GitHub release" >&2; exit 0; fi
+
+exec >&2 </dev/null
+step() { echo "pre-push: $*"; }
+fail() { echo "pre-push: release $tag ABORTED: $*" >&2; echo "pre-push: push cancelled. Fix it, then retry: git push $remote $tag   (bypass: SKIP_RELEASE=1 git push ...)" >&2; exit 1; }
+q() { case "$1" in *[!A-Za-z0-9_./:=+@%-]*|"") printf "'%s'" "$(printf %s "$1" | sed "s/'/'\\\\''/g")" ;; *) printf %s "$1" ;; esac; }
+ver_of() { bun -e "console.log(JSON.parse(require('fs').readFileSync('$1','utf8')).version)"; }
+run() { env -u GIT_DIR -u GIT_INDEX_FILE -u GIT_WORK_TREE sh -c "$1"; }
+
+cd "$(git rev-parse --show-toplevel)" || exit 1
+tag="(none)"
+gh_cmd="${RELEASE_GH:-gh}"
+command -v "$gh_cmd" >/dev/null 2>&1 || fail "gh (GitHub CLI) is not installed or not on PATH; install it and run gh auth login. The release is never skipped silently"
+
+for ref in $tags; do
+  tag="${ref#refs/tags/}"
+  step "release $tag"
+  [ "$(git cat-file -t "$ref")" = commit ] || fail "$tag is an annotated tag; use a lightweight tag (git tag $tag) so GitHub's tag matches the pushed one"
+  commit="$(git rev-parse "$ref^{commit}")"
+  pv="$(ver_of package.json)"; mv="$(ver_of extension/manifest.json)"
+  [ "$tag" = "v$pv" ] || fail "tag $tag does not match package.json version $pv (expected v$pv)"
+  [ "$tag" = "v$mv" ] || fail "tag $tag does not match extension/manifest.json version $mv (expected v$mv)"
+  [ "$(git rev-parse HEAD)" = "$commit" ] || fail "tag $tag points to $(git rev-parse --short "$commit") but HEAD is $(git rev-parse --short HEAD): check out the tagged commit"
+  [ -z "$(git status --porcelain)" ] || fail "working tree is not clean (commit or stash first)"
+  # gh creates the release (and its tag) on GitHub before this push transfers anything, so the commit must already be there.
+  [ -n "$(git for-each-ref --contains "$commit" "refs/remotes/$remote" 2>/dev/null)" ] || fail "commit is not on remote '$remote' yet: run git push $remote main first, then git push $remote $tag"
+
+  out="$("$gh_cmd" release view "$tag" 2>&1)" && fail "GitHub release $tag already exists (never overwritten); bump the version or delete the release by hand"
+  case "$out" in *"not found"*) ;; *) fail "cannot check for an existing release (gh: $out)" ;; esac
+
+  step "bun test"; run "${RELEASE_TEST_CMD:-bun test}" || fail "tests failed"
+  step "typecheck"; run "${RELEASE_TYPECHECK_CMD:-bun run typecheck}" || fail "typecheck failed"
+
+  targets="${RELEASE_TARGETS:-host}"
+  case "$targets" in
+    all) arches="arm64 x64"; flag=" --all" ;;
+    host) flag=""; case "$(uname -m)" in arm64) arches=arm64 ;; *) arches=x64 ;; esac ;;
+    *) fail "RELEASE_TARGETS must be host or all (got $targets)" ;;
   esac
+  step "build (RELEASE_TARGETS=$targets)"
+  run "${RELEASE_BUILD_CMD:-bun scripts/build.ts$flag}" || fail "build failed"
+  echo "pre-push: built arches: $arches"
 
-  TAG=${local_ref#refs/tags/v}
-  VERSION=$(bun -e "console.log(require('./package.json').version)")
-  if [ "$TAG" != "$VERSION" ]; then
-    echo "Error: Tag v$TAG does not match package.json version $VERSION" >&2
-    exit 1
-  fi
-
-  MANIFEST=$(bun -e "console.log(require('./extension/manifest.json').version)")
-  if [ "$MANIFEST" != "$VERSION" ]; then
-    echo "Error: manifest.json version $MANIFEST does not match package.json version $VERSION" >&2
-    exit 1
-  fi
-
-  if [ -n "$(git status --porcelain)" ]; then
-    echo "Error: Working tree is not clean. Commit or stash all changes before tagging." >&2
-    exit 1
-  fi
-
-  echo "Running pre-release tests and typecheck..."
-  bun test || exit 1
-  bun run typecheck || exit 1
-
-  echo "Building release artifacts..."
-  bun scripts/build.ts --all || exit 1
-
-  echo "Verifying build sha256 checksums..."
-  bun -e '
-    const fs = require("node:fs");
-    const crypto = require("node:crypto");
-    const path = require("node:path");
-    const latest = JSON.parse(fs.readFileSync("dist/latest.json", "utf8"));
-    for (const [arch, info] of Object.entries(latest.binaries)) {
-      const file = path.join("dist", info.url);
-      const sum = crypto.createHash("sha256").update(fs.readFileSync(file)).digest("hex");
-      if (sum !== info.sha256) throw new Error(`SHA256 mismatch for ${file}: expected ${info.sha256}, got ${sum}`);
+  step "verify dist/latest.json and sha256"
+  assets="$(ARCHES="$arches" PV="$pv" bun -e '
+    const fs = require("node:fs"), crypto = require("node:crypto");
+    const die = (m) => { console.error(m); process.exit(1); };
+    let latest; try { latest = JSON.parse(fs.readFileSync("dist/latest.json", "utf8")); } catch (e) { die("dist/latest.json missing or invalid"); }
+    if (latest.version !== process.env.PV) die(`dist/latest.json version ${latest.version} is not ${process.env.PV}`);
+    for (const a of process.env.ARCHES.split(" ")) if (!latest.binaries?.[`darwin-${a}`]) die(`dist/latest.json has no binaries.darwin-${a}`);
+    const entries = [...Object.values(latest.binaries ?? {}), latest.extension];
+    const files = [];
+    for (const e of entries) {
+      if (!e?.url || !e?.sha256) die("dist/latest.json entry without url or sha256");
+      const f = `dist/${e.url}`;
+      if (!fs.existsSync(f)) die(`${f} listed in latest.json does not exist`);
+      const got = crypto.createHash("sha256").update(fs.readFileSync(f)).digest("hex");
+      if (got !== e.sha256) die(`SHA256 mismatch for ${f}: latest.json ${e.sha256}, file ${got}`);
+      files.push(f);
     }
-    const extFile = path.join("dist", latest.extension.url);
-    const extSum = crypto.createHash("sha256").update(fs.readFileSync(extFile)).digest("hex");
-    if (extSum !== latest.extension.sha256) throw new Error(`SHA256 mismatch for ${extFile}: expected ${latest.extension.sha256}, got ${extSum}`);
-  ' || exit 1
+    if (!fs.existsSync("dist/install.sh")) die("dist/install.sh missing");
+    console.log([...files, "dist/latest.json", "dist/install.sh"].join(" "));
+  ')" || fail "release artifacts invalid"
 
-  if command -v gh >/dev/null 2>&1; then
-    if gh release view "v$TAG" >/dev/null 2>&1; then
-      echo "Release v$TAG already exists on GitHub."
-    else
-      echo "Creating GitHub release v$TAG..."
-      gh release create "v$TAG" dist/* --title "v$TAG" --generate-notes || exit 1
-    fi
+  # Only the files named in latest.json (+ latest.json, install.sh): never dist/* and never the bare dist/socmedia binary.
+  # shellcheck disable=SC2086
+  set -- release create "$tag" --target "$commit" --title "$tag" --generate-notes $assets
+  if [ -n "${RELEASE_DRY_RUN:-}" ]; then
+    printf 'pre-push: RELEASE_DRY_RUN, would run: %s' "$gh_cmd"; for a; do printf ' '; q "$a"; done; echo
+    continue
   fi
+  step "gh release create $tag"
+  "$gh_cmd" "$@" || fail "gh release create failed (a partial release may exist: check/delete it on GitHub before retrying)"
+  echo "pre-push: release $tag created"
 done
-
 exit 0
