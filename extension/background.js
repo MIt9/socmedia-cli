@@ -1576,10 +1576,20 @@ async function tiktokUpload({ file, caption = "", privacy = "private" }) {
   try {
     await chrome.debugger.sendCommand(debuggee, "DOM.enable");
     const doc = await chrome.debugger.sendCommand(debuggee, "DOM.getDocument");
-    const { nodeId } = await chrome.debugger.sendCommand(debuggee, "DOM.querySelector", {
-      nodeId: doc.root.nodeId,
-      selector: 'input[type="file"]',
-    });
+    // Studio renders the input after load, and a re-render invalidates the document, so re-read it each try.
+    let nodeId = 0;
+    const inputDeadline = Date.now() + 15000;
+    let root = doc.root.nodeId;
+    while (!nodeId && Date.now() < inputDeadline) {
+      ({ nodeId } = await chrome.debugger.sendCommand(debuggee, "DOM.querySelector", {
+        nodeId: root,
+        selector: 'input[type="file"]',
+      }));
+      if (!nodeId) {
+        await delay(500);
+        root = (await chrome.debugger.sendCommand(debuggee, "DOM.getDocument")).root.nodeId;
+      }
+    }
     if (!nodeId) throw new Error("Could not find file input on TikTok Studio upload page");
     await chrome.debugger.sendCommand(debuggee, "DOM.setFileInputFiles", {
       nodeId,
@@ -1627,7 +1637,8 @@ async function tiktokUpload({ file, caption = "", privacy = "private" }) {
   }
 
   // Setup caption and privacy; require read-back confirmation BEFORE clicking Post
-  function pgSetupAndVerifyUpload(cap, priv) {
+  async function pgSetupAndVerifyUpload(cap, priv) {
+    const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
     // Caption confirmation
     if (cap) {
       const captionEl = document.querySelector('[contenteditable="true"], .notranslate[contenteditable], textarea, [data-e2e="caption-editor"]');
@@ -1636,15 +1647,31 @@ async function tiktokUpload({ file, caption = "", privacy = "private" }) {
       }
       if (captionEl.tagName === "TEXTAREA" || captionEl.tagName === "INPUT") {
         captionEl.value = cap;
+      } else if (typeof document.execCommand === "function") {
+        // Studio's Draft.js editor ignores textContent: its state keeps the filename and that is what gets posted.
+        captionEl.focus();
+        document.execCommand("selectAll");
+        await wait(300); // Draft.js picks the selection up from an async selectionchange; pasting sooner keeps the filename
+        // insertText with newlines scrambles Draft.js blocks (duplicated last line); a paste event keeps them intact.
+        const data = new DataTransfer();
+        data.setData("text/plain", cap);
+        captionEl.dispatchEvent(new ClipboardEvent("paste", { clipboardData: data, bubbles: true, cancelable: true }));
+        await wait(500);
       } else {
         captionEl.textContent = cap;
       }
       captionEl.dispatchEvent(new Event("input", { bubbles: true }));
       captionEl.dispatchEvent(new Event("change", { bubbles: true }));
 
-      const readVal = (captionEl.value ?? captionEl.innerText ?? captionEl.textContent ?? "").trim();
-      if (!readVal.includes(cap.trim())) {
-        return { ok: false, error: `Caption read-back failed: expected "${cap.trim()}", got "${readVal}"` };
+      // Draft.js blocks read back without separators, so compare ignoring all whitespace.
+      const flat = (text) => text.replace(/\s+/g, "");
+      const readVal = flat(captionEl.value ?? captionEl.innerText ?? captionEl.textContent ?? "");
+      if (readVal !== flat(cap)) {
+        return { ok: false, error: `Caption read-back failed: expected "${flat(cap)}", got "${readVal}"` };
+      }
+      const counter = (document.body?.innerText || "").match(/(\d+)\s*\/\s*4000\b/);
+      if (counter && Math.abs(Number(counter[1]) - cap.trim().length) > 10) {
+        return { ok: false, error: `Caption not accepted by editor: counter ${counter[1]}, expected about ${cap.trim().length}` };
       }
     }
 
@@ -1665,6 +1692,26 @@ async function tiktokUpload({ file, caption = "", privacy = "private" }) {
         },
       };
       const rule = privMap[priv.toLowerCase()] || { allowed: [priv.toLowerCase()], forbidden: [] };
+
+      // Current Studio: "Who can see this post" is a combobox with options Everyone / Friends / Only you.
+      const label = { private: "only you", public: "everyone", friends: "friends" }[priv.toLowerCase()];
+      const norm = (el) => (el.innerText || el.textContent || "").trim().toLowerCase();
+      const combo = [...document.querySelectorAll('[role="combobox"]')].find((el) => ["everyone", "friends", "only you"].includes(norm(el)));
+      if (combo && label) {
+        if (norm(combo) !== label) {
+          combo.click();
+          await wait(500);
+          const option = [...document.querySelectorAll('[role="option"]')].find((el) => norm(el).startsWith(label));
+          if (!option) return { ok: false, error: `Privacy option "${label}" not found` };
+          option.click();
+          await wait(500);
+        }
+        if (norm(combo) !== label) {
+          return { ok: false, error: `Privacy read-back failed: expected "${label}", got "${norm(combo)}"` };
+        }
+        return { ok: true };
+      }
+
       const radios = [...document.querySelectorAll('input[type="radio"], [role="radio"], [data-e2e*="privacy"]')];
 
       function getSpecificRadioText(r) {
@@ -1747,14 +1794,23 @@ async function tiktokUpload({ file, caption = "", privacy = "private" }) {
     return { ok: true };
   }
 
-  const [setupExec] = await chrome.scripting.executeScript({
-    target: { tabId },
-    func: pgSetupAndVerifyUpload,
-    args: [caption, privacy],
-  });
+  // Draft.js ignores the selection while the window is unfocused, so selectAll would not replace the filename.
+  await chrome.debugger.attach(debuggee, "1.3");
+  let setupExec;
+  try {
+    await chrome.debugger.sendCommand(debuggee, "Emulation.setFocusEmulationEnabled", { enabled: true });
+    [setupExec] = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: pgSetupAndVerifyUpload,
+      args: [caption, privacy],
+    });
+  } finally {
+    try { await chrome.debugger.detach(debuggee); } catch {}
+  }
 
-  if (!setupExec?.result?.ok) {
-    return { posted: false, verified: false, error: setupExec?.result?.error || "Upload configuration failed" };
+  const setup = await setupExec?.result;
+  if (!setup?.ok) {
+    return { posted: false, verified: false, error: setup?.error || "Upload configuration failed" };
   }
 
   // Click Post
