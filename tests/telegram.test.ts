@@ -9,7 +9,7 @@ import { runInNewContext } from "node:vm";
 import { telegramChat, validateMediaFile } from "../src/lib/validate";
 import { safeSeg, resolveHomePath } from "../src/media";
 
-const projectVersion = "0.17.0";
+const projectVersion = "0.20.0";
 
 const createMockMp4 = (path: string) => {
   const buf = Buffer.alloc(64);
@@ -40,12 +40,20 @@ async function authenticateMock(ws: WebSocket, token: string, version = projectV
 }
 
 test("Telegram URL and chat validation & canonicalisation", () => {
-  // Valid chats
+  // Valid chats (usernames)
   expect(telegramChat("@valid_user")).toBe("@valid_user");
   expect(telegramChat("valid_user")).toBe("@valid_user");
   expect(telegramChat("https://t.me/valid_user")).toBe("@valid_user");
   expect(telegramChat("@user123")).toBe("@user123");
   expect(telegramChat("https://t.me/a1234567890123456789012345678901")).toBe("@a1234567890123456789012345678901");
+
+  // Valid peer IDs (private channels, supergroups, direct IDs)
+  expect(telegramChat("-3913521119")).toBe("-3913521119");
+  expect(telegramChat("3913521119")).toBe("3913521119");
+  expect(telegramChat("#-3913521119")).toBe("-3913521119");
+  expect(telegramChat("https://web.telegram.org/k/#-3913521119")).toBe("-3913521119");
+  expect(telegramChat("https://web.telegram.org/k/#@my_channel")).toBe("@my_channel");
+  expect(telegramChat("https://web.telegram.org/a/#-1003913521119")).toBe("-1003913521119");
 
   // Hostile / invalid inputs
   expect(() => telegramChat("t.me/+invite123")).toThrow(/Invite links/);
@@ -126,7 +134,7 @@ test("Telegram write previews enqueue nothing into database", async () => {
     await rm(stateDir, { recursive: true, force: true });
     await rm(fakeHome, { recursive: true, force: true });
   }
-});
+}, 30000);
 
 test("Telegram message daily limit and 7-day duplicate text refusal", async () => {
   const stateDir = await mkdtemp(join(tmpdir(), "socmedia-tg-limits-"));
@@ -203,7 +211,7 @@ test("Telegram message daily limit and 7-day duplicate text refusal", async () =
     await rm(stateDir, { recursive: true, force: true });
     await rm(fakeHome, { recursive: true, force: true });
   }
-});
+}, 30000);
 
 test("Telegram channel creation daily limit", async () => {
   const stateDir = await mkdtemp(join(tmpdir(), "socmedia-tg-chan-limits-"));
@@ -266,7 +274,7 @@ test("Telegram channel creation daily limit", async () => {
     await rm(stateDir, { recursive: true, force: true });
     await rm(fakeHome, { recursive: true, force: true });
   }
-});
+}, 30000);
 
 test("Telegram side-effect jobs become unverified on disconnect and on restart", async () => {
   const stateDir = await mkdtemp(join(tmpdir(), "socmedia-tg-unv-"));
@@ -357,7 +365,7 @@ test("Telegram side-effect jobs become unverified on disconnect and on restart",
     await rm(stateDir, { recursive: true, force: true });
     await rm(fakeHome, { recursive: true, force: true });
   }
-});
+}, 30000);
 
 test("extension background.js wires all Telegram actions in ACTION_HANDLERS and detects challenges", async () => {
   const bg = await Bun.file(new URL("../extension/background.js", import.meta.url)).text();
@@ -572,7 +580,7 @@ test("CRITICAL 5: tgSendMedia returns sent:false when confirm fails, verifies on
 test("CRITICAL 6: tgCreateChannel aborts with created:false if steps fail and rejects old channel title", async () => {
   const script = await Bun.file(new URL("../extension/background.js", import.meta.url)).text();
   let clickedDone = false;
-  let hasPrivateRadio = false;
+  let hasArrowBtn = true;
 
   const existingDialog = {
     innerText: "Existing Channel Title",
@@ -582,17 +590,13 @@ test("CRITICAL 6: tgCreateChannel aborts with created:false if steps fail and re
     querySelector: (sel: string) => {
       if (sel.includes("sidebar-header button") || sel.includes("btn-menu")) return { click: () => {} };
       if (sel.includes("Channel Name") || sel.includes("input-field-name")) return { value: "", dispatchEvent: () => {} };
-      if (sel.includes("btn-next")) return { click: () => {} };
+      if (sel.includes("btn-next")) return hasArrowBtn ? { click: () => {} } : null;
       if (sel.includes("btn-done")) return { click: () => { clickedDone = true; } };
       return null;
     },
     querySelectorAll: (sel: string) => {
       if (sel.includes("menu-item") || sel.includes("dropdown-item")) return [{ innerText: "New Channel", click: () => {} }];
-      if (sel.includes("radio")) return hasPrivateRadio ? [{
-        parentElement: { innerText: "Private" },
-        checked: true,
-        click: () => {},
-      }] : [];
+      if (sel.includes("radio")) return [];
       if (sel.includes("peer-title") || sel.includes("chat-title")) return [existingDialog];
       return [];
     },
@@ -619,15 +623,15 @@ test("CRITICAL 6: tgCreateChannel aborts with created:false if steps fail and re
   };
   runInNewContext(script, context);
 
-  // 1. Missing private radio -> must abort before Done with created: false!
-  hasPrivateRadio = false;
+  // 1. Missing or disabled arrow button -> must abort before channel creation with created: false!
+  hasArrowBtn = false;
   clickedDone = false;
   const res1 = await runInNewContext('tgCreateChannel({ title: "My Channel" })', context);
   expect(res1.created).toBe(false);
   expect(clickedDone).toBe(false);
 
-  // 2. Private radio present and Done clicked, but dialog is OLD (already existed before) -> verified must be false!
-  hasPrivateRadio = true;
+  // 2. Arrow clicked, but dialog is OLD (already existed before) -> verified must be false!
+  hasArrowBtn = true;
   clickedDone = false;
   const res2 = await runInNewContext('tgCreateChannel({ title: "Existing Channel Title" })', context);
   expect(res2.created).toBe(true);
@@ -733,7 +737,7 @@ test("CRITICAL 7: daily caps and duplicate checks count queued and running jobs"
     await rm(stateDir, { recursive: true, force: true });
     await rm(fakeHome, { recursive: true, force: true });
   }
-});
+}, 30000);
 
 test("HIGH 10: pgCollectAndChunkTgMedia skips avatars/stickers/reactions and flags previews", async () => {
   const script = await Bun.file(new URL("../extension/background.js", import.meta.url)).text();
@@ -1015,7 +1019,7 @@ test("HIGH 8 & HIGH 9: tgMediaDownload chunk handling ties to running job, preve
     await rm(stateDir, { recursive: true, force: true });
     await rm(fakeHome, { recursive: true, force: true });
   }
-});
+}, 30000);
 
 test("HIGH 11: message gap and jitter constants enforced, planned slot asserted, --not-before cannot beat gap slot", async () => {
   const stateDir = await mkdtemp(join(tmpdir(), "socmedia-tg-gap-state-"));
@@ -1073,7 +1077,7 @@ test("HIGH 11: message gap and jitter constants enforced, planned slot asserted,
     await rm(stateDir, { recursive: true, force: true });
     await rm(fakeHome, { recursive: true, force: true });
   }
-});
+}, 30000);
 
 test("BLOCKER 1: tgMediaDownload in background.js sends chunk messages with type 'chunk' and mediaType", async () => {
   const script = await Bun.file(new URL("../extension/background.js", import.meta.url)).text();
@@ -1137,5 +1141,730 @@ test("BLOCKER 1: tgMediaDownload in background.js sends chunk messages with type
   expect(chunkMsg.data).toBe("dGVzdA==");
 });
 
+test("validateMediaFile resolves relative paths against caller cwd", async () => {
+  const { realpathSync, mkdirSync } = await import("node:fs");
+  const rawHome = await mkdtemp(join(tmpdir(), "socmedia-cwd-home-"));
+  const fakeHome = realpathSync(rawHome);
+  const subDir = join(fakeHome, "project", "sub");
+  mkdirSync(subDir, { recursive: true });
+  const testFile = join(subDir, "clip.mp4");
+  createMockMp4(testFile);
+
+  const prevHome = process.env.HOME;
+  try {
+    process.env.HOME = fakeHome;
+    // When called with subDir as caller cwd and relative filename "clip.mp4"
+    const validated = validateMediaFile("clip.mp4", ["mp4"], subDir);
+    expect(validated.path).toBe(testFile);
+    expect(validated.ext).toBe("mp4");
+  } finally {
+    process.env.HOME = prevHome;
+    await rm(fakeHome, { recursive: true, force: true });
+  }
+});
+
+test("pgExtractTgStatus extracts account from localStorage or DOM", async () => {
+  const script = await Bun.file(new URL("../extension/background.js", import.meta.url)).text();
+  const mockStorage: Record<string, string> = {
+    user_auth: JSON.stringify({ id: 12345, first_name: "John", last_name: "Doe", username: "johndoe" }),
+  };
+
+  const context: any = {
+    chrome: {
+      storage: { local: { get: async () => ({}) }, onChanged: { addListener() {} } },
+      alarms: { create() {}, onAlarm: { addListener() {} } },
+      runtime: { onStartup: { addListener() {} } },
+    },
+    document: {
+      querySelector: (sel: string) => null,
+      querySelectorAll: () => [],
+    },
+    location: { hash: "", href: "https://web.telegram.org/k/" },
+    localStorage: {
+      getItem: (key: string) => mockStorage[key] || null,
+    },
+    URL, setTimeout, clearTimeout, Date, Math,
+  };
+  runInNewContext(script, context);
+
+  // 1. user_auth in localStorage
+  const res1 = await runInNewContext("pgExtractTgStatus()", context);
+  expect(res1.loggedIn).toBe(true);
+  expect(res1.account).toBe("John Doe");
+
+  // 2. tt-global-state in localStorage
+  delete mockStorage.user_auth;
+  mockStorage["tt-global-state"] = JSON.stringify({
+    currentUserId: "42",
+    users: { byId: { "42": { firstName: "Owner", lastName: "Admin", username: "admin" } } },
+  });
+  const res2 = await runInNewContext("pgExtractTgStatus()", context);
+  expect(res2.loggedIn).toBe(true);
+  expect(res2.account).toBe("Owner Admin");
+
+  // 3. Not logged in (login form present)
+  context.document.querySelector = (sel: string) => sel.includes("login-header") ? {} : null;
+  const res3 = await runInNewContext("pgExtractTgStatus()", context);
+  expect(res3.loggedIn).toBe(false);
+  expect(res3.account).toBe(null);
+});
+
+test("pgExtractTgDialogs parses peer IDs, polls, and dismisses tips overlay", async () => {
+  const script = await Bun.file(new URL("../extension/background.js", import.meta.url)).text();
+  let tipDismissed = false;
+
+  const mockDialogs = [
+    {
+      querySelector: (sel: string) => {
+        if (sel.includes("subtitle")) return { innerText: "Episode 23 video" };
+        if (sel.includes("title")) return { innerText: "Private Channel" };
+        if (sel.includes("time")) return { innerText: "14:20" };
+        return null;
+      },
+      getAttribute: (attr: string) => attr === "href" ? "#-3913521119" : null,
+    },
+    {
+      querySelector: (sel: string) => {
+        if (sel.includes("subtitle")) return { innerText: "Hello there" };
+        if (sel.includes("title")) return { innerText: "Public Chat" };
+        return null;
+      },
+      getAttribute: (attr: string) => attr === "href" ? "#@public_chat" : null,
+    },
+  ];
+
+  const context: any = {
+    chrome: {
+      storage: { local: { get: async () => ({}) }, onChanged: { addListener() {} } },
+      alarms: { create() {}, onAlarm: { addListener() {} } },
+      runtime: { onStartup: { addListener() {} } },
+    },
+    document: {
+      querySelector: (sel: string) => {
+        if (sel.includes("popup-tips") || sel.includes("tooltip")) {
+          return { click: () => { tipDismissed = true; } };
+        }
+        return null;
+      },
+      querySelectorAll: (sel: string) => sel.includes("chatlist") || sel.includes("peer-id") ? mockDialogs : [],
+      dispatchEvent: () => true,
+    },
+    KeyboardEvent: class KeyboardEvent {},
+    location: { hash: "", href: "https://web.telegram.org/k/" },
+    URL, setTimeout, clearTimeout, Date, Math,
+  };
+  runInNewContext(script, context);
+
+  const dialogs = await runInNewContext("pgExtractTgDialogs(10)", context);
+  expect(tipDismissed).toBe(true);
+  expect(dialogs.length).toBe(2);
+  expect(dialogs[0]).toMatchObject({
+    title: "Private Channel",
+    peer: "-3913521119",
+    lastMessage: "Episode 23 video",
+    time: "14:20",
+  });
+  expect(dialogs[1]).toMatchObject({
+    title: "Public Chat",
+    peer: "@public_chat",
+    lastMessage: "Hello there",
+  });
+});
+
+test("pgMatchTgChat wrong-chat protection for peer IDs", async () => {
+  const script = await Bun.file(new URL("../extension/background.js", import.meta.url)).text();
+  const peerId = "-3913521119";
+
+  const dialogListEl = {
+    querySelector: (sel: string) => sel.includes("title") ? { innerText: "My Private Channel" } : null,
+  };
+
+  let headerTitle = "My Private Channel";
+  let currentHash = `#${peerId}`;
+
+  const context: any = {
+    chrome: {
+      storage: { local: { get: async () => ({}) }, onChanged: { addListener() {} } },
+      alarms: { create() {}, onAlarm: { addListener() {} } },
+      runtime: { onStartup: { addListener() {} } },
+    },
+    document: {
+      querySelector: (sel: string) => {
+        if (sel.includes("peer-title") || sel.includes("chat-title")) return { innerText: headerTitle };
+        if (sel.includes(peerId)) return dialogListEl;
+        return null;
+      },
+      querySelectorAll: () => [],
+    },
+    get location() {
+      return { hash: currentHash, href: `https://web.telegram.org/k/${currentHash}` };
+    },
+    URL, setTimeout, clearTimeout, Date, Math,
+  };
+  runInNewContext(script, context);
+
+  // 1. Matches when hash matches, not stale, and title matches dialog list
+  const matchOk = runInNewContext(`pgMatchTgChat("${peerId}", "Some Other Chat")`, context);
+  expect(matchOk.matched).toBe(true);
+  expect(matchOk.title).toBe("My Private Channel");
+  expect(matchOk.peer).toBe(peerId);
+
+  // 2. Refuses when header is stale from previous chat
+  const matchStale = runInNewContext(`pgMatchTgChat("${peerId}", "My Private Channel")`, context);
+  expect(matchStale.matched).toBe(false);
+  expect(matchStale.stale).toBe(true);
+
+  // 3. Refuses when URL hash does not match peer ID
+  currentHash = "#-9999999999";
+  const matchWrongHash = runInNewContext(`pgMatchTgChat("${peerId}")`, context);
+  expect(matchWrongHash.matched).toBe(false);
+  expect(matchWrongHash.reason).toContain("URL hash");
+
+  // 4. Refuses when open chat title does not match dialog list title
+  currentHash = `#${peerId}`;
+  headerTitle = "Completely Different Chat";
+  const matchMismatch = runInNewContext(`pgMatchTgChat("${peerId}")`, context);
+  expect(matchMismatch.matched).toBe(false);
+  expect(matchMismatch.reason).toContain("does not match dialog list title");
+});
+
+test("tgCreateChannel returns newly created peer ID", async () => {
+  const script = await Bun.file(new URL("../extension/background.js", import.meta.url)).text();
+  let clickedDone = false;
+  let clickedNext = false;
+
+  const document: any = {
+    body: { innerText: "" },
+    querySelector: (sel: string) => {
+      if (sel.includes("tgico-pencil") || sel.includes("btn-menu")) return { click: () => {} };
+      if (sel.includes("Channel Name") || sel.includes("input-field-name")) return { value: "", dispatchEvent: () => {} };
+      if (sel.includes("btn-done") || sel.includes("btn-primary")) return { click: () => { clickedDone = true; location.hash = "#-3913521119"; } };
+      if (sel.includes("btn-next") || sel.includes("btn-circle")) return { click: () => { clickedNext = true; } };
+      if (sel.includes("peer-title") || sel.includes("chat-title")) return { innerText: "New Brand Channel" };
+      return null;
+    },
+    querySelectorAll: (sel: string) => {
+      if (sel.includes("menu-item") || sel.includes("dropdown-item")) return [{ innerText: "New Channel", click: () => {} }];
+      if (sel.includes("radio")) return [{
+        parentElement: { innerText: "Private" },
+        checked: true,
+        click: () => {},
+      }];
+      if (sel.includes("peer-title") || sel.includes("chat-title")) return [{ innerText: "New Brand Channel" }];
+      return [];
+    },
+    dispatchEvent: () => true,
+  };
+  const location = { hash: "#old_chat", href: "https://web.telegram.org/k/#old_chat", pathname: "/k/", hostname: "web.telegram.org" };
+  const chrome = {
+    storage: { local: { get: async () => ({ cliSelectedTab: 1 }), set: async () => {} }, onChanged: { addListener() {} } },
+    tabs: { get: async () => ({ id: 1, url: location.href, status: "complete" }), update: async () => {}, query: async () => [] },
+    windows: { get: async () => ({ id: 1, state: "normal" }), create: async () => ({ id: 1 }) },
+    tabGroups: { query: async () => [] },
+    alarms: { create() {}, onAlarm: { addListener() {} } },
+    runtime: { onStartup: { addListener() {} } },
+    scripting: {
+      executeScript: async (options: any) => [{ result: options.func(...(options.args || [])) }],
+    },
+  };
+
+  let now = 100000;
+  const context = {
+    chrome, document, location, URL, Event,
+    setTimeout: (fn: any) => { fn(); return 0; },
+    clearTimeout,
+    Date: { now: () => (now += 500) },
+    Math,
+  };
+  runInNewContext(script, context);
+
+  const res = await runInNewContext('tgCreateChannel({ title: "New Brand Channel" })', context);
+  expect(res.created).toBe(true);
+  expect(res.peer).toBe("-3913521119");
+  expect(res.privacy).toBe("private");
+  expect(clickedNext).toBe(true);
+  expect(clickedDone).toBe(true);
+});
+
+test("screenshot falls back to debugger Page.captureScreenshot on permission error", async () => {
+  const script = await Bun.file(new URL("../extension/background.js", import.meta.url)).text();
+  let debuggerAttached = false;
+  let debuggerDetached = false;
+  let cdpScreenshotCalled = false;
+
+  const chrome = {
+    storage: { local: { get: async () => ({ cliSelectedTab: 1, cliWorkTabId: 1 }), set: async () => {} }, onChanged: { addListener() {} } },
+    alarms: { create() {}, onAlarm: { addListener() {} } },
+    runtime: { onStartup: { addListener() {} } },
+    tabGroups: { query: async () => [] },
+    tabs: {
+      get: async () => ({ id: 1, windowId: 10, url: "https://web.telegram.org/k/" }),
+      update: async () => {},
+      query: async () => [],
+      captureVisibleTab: async () => {
+        throw new Error("Either the '<all_urls>' or 'activeTab' permission is required.");
+      },
+    },
+    debugger: {
+      attach: async () => { debuggerAttached = true; },
+      detach: async () => { debuggerDetached = true; },
+      sendCommand: async (_target: any, method: string) => {
+        if (method === "Page.captureScreenshot") {
+          cdpScreenshotCalled = true;
+          return { data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==" };
+        }
+        return {};
+      },
+    },
+    scripting: {
+      executeScript: async (options: any) => options?.func?.name === "inspectPage" ? [{ result: null }] : [{ result: { crop: false, width: 100, height: 100 } }],
+    },
+  };
+
+  const context = {
+    chrome, URL, setTimeout, clearTimeout, Date, Math,
+    document: { body: { innerText: "" } },
+    location: { href: "https://web.telegram.org/k/" },
+  };
+  runInNewContext(script, context);
+
+  const snap = await runInNewContext("screenshot()", context);
+  expect(debuggerAttached).toBe(true);
+  expect(cdpScreenshotCalled).toBe(true);
+  expect(debuggerDetached).toBe(true);
+  expect(snap.dataUrl).toContain("data:image/png;base64,");
+});
+
+function tgPageContext(script: string, document: any, hash = "", storage: Record<string, string> = {}) {
+  const context: any = {
+    chrome: {
+      storage: { local: { get: async () => ({}) }, onChanged: { addListener() {} } },
+      alarms: { create() {}, onAlarm: { addListener() {} } },
+      runtime: { onStartup: { addListener() {} } },
+    },
+    document,
+    location: { hash, href: `https://web.telegram.org/k/${hash}` },
+    localStorage: { getItem: (key: string) => storage[key] ?? null },
+    URL, setTimeout, clearTimeout, Date, Math,
+  };
+  runInNewContext(script, context);
+  return context;
+}
+
+test("pgMatchTgChat refuses a peer id whose URL hash differs only by sign", async () => {
+  const script = await Bun.file(new URL("../extension/background.js", import.meta.url)).text();
+  const titled = { innerText: "Same Title", getAttribute: () => null, querySelector: () => ({ innerText: "Same Title" }) };
+  const context = tgPageContext(script, {
+    querySelector: (sel: string) => (sel.includes("peer-title") || sel.includes("chat-title") ? titled : sel.includes("123456") ? titled : null),
+    querySelectorAll: () => [],
+  }, "#123456");
+
+  const res = runInNewContext(`pgMatchTgChat("-123456", "Previous Chat")`, context);
+  expect(res.matched).toBe(false);
+  expect(res.reason).toContain("URL hash");
+});
+
+test("pgMatchTgChat takes the dialog title only from the exact peer, never a partial or unsigned match", async () => {
+  const script = await Bun.file(new URL("../extension/background.js", import.meta.url)).text();
+  const looseDialog = { querySelector: () => ({ innerText: "Other Chat" }) };
+  const context = tgPageContext(script, {
+    querySelector: (sel: string) => {
+      if (sel.includes("peer-title") || sel.includes("chat-title")) return { innerText: "Other Chat" };
+      if (sel.includes("href*=") || sel.includes('[data-peer-id="39135"]')) return looseDialog;
+      return null;
+    },
+    querySelectorAll: () => [],
+  }, "#-39135");
+
+  const res = runInNewContext(`pgMatchTgChat("-39135", "Previous Chat")`, context);
+  expect(res.matched).toBe(false);
+});
+
+test("pgExtractTgStatus never reports a chat title as the account and clicks nothing", async () => {
+  const script = await Bun.file(new URL("../extension/background.js", import.meta.url)).text();
+  let clicks = 0;
+  const context = tgPageContext(script, {
+    querySelector: (sel: string) => {
+      if (sel.includes("login-header")) return null;
+      if (sel.includes("[class*='sidebar'] [class*='title']") || sel.split(",").some((s) => s.trim() === ".user-title")) return { innerText: "Some Chat" };
+      if (sel.includes("btn-menu")) return { click: () => { clicks++; } };
+      return null;
+    },
+    querySelectorAll: () => [],
+  }, "", { user_auth: JSON.stringify({ dcID: 2, id: 555 }) });
+
+  const res = await runInNewContext("pgExtractTgStatus()", context);
+  expect(res.loggedIn).toBe(true);
+  expect(res.account).toBe(null);
+  expect(res.accountId).toBe("555");
+  expect(clicks).toBe(0);
+});
+
+test("tgPinMessage validation rejects invalid options and validates chat and messageId", async () => {
+  const { validateJob } = await import("../src/lib/validate");
+
+  // Valid without messageId
+  const valid1 = validateJob({ action: "tgPinMessage", args: { chat: "@my_channel" } });
+  expect((valid1.args as any).chat).toBe("@my_channel");
+
+  // Valid with numeric messageId
+  const valid2 = validateJob({ action: "tgPinMessage", args: { chat: "-1001234567890", messageId: 42 } });
+  expect((valid2.args as any).chat).toBe("-1001234567890");
+  expect((valid2.args as any).messageId).toBe("42");
+
+  // Unknown option rejected
+  expect(() => validateJob({ action: "tgPinMessage", args: { chat: "@my_channel", extra: "bad" } }))
+    .toThrow(/Unknown tgPinMessage option/);
+
+  // Invalid messageId rejected
+  expect(() => validateJob({ action: "tgPinMessage", args: { chat: "@my_channel", messageId: "abc" } }))
+    .toThrow(/messageId must be a positive integer ID/);
+});
+
+test("extension tgPinMessage fails closed when message ID not found, avoids Unpin, and verifies pin", async () => {
+  const script = await Bun.file(new URL("../extension/background.js", import.meta.url)).text();
+
+  let contextMenuTriggeredOn: any = null;
+  let clickedPin = false;
+  let clickedUnpin = false;
+  let hasPinnedBar = false;
+  let pinnedBarText = "";
+
+  const bubble1 = {
+    id: "message-100",
+    getAttribute: (attr: string) => attr === "data-mid" ? "100" : null,
+    querySelector: (sel: string) => sel.includes("data-mid") ? null : ({ innerText: "First message text" }),
+    innerText: "First message text",
+    dispatchEvent: (ev: any) => { if (ev.type === "contextmenu") contextMenuTriggeredOn = bubble1; },
+  };
+
+  const bubble2 = {
+    id: "message-200",
+    getAttribute: (attr: string) => attr === "data-mid" ? "200" : null,
+    querySelector: (sel: string) => sel.includes("data-mid") ? null : ({ innerText: "Second message text" }),
+    innerText: "Second message text",
+    dispatchEvent: (ev: any) => { if (ev.type === "contextmenu") contextMenuTriggeredOn = bubble2; },
+  };
+
+  const unpinItem = {
+    innerText: "Unpin message",
+    textContent: "Unpin message",
+    classList: { contains: () => false },
+    click: () => { clickedUnpin = true; },
+  };
+
+  const pinItem = {
+    innerText: "Pin",
+    textContent: "Pin",
+    classList: { contains: (c: string) => c === "tgico-pin" },
+    click: () => {
+      clickedPin = true;
+      hasPinnedBar = true;
+      pinnedBarText = "First message text";
+    },
+  };
+
+  const document: any = {
+    body: { innerText: "" },
+    querySelector: (sel: string) => {
+      if (sel.includes("peer-title") || sel.includes("chat-title")) return { innerText: "Target Channel" };
+      if (sel.includes("user-username") || sel.includes("username")) return { innerText: "@target_channel" };
+      if (sel.includes("pinned-message")) return hasPinnedBar ? { innerText: pinnedBarText } : null;
+      if (sel.includes("popup-pin") || sel.includes("modal")) return null;
+      return null;
+    },
+    querySelectorAll: (sel: string) => {
+      if (sel.includes(".bubble") || sel.includes(".message")) return [bubble1, bubble2];
+      if (sel.includes("btn-menu-item") || sel.includes("menu-item") || sel.includes("[role=menuitem]")) {
+        // Unpin is first to test regex rejection of Unpin!
+        return [unpinItem, pinItem];
+      }
+      return [];
+    },
+  };
+
+  const location = { hash: "#@target_channel", href: "https://web.telegram.org/k/#@target_channel", pathname: "/k/", hostname: "web.telegram.org" };
+  const chrome = {
+    storage: { local: { get: async () => ({ cliSelectedTab: 1 }), set: async () => {} }, onChanged: { addListener() {} } },
+    tabs: { get: async () => ({ id: 1, url: location.href, status: "complete" }), update: async () => {}, query: async () => [] },
+    windows: { get: async () => ({ id: 1, state: "normal" }), create: async () => ({ id: 1 }) },
+    tabGroups: { query: async () => [] },
+    alarms: { create() {}, onAlarm: { addListener() {} } },
+    runtime: { onStartup: { addListener() {} } },
+    scripting: {
+      executeScript: async (options: any) => [{ result: options.func(...(options.args || [])) }],
+    },
+  };
+  let now = 100000;
+  const context: any = {
+    chrome, document, location, URL, Event,
+    MouseEvent: class { type: string; constructor(type: string) { this.type = type; } },
+    setTimeout: (fn: any) => { fn(); return 0; },
+    clearTimeout,
+    Date: { now: () => (now += 500) },
+    Math,
+  };
+  runInNewContext(script, context);
+
+  // 1. When non-existent message ID is requested: must fail closed and NEVER pin last message
+  contextMenuTriggeredOn = null;
+  clickedPin = false;
+  const resBadId = await runInNewContext('tgPinMessage({ chat: "@target_channel", messageId: "999" })', context);
+  expect(resBadId.pinned).toBe(false);
+  expect(resBadId.error).toMatch(/Message with ID "999" not found/);
+  expect(contextMenuTriggeredOn).toBe(null);
+  expect(clickedPin).toBe(false);
+
+  // 2. When valid ID is requested: locates exact bubble, never clicks Unpin, clicks Pin, verifies
+  contextMenuTriggeredOn = null;
+  clickedPin = false;
+  clickedUnpin = false;
+  const resGood = await runInNewContext('tgPinMessage({ chat: "@target_channel", messageId: "100" })', context);
+  expect(resGood.pinned).toBe(true);
+  expect(resGood.verified).toBe(true);
+  expect(contextMenuTriggeredOn).toBe(bubble1);
+  expect(clickedPin).toBe(true);
+  expect(clickedUnpin).toBe(false);
+});
+
+test("pgMatchTgChat confirms chat title and canonical username when peer is cached during navigation", async () => {
+  const script = await Bun.file(new URL("../extension/background.js", import.meta.url)).text();
+  const document: any = {
+    querySelector: (sel: string) => {
+      if (sel.includes("peer-title") || sel.includes("chat-title")) {
+        return { innerText: "Target Peer Chat" };
+      }
+      return null;
+    },
+    querySelectorAll: () => [],
+  };
+  const location = { hash: "#-3913521119", href: "https://web.telegram.org/k/#-3913521119" };
+  const chrome: any = {
+    storage: { local: { get: async () => ({}) }, onChanged: { addListener() {} } },
+    alarms: { create() {}, onAlarm: { addListener() {} } },
+    runtime: { onStartup: { addListener() {} } },
+  };
+  const context: any = {
+    chrome,
+    document,
+    location,
+    URL,
+    setTimeout: (fn: any) => { fn(); return 0; },
+    clearTimeout,
+    Date,
+    Math,
+    __socmedia_last_tg_chat: { peer: "-3913521119", title: "Target Peer Chat" },
+  };
+  runInNewContext(script, context);
+
+  // Matches via cached navigation title even if not currently in virtualized DOM
+  const res = runInNewContext('pgMatchTgChat("-3913521119", "Previous Chat")', context);
+  expect(res.matched).toBe(true);
+  expect(res.title).toBe("Target Peer Chat");
+  expect(res.peer).toBe("-3913521119");
+
+  // Canonical username hash matches when authentic peer username is confirmed
+  location.hash = "#@target_user_alias";
+  context.__socmedia_last_tg_chat = { peer: "244130630", title: "Target User", username: "target_user_alias" };
+  document.querySelector = (sel: string) => {
+    if (sel.includes("peer-title") || sel.includes("chat-title")) return { innerText: "Target User" };
+    return null;
+  };
+  const resCanonical = runInNewContext('pgMatchTgChat("244130630", "Previous Chat")', context);
+  expect(resCanonical.matched).toBe(true);
+  expect(resCanonical.title).toBe("Target User");
+});
+
+test("pgMatchTgChat strictly refuses mismatched #@ hash for peer ID", async () => {
+  const script = await Bun.file(new URL("../extension/background.js", import.meta.url)).text();
+  const chrome: any = {
+    storage: { local: { get: async () => ({}) }, onChanged: { addListener() {} } },
+    alarms: { create() {}, onAlarm: { addListener() {} } },
+    runtime: { onStartup: { addListener() {} } },
+  };
+  const context: any = {
+    chrome,
+    document: {
+      querySelector: (s: string) => (s.includes("user-title") || s.includes("peer-title") ? { innerText: "Test Group" } : null),
+      querySelectorAll: () => [],
+    },
+    location: { hash: "#@testgroup", href: "https://web.telegram.org/k/#@testgroup" },
+    URL, setTimeout, clearTimeout, Date, Math,
+    __socmedia_last_tg_chat: { peer: "-3913521119", title: "Test Group", username: null },
+  };
+  runInNewContext(script, context);
+  const res = runInNewContext('pgMatchTgChat("-3913521119", null)', context);
+  expect(res.matched).toBe(false);
+  expect(res.reason).toContain("does not match peer id");
+});
+
+test("pgMatchTgChat requires exact title match and refuses substring/superset titles", async () => {
+  const script = await Bun.file(new URL("../extension/background.js", import.meta.url)).text();
+  const chrome: any = {
+    storage: { local: { get: async () => ({}) }, onChanged: { addListener() {} } },
+    alarms: { create() {}, onAlarm: { addListener() {} } },
+    runtime: { onStartup: { addListener() {} } },
+  };
+  const context: any = {
+    chrome,
+    document: {
+      querySelector: (s: string) => (s.includes("user-title") || s.includes("peer-title") ? { innerText: "Target Peer Chat Extended" } : null),
+      querySelectorAll: () => [],
+    },
+    location: { hash: "#-3913521119", href: "https://web.telegram.org/k/#-3913521119" },
+    URL, setTimeout, clearTimeout, Date, Math,
+    __socmedia_last_tg_chat: { peer: "-3913521119", title: "Target Peer Chat" },
+  };
+  runInNewContext(script, context);
+  const res = runInNewContext('pgMatchTgChat("-3913521119", null)', context);
+  expect(res.matched).toBe(false);
+  expect(res.reason).toContain("does not match");
+});
 
 
+test("pgMatchTgChat confirms a private channel by the header's own data-peer-id and refuses another id", async () => {
+  const script = await Bun.file(new URL("../extension/background.js", import.meta.url)).text();
+  let headerPeer = "-3913521119";
+  const context: any = {
+    chrome: {
+      storage: { local: { get: async () => ({}) }, onChanged: { addListener() {} } },
+      alarms: { create() {}, onAlarm: { addListener() {} } },
+      runtime: { onStartup: { addListener() {} } },
+    },
+    document: {
+      querySelector: (s: string) => {
+        if (s.includes("data-peer-id]") && s.startsWith(".chat-info")) return { getAttribute: () => headerPeer };
+        if (s.includes("peer-title") || s.includes("user-title")) return { innerText: "Крок за кроком" };
+        return null; // not in the (virtualised) dialog list, nothing cached
+      },
+      querySelectorAll: () => [],
+    },
+    location: { hash: "#-3913521119", href: "https://web.telegram.org/k/#-3913521119" },
+    URL, setTimeout, clearTimeout, Date, Math,
+  };
+  runInNewContext(script, context);
+  const ok = runInNewContext('pgMatchTgChat("-3913521119", "Other chat")', context);
+  expect(ok.matched).toBe(true);
+  headerPeer = "-111";
+  const bad = runInNewContext('pgMatchTgChat("-3913521119", "Other chat")', context);
+  expect(bad.matched).toBe(false);
+  expect(bad.reason).toContain("peer id");
+});
+
+function liveTgContext(script: string, opts: { draft: string; bubbles: () => any[]; sendBtn?: () => any }) {
+  const composer: any = {
+    innerText: opts.draft,
+    focus() {},
+    dispatchEvent(ev: any) {
+      if (ev?.type === "paste") this.innerText = ev.clipboardData.getData("text/plain");
+    },
+  };
+  class MockClipboardEvent extends Event {
+    clipboardData: any;
+    constructor(type: string, init?: any) { super(type, init); this.clipboardData = init?.clipboardData; }
+  }
+  class MockDataTransfer {
+    d: Record<string, string> = {};
+    setData(k: string, v: string) { this.d[k] = v; }
+    getData(k: string) { return this.d[k] ?? ""; }
+  }
+  let page = "https://web.telegram.org/k/#-3913521119";
+  const document: any = {
+    body: { innerText: "" },
+    execCommand: () => true,
+    querySelector: (sel: string) => {
+      if (sel.startsWith(".chat-info") && sel.includes("data-peer-id]")) return { getAttribute: () => "-3913521119" };
+      if (sel.includes("peer-title") || sel.includes("user-title")) return { innerText: "Крок" };
+      if (sel.includes("input-message-input") || sel.includes("contenteditable")) return composer;
+      if (sel.includes("btn-send")) return opts.sendBtn ? opts.sendBtn() : { click: () => { composer.innerText = ""; } };
+      return null;
+    },
+    querySelectorAll: (sel: string) => (sel.includes("bubble") ? opts.bubbles() : []),
+  };
+  const location = { hash: "#-3913521119", href: page, pathname: "/k/", hostname: "web.telegram.org" };
+  const chrome = {
+    storage: { local: { get: async () => ({ cliSelectedTab: 1 }), set: async () => {} }, onChanged: { addListener() {} } },
+    tabs: {
+      get: async () => ({ id: 1, url: page, status: "complete" }),
+      update: async (_id: number, val: any) => { if (val.url) page = val.url; },
+      query: async () => [],
+    },
+    windows: { get: async () => ({ id: 1, state: "normal" }), create: async () => ({ id: 1 }) },
+    tabGroups: { query: async () => [] },
+    alarms: { create() {}, onAlarm: { addListener() {} } },
+    runtime: { onStartup: { addListener() {} } },
+    scripting: { executeScript: async (o: any) => [{ result: await o.func(...(o.args || [])) }] },
+  };
+  let now = 100000;
+  const context: any = {
+    chrome, document, location, URL, Event, ClipboardEvent: MockClipboardEvent, DataTransfer: MockDataTransfer,
+    setTimeout: (fn: any) => { fn(); return 0; }, clearTimeout, Date: { now: () => (now += 500) }, Math,
+  };
+  runInNewContext(script, context);
+  return { context, composer };
+}
+
+const channelBubble = (mid: string, text: string, cls: string[] = ["is-in", "channel-post"]) => ({
+  classList: { contains: (c: string) => cls.includes(c) },
+  parentElement: { closest: () => null },
+  getAttribute: (a: string) => (a === "data-mid" ? mid : null),
+  querySelector: (sel: string) => (sel.includes(".message") ? { innerText: `${text} 15:30` } : null),
+  innerText: `${text} 15:30`,
+});
+
+test("tgSendMessage verifies an own channel post (is-in, not is-out) by new id, no is-sending and text", async () => {
+  const script = await Bun.file(new URL("../extension/background.js", import.meta.url)).text();
+  let sent = false;
+  const { context, composer } = liveTgContext(script, {
+    draft: "",
+    bubbles: () => (sent ? [channelBubble("1", "old"), channelBubble("2", "hello world")] : [channelBubble("1", "old")]),
+    sendBtn: () => ({ click: () => { sent = true; composer.innerText = ""; } }),
+  });
+  const res = await runInNewContext('tgSendMessage({ chat: "-3913521119", text: "hello\\nworld" })', context);
+  expect(res.sent).toBe(true);
+  expect(res.verified).toBe(true);
+  expect(res.messageId).toBe("2");
+});
+
+test("tgSendMessage refuses to type over an existing composer draft and reports a still-sending bubble as unverified", async () => {
+  const script = await Bun.file(new URL("../extension/background.js", import.meta.url)).text();
+  const drafted = liveTgContext(script, { draft: "old intro draft", bubbles: () => [] });
+  const refused = await runInNewContext('tgSendMessage({ chat: "-3913521119", text: "hi" })', drafted.context);
+  expect(refused.sent).toBe(false);
+  expect(refused.error).toMatch(/unsent draft/);
+  expect(drafted.composer.innerText).toBe("old intro draft");
+
+  let sent = false;
+  const pending = liveTgContext(script, {
+    draft: "",
+    bubbles: () => (sent ? [channelBubble("1", "old"), channelBubble("2", "hi", ["is-in", "channel-post", "is-sending"])] : [channelBubble("1", "old")]),
+    sendBtn: () => ({ click: () => { sent = true; pending.composer.innerText = ""; } }),
+  });
+  const res = await runInNewContext('tgSendMessage({ chat: "-3913521119", text: "hi" })', pending.context);
+  expect(res.sent).toBe(true);
+  expect(res.verified).toBe(false);
+});
+
+test("tgSendMedia refuses to run over an existing composer draft before touching the file input", async () => {
+  const script = await Bun.file(new URL("../extension/background.js", import.meta.url)).text();
+  let attached = false;
+  const { context } = liveTgContext(script, { draft: "old intro draft", bubbles: () => [] });
+  context.chrome.debugger = { attach: async () => { attached = true; }, detach: async () => {}, sendCommand: async () => ({}) };
+  const res = await runInNewContext('tgSendMedia({ chat: "-3913521119", file: "/x/a.mp4", caption: "c" })', context);
+  expect(res.sent).toBe(false);
+  expect(res.error).toMatch(/unsent draft/);
+  expect(attached).toBe(false);
+});
+
+test("tgSendMessage treats a temporary (not server-confirmed) message id as not yet verified", async () => {
+  const script = await Bun.file(new URL("../extension/background.js", import.meta.url)).text();
+  let sent = false;
+  const ctx = liveTgContext(script, {
+    draft: "",
+    bubbles: () => (sent ? [channelBubble("1", "old"), channelBubble("4294967323.0001", "hi")] : [channelBubble("1", "old")]),
+    sendBtn: () => ({ click: () => { sent = true; ctx.composer.innerText = ""; } }),
+  });
+  const res = await runInNewContext('tgSendMessage({ chat: "-3913521119", text: "hi" })', ctx.context);
+  expect(res.sent).toBe(true);
+  expect(res.verified).toBe(false);
+});

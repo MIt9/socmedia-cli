@@ -136,9 +136,14 @@ export async function downloadPostMedia(result: any, postUrl: string) {
   return result;
 }
 
-export function resolveHomePath(inputPath: string): string {
-  const home = resolve(homedir());
-  const target = resolve(home, inputPath.replace(/^~(?=\/|$)/, home));
+export function resolveHomePath(inputPath: string, base: string = homedir()): string {
+  const home = resolve(process.env.HOME || homedir());
+  const expanded = inputPath.startsWith("~")
+    ? inputPath.replace(/^~(?=\/|$)/, home)
+    : isAbsolute(inputPath)
+    ? inputPath
+    : resolve(base, inputPath);
+  const target = resolve(home, expanded);
   const rel = relative(home, target);
   if (!rel || rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) throw new Error("Path must be inside home");
   return target;

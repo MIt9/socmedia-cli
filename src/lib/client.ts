@@ -174,7 +174,8 @@ export type PageJobAction =
   | "snapshot" | "readPage" | "getProfile" | "getComments" | "getPosts" | "getPost" | "screenshot" | "search"
   | "readInbox" | "readThread" | "sendMessage" | "ytStudioRead" | "click" | "scroll"
   | "tiktokProfile" | "tiktokPosts" | "tiktokVideo" | "tiktokComments" | "tiktokSearch" | "tiktokInbox" | "tiktokUpload"
-  | "tgStatus" | "tgDialogsList" | "tgMessagesRead" | "tgMediaDownload" | "tgSendMessage" | "tgSendMedia" | "tgCreateChannel";
+  | "tiktokStudioList" | "tiktokSetPrivacy"
+  | "tgStatus" | "tgDialogsList" | "tgMessagesRead" | "tgMediaDownload" | "tgSendMessage" | "tgSendMedia" | "tgCreateChannel" | "tgPinMessage";
 
 export async function runPageJob(action: PageJobAction, args: Record<string, unknown>): Promise<unknown> {
   const current = await status();
@@ -197,10 +198,13 @@ export async function runPageJob(action: PageJobAction, args: Record<string, unk
     tiktokComments: 75000,
     tiktokSearch: 75000,
     tiktokInbox: 75000,
+    tiktokStudioList: 90000,
+    tiktokSetPrivacy: 75000,
     tgStatus: 75000,
     tgDialogsList: 75000,
     tgMessagesRead: 75000,
     tgSendMessage: 75000,
+    tgPinMessage: 75000,
     tgCreateChannel: 75000,
     getComments: 75000,
     getPosts: 75000,

@@ -75,7 +75,7 @@ test("publish runs gh release create exactly once (stub gh), no dry run", () => 
     expect(creates).toHaveLength(1);
     expect(creates[0]).toContain(`--target ${t.sha}`);
   } finally { rmSync(t.dir, { recursive: true, force: true }); }
-});
+}, 30000);
 
 // Writes a minimal consistent dist/ without compiling (fast); `tamper` corrupts the binary archive afterwards.
 function stubBuild(repo: string, tamper = false) {

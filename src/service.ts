@@ -10,7 +10,7 @@ import { downloadPostMedia, downloadProfile, fetchBody, isMediaHost, MAX_VIDEO_B
 import { identity, lockPath, pairingPath, socketPath, stateDir, extensionVersion } from "./lib/state";
 import { effectivePort } from "./lib/config";
 import { compatibleVersion } from "./lib/extension";
-import { DEFAULT_CAP, DUP_MS, checkMessageText, GAP_MS, JITTER_MS, MAX_LEN, capFromEnv, contactStatuses, parseMessageTarget, telegramChat, tgChannelsCapFromEnv, tiktokUploadsCapFromEnv, validateJob } from "./lib/validate";
+import { DEFAULT_CAP, DUP_MS, checkMessageText, GAP_MS, JITTER_MS, MAX_LEN, capFromEnv, contactStatuses, parseMessageTarget, telegramChat, tgChannelsCapFromEnv, tiktokUploadsCapFromEnv, tiktokPrivacyCapFromEnv, validateJob } from "./lib/validate";
 import { exportContactFile, upsertProfileContact } from "./lib/contacts";
 
 // Service daemon: `socmedia --service-daemon` (spawned detached by lib/client.ts start()).
@@ -43,12 +43,13 @@ export async function runServiceDaemon() {
   db.run("CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY, at TEXT NOT NULL, platform TEXT NOT NULL, toUrl TEXT NOT NULL, text TEXT NOT NULL, status TEXT NOT NULL, error TEXT, jobId INTEGER)");
   db.run("CREATE TABLE IF NOT EXISTS uploads (id INTEGER PRIMARY KEY, at TEXT NOT NULL, platform TEXT NOT NULL, sha256 TEXT NOT NULL, file TEXT NOT NULL, status TEXT NOT NULL, error TEXT, jobId INTEGER)");
   db.run("CREATE TABLE IF NOT EXISTS channels (id INTEGER PRIMARY KEY, at TEXT NOT NULL, platform TEXT NOT NULL, title TEXT NOT NULL, status TEXT NOT NULL, error TEXT, jobId INTEGER)");
+  db.run("CREATE TABLE IF NOT EXISTS privacy_changes (id INTEGER PRIMARY KEY, at TEXT NOT NULL, platform TEXT NOT NULL, videoId TEXT NOT NULL, privacy TEXT NOT NULL, status TEXT NOT NULL, error TEXT, jobId INTEGER)");
   const haltRow = db.query("SELECT value FROM service_state WHERE key = 'halted'").get() as { value: string } | null;
   let halted: { code: string; reason: string } | null = haltRow ? JSON.parse(haltRow.value) : null;
   // Side-effect actions found running at startup must become unverified, NEVER queued:
-  db.run("UPDATE jobs SET data = json_set(data, '$.status', 'unverified') WHERE json_extract(data, '$.action') IN ('sendMessage','tiktokUpload','tgSendMessage','tgSendMedia','tgCreateChannel') AND json_extract(data, '$.status') = 'running'");
+  db.run("UPDATE jobs SET data = json_set(data, '$.status', 'unverified') WHERE json_extract(data, '$.action') IN ('sendMessage','tiktokUpload','tgSendMessage','tgSendMedia','tgCreateChannel','tiktokSetPrivacy','tgPinMessage') AND json_extract(data, '$.status') = 'running'");
   // Read actions can be requeued to queued:
-  db.run("UPDATE jobs SET data = json_set(data, '$.status', 'queued') WHERE json_extract(data, '$.action') IN ('readPage','snapshot','getProfile','getComments','getPosts','getPost','screenshot','search','downloadProfile','readInbox','readThread','ytStudioRead','click','scroll','tiktokProfile','tiktokPosts','tiktokVideo','tiktokComments','tiktokSearch','tiktokInbox','tgStatus','tgDialogsList','tgMessagesRead','tgMediaDownload') AND json_extract(data, '$.status') = 'running'");
+  db.run("UPDATE jobs SET data = json_set(data, '$.status', 'queued') WHERE json_extract(data, '$.action') IN ('readPage','snapshot','getProfile','getComments','getPosts','getPost','screenshot','search','downloadProfile','readInbox','readThread','ytStudioRead','click','scroll','tiktokProfile','tiktokPosts','tiktokVideo','tiktokComments','tiktokSearch','tiktokInbox','tiktokStudioList','tgStatus','tgDialogsList','tgMessagesRead','tgMediaDownload') AND json_extract(data, '$.status') = 'running'");
   type ExtensionData = { token: string; challenge?: { clientNonce: string; serverNonce: string; version: string } };
   let extensionSocket: Bun.ServerWebSocket<ExtensionData> | null = null;
   let connectedVersion: string | null = null;
@@ -277,7 +278,7 @@ export async function runServiceDaemon() {
       })();
     }
     if (browserBusy) return;
-    const rows = db.query("SELECT id, data FROM jobs WHERE json_extract(data, '$.action') IN ('readPage','snapshot','getProfile','getComments','getPosts','getPost','screenshot','search','downloadProfile','readInbox','readThread','sendMessage','ytStudioRead','click','scroll','tiktokProfile','tiktokPosts','tiktokVideo','tiktokComments','tiktokSearch','tiktokInbox','tiktokUpload','tgStatus','tgDialogsList','tgMessagesRead','tgMediaDownload','tgSendMessage','tgSendMedia','tgCreateChannel') AND json_extract(data, '$.status') = 'queued' ORDER BY id").all() as { id: number; data: string }[];
+    const rows = db.query("SELECT id, data FROM jobs WHERE json_extract(data, '$.action') IN ('readPage','snapshot','getProfile','getComments','getPosts','getPost','screenshot','search','downloadProfile','readInbox','readThread','sendMessage','ytStudioRead','click','scroll','tiktokProfile','tiktokPosts','tiktokVideo','tiktokComments','tiktokSearch','tiktokInbox','tiktokUpload','tiktokStudioList','tiktokSetPrivacy','tgStatus','tgDialogsList','tgMessagesRead','tgMediaDownload','tgSendMessage','tgSendMedia','tgCreateChannel','tgPinMessage') AND json_extract(data, '$.status') = 'queued' ORDER BY id").all() as { id: number; data: string }[];
     const row = rows.find((candidate) => {
       const job = JSON.parse(candidate.data);
       const at = job.notBefore ? Date.parse(job.notBefore) : 0;
@@ -309,10 +310,10 @@ export async function runServiceDaemon() {
     const finish = async (reply: unknown) => {
       const halt = reply && typeof reply === "object" && "halt" in reply ? (reply as { halt: { code: string; reason: string } }).halt : null;
       const error = reply && typeof reply === "object" && "error" in reply ? String((reply as { error: unknown }).error) : null;
-      const isSideEffect = ["sendMessage", "tiktokUpload", "tgSendMessage", "tgSendMedia", "tgCreateChannel"].includes(job.action);
+      const isSideEffect = ["sendMessage", "tiktokUpload", "tgSendMessage", "tgSendMedia", "tgCreateChannel", "tiktokSetPrivacy", "tgPinMessage"].includes(job.action);
       const postPointOfNoReturn = Boolean(
-        (reply as any)?.sent || (reply as any)?.posted || (reply as any)?.created ||
-        (reply as any)?.isPostAction
+        (reply as any)?.sent || (reply as any)?.posted || (reply as any)?.created || (reply as any)?.changed ||
+        (reply as any)?.pinned || (reply as any)?.isPostAction
       );
       if (halt) {
         halted = halt;
@@ -531,6 +532,24 @@ export async function runServiceDaemon() {
               nowIso, "tg", String(job.args.title), chanStatus, chanError, row.id
             );
           }
+          if (job.action === "tiktokSetPrivacy") {
+            const nowIso = new Date().toISOString();
+            let privStatus = "failed";
+            let privError: string | null = job.error ? (typeof job.error === "object" ? job.error.reason : String(job.error)) : null;
+            if (job.status === "done") {
+              const res = reply as { changed?: boolean; verified?: boolean; note?: string };
+              if (res.verified) privStatus = "done";
+              else if (res.changed) { privStatus = "unverified"; privError = "changed, but unverified"; }
+              else if (res.note && res.note.includes("already has requested privacy")) { privStatus = "done"; }
+              else privStatus = "failed";
+            } else if (job.status === "unverified") {
+              privStatus = "unverified";
+              privError = job.error ? (typeof job.error === "object" ? job.error.reason : String(job.error)) : "unverified";
+            }
+            db.query("INSERT INTO privacy_changes (at, platform, videoId, privacy, status, error, jobId) VALUES (?, ?, ?, ?, ?, ?, ?)").run(
+              nowIso, "tt", String(job.args.videoId), String(job.args.privacy), privStatus, privError, row.id
+            );
+          }
           db.query("UPDATE jobs SET data = ? WHERE id = ?").run(JSON.stringify(job), row.id);
         })();
       } catch (error) {
@@ -553,11 +572,14 @@ export async function runServiceDaemon() {
       tiktokComments: 75000,
       tiktokSearch: 75000,
       tiktokInbox: 75000,
+      tiktokStudioList: 90000,
+      tiktokSetPrivacy: 75000,
       tgStatus: 75000,
       tgDialogsList: 75000,
       tgMessagesRead: 75000,
       tgSendMessage: 75000,
       tgCreateChannel: 75000,
+      tgPinMessage: 75000,
       getComments: Math.max(extensionTimeout, 60000),
       getProfile: Math.max(extensionTimeout, 45000),
     };
@@ -579,6 +601,7 @@ export async function runServiceDaemon() {
       limits: {
         messages: { cap: capFromEnv() },
         tiktokUploads: { cap: tiktokUploadsCapFromEnv() },
+        tiktokPrivacy: { cap: tiktokPrivacyCapFromEnv() },
         telegramChannels: { cap: tgChannelsCapFromEnv() },
       },
     }) + "\n");
@@ -855,6 +878,30 @@ export async function runServiceDaemon() {
               const totalToday = usedToday.count + activeJobs.length;
               if (totalToday >= cap) {
                 const err: any = new Error(`Daily channel creation cap reached: ${totalToday} of ${cap} channels on tg today (SOCMEDIA_MAX_TG_CHANNELS_PER_DAY). Try again tomorrow.`);
+                err.code = "RATE_LIMIT";
+                throw err;
+              }
+            }
+            if (job.action === "tiktokSetPrivacy") {
+              const pArgs = job.args as Record<string, any>;
+              const vId = String(pArgs.videoId);
+              const reqPrivacy = String(pArgs.privacy);
+              if (reqPrivacy === "public" && process.env.SOCMEDIA_TIKTOK_ALLOW_PUBLIC !== "1") {
+                throw new Error("Setting video privacy to public is disabled by default. Set SOCMEDIA_TIKTOK_ALLOW_PUBLIC=1 in the service environment to allow.");
+              }
+              const cap = tiktokPrivacyCapFromEnv();
+              const startOfToday = new Date(new Date().getFullYear(), new Date().getMonth(), new Date().getDate()).toISOString();
+              const usedToday = db.query("SELECT COUNT(*) as count FROM privacy_changes WHERE platform = 'tt' AND status IN ('done', 'unverified') AND at >= ?").get(startOfToday) as { count: number };
+              const activeJobs = db.query("SELECT data FROM jobs WHERE json_extract(data, '$.action') = 'tiktokSetPrivacy' AND json_extract(data, '$.status') IN ('queued', 'running')").all() as { data: string }[];
+              for (const r of activeJobs) {
+                const j = JSON.parse(r.data);
+                if (vId && String(j.args?.videoId) === vId) {
+                  throw new Error("Refused: privacy change for this video is already queued or running.");
+                }
+              }
+              const totalToday = usedToday.count + activeJobs.length;
+              if (totalToday >= cap) {
+                const err: any = new Error(`Daily privacy change cap reached: ${totalToday} of ${cap} privacy changes on tt today (SOCMEDIA_MAX_TIKTOK_PRIVACY_PER_DAY). Try again tomorrow.`);
                 err.code = "RATE_LIMIT";
                 throw err;
               }

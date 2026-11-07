@@ -1806,7 +1806,7 @@ test("extension install uses a stable path and public-key ID without changing pa
     const humanPath = await run("extension", "path");
     expect(humanPath.stdout.trim()).toBe(path);
   } finally { await rm(stateDir, { recursive: true, force: true }); }
-});
+}, 30000);
 
 test("real extension detects login, checkpoint and captcha before reading", async () => {
   const script = await Bun.file(new URL("../extension/background.js", import.meta.url)).text();

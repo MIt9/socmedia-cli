@@ -15,6 +15,7 @@ export const meta: CommandMeta = {
     { name: "dialogs list", summary: "List dialogs from Telegram Web K" },
     { name: "messages read CHAT", summary: "Read messages from a chat" },
     { name: "message send CHAT", summary: "Send text message to a chat" },
+    { name: "message pin CHAT", summary: "Pin a message in a chat" },
     { name: "media download CHAT", summary: "Download photos and videos from a chat" },
     { name: "media send CHAT FILE", summary: "Send photo or video to a chat" },
     { name: "channel create", summary: "Create a new private channel" },
@@ -25,6 +26,7 @@ export const meta: CommandMeta = {
     { flag: "--dir DIR", description: "Directory to save downloaded media" },
     { flag: "--text TEXT", description: "Message text (max 4096 characters)" },
     { flag: "--caption TEXT", description: "Caption for media sent to chat (max 4096 characters)" },
+    { flag: "--id ID", description: "Message ID to pin (default: latest message)" },
     { flag: "--title TEXT", description: "Channel title (1-128 characters)" },
     { flag: "--description DESC", description: "Channel description (max 255 characters)" },
     { flag: "--confirm", description: "Confirm write action; without this flag, returns preview" },
@@ -64,33 +66,63 @@ async function run(argv: string[]): Promise<void> {
       const res = await runPageJob("tgMessagesRead", { chat, limit });
       printOutput(res);
     } else if (sub === "message") {
-      if (argv[4] !== "send") throw new Error("Usage: socmedia telegram message send CHAT --text TEXT [options]");
-      const chatRaw = argv[5];
-      if (!chatRaw || chatRaw.startsWith("--")) throw new Error("Usage: socmedia telegram message send CHAT --text TEXT [options]");
-      const chat = telegramChat(chatRaw);
-      let text = "";
-      let confirm = false;
-      for (let i = 6; i < argv.length; i++) {
-        if (argv[i] === "--json") continue;
-        if (argv[i] === "--text") {
-          text = argv[++i] ?? "";
-        } else if (argv[i] === "--confirm") {
-          confirm = true;
-        } else throw new Error(`Unknown telegram message send option: ${argv[i]}`);
-      }
-      if (!text.trim()) throw new Error("Message text is empty");
-      if (text.length > 4096) throw new Error(`Message is too long (${text.length} > 4096 characters)`);
+      const act = argv[4];
+      if (act === "send") {
+        const chatRaw = argv[5];
+        if (!chatRaw || chatRaw.startsWith("--")) throw new Error("Usage: socmedia telegram message send CHAT --text TEXT [options]");
+        const chat = telegramChat(chatRaw);
+        let text = "";
+        let confirm = false;
+        for (let i = 6; i < argv.length; i++) {
+          if (argv[i] === "--json") continue;
+          if (argv[i] === "--text") {
+            text = argv[++i] ?? "";
+          } else if (argv[i] === "--confirm") {
+            confirm = true;
+          } else throw new Error(`Unknown telegram message send option: ${argv[i]}`);
+        }
+        if (!text.trim()) throw new Error("Message text is empty");
+        if (text.length > 4096) throw new Error(`Message is too long (${text.length} > 4096 characters)`);
 
-      if (!confirm) {
-        printOutput({
-          platform: "tg",
-          sent: false,
-          preview: { chat, text },
-          note: "Nothing sent. Pass --confirm to send message.",
-        });
+        if (!confirm) {
+          printOutput({
+            platform: "tg",
+            sent: false,
+            preview: { chat, text },
+            note: "Nothing sent. Pass --confirm to send message.",
+          });
+        } else {
+          const res = await runPageJob("tgSendMessage", { chat, text });
+          printOutput(res);
+        }
+      } else if (act === "pin") {
+        const chatRaw = argv[5];
+        if (!chatRaw || chatRaw.startsWith("--")) throw new Error("Usage: socmedia telegram message pin CHAT [options]");
+        const chat = telegramChat(chatRaw);
+        let messageId: string | null = null;
+        let confirm = false;
+        for (let i = 6; i < argv.length; i++) {
+          if (argv[i] === "--json" || argv[i] === "--text") continue;
+          if (argv[i] === "--id") {
+            messageId = argv[++i] ?? null;
+          } else if (argv[i] === "--confirm") {
+            confirm = true;
+          } else throw new Error(`Unknown telegram message pin option: ${argv[i]}`);
+        }
+
+        if (!confirm) {
+          printOutput({
+            platform: "tg",
+            pinned: false,
+            preview: { chat, messageId },
+            note: "Nothing pinned. Pass --confirm to pin message.",
+          });
+        } else {
+          const res = await runPageJob("tgPinMessage", { chat, messageId });
+          printOutput(res);
+        }
       } else {
-        const res = await runPageJob("tgSendMessage", { chat, text });
-        printOutput(res);
+        throw new Error("Usage: socmedia telegram message <send|pin> CHAT [options]");
       }
     } else if (sub === "media") {
       const action = argv[4];
@@ -108,7 +140,7 @@ async function run(argv: string[]): Promise<void> {
           } else if (argv[i] === "--types") {
             types = (argv[++i] ?? "").split(",").map((t) => t.trim()).filter(Boolean);
           } else if (argv[i] === "--dir") {
-            dir = resolveHomePath(argv[++i]);
+            dir = resolveHomePath(argv[++i], process.cwd());
           } else throw new Error(`Unknown telegram media download option: ${argv[i]}`);
         }
         const res = await runPageJob("tgMediaDownload", { chat, limit, types, dir });

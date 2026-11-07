@@ -6,8 +6,8 @@ export const actions = new Set([
   "getProfile", "getPosts", "getPost", "getComments", "search", "screenshot",
   "readInbox", "readThread", "sendMessage", "readPage", "snapshot", "scroll",
   "listTabs", "useTab", "ytStudioRead", "click", "downloadProfile", "inertTask",
-  "tiktokProfile", "tiktokPosts", "tiktokVideo", "tiktokComments", "tiktokSearch", "tiktokInbox", "tiktokUpload",
-  "tgStatus", "tgDialogsList", "tgMessagesRead", "tgMediaDownload", "tgSendMessage", "tgSendMedia", "tgCreateChannel"
+  "tiktokProfile", "tiktokPosts", "tiktokVideo", "tiktokComments", "tiktokSearch", "tiktokInbox", "tiktokUpload", "tiktokStudioList", "tiktokSetPrivacy",
+  "tgStatus", "tgDialogsList", "tgMessagesRead", "tgMediaDownload", "tgSendMessage", "tgSendMedia", "tgCreateChannel", "tgPinMessage"
 ]);
 export const contactStatuses = ["new", "messaged", "replied", "won", "rejected", "skip"];
 export const contactColumns = ["id", "platform", "username", "name", "status", "followers", "following", "postsCount", "verified", "private", "isBusiness", "category", "website", "email", "phone", "bio", "url", "note", "firstSeen", "lastSeen", "updatedAt"];
@@ -24,11 +24,44 @@ export function capFromEnv(v = process.env.SOCMEDIA_MAX_MESSAGES_PER_DAY) {
   return Number.isInteger(n) && n >= 0 ? n : DEFAULT_CAP;
 }
 
+// TikTok Studio's native scheduler accepts roughly 15 minutes..10 days ahead (checked against TikTok's announcement and
+// third-party docs, not live: the picker only appears after a file is chosen). We keep a 20 minute margin.
+export const SCHEDULE_MIN_MINUTES = 20;
+export const SCHEDULE_MAX_DAYS = 10;
+const KYIV = "Europe/Kyiv";
+function kyivWall(ms: number): number {
+  const p = Object.fromEntries(new Intl.DateTimeFormat("en-CA", { timeZone: KYIV, year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hourCycle: "h23" }).formatToParts(new Date(ms)).map((x) => [x.type, x.value]));
+  return Date.UTC(Number(p.year), Number(p.month) - 1, Number(p.day), Number(p.hour), Number(p.minute));
+}
+/** "YYYY-MM-DD HH:MM" Europe/Kyiv wall time -> instant, refusing impossible times and anything outside the window. */
+export function parseKyivSchedule(input: string, now: number = Date.now()): { date: string; time: string; at: number } {
+  const m = /^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2})$/.exec(String(input ?? ""));
+  const fmt = new Error('--schedule must look like "YYYY-MM-DD HH:MM" (Europe/Kyiv local time)');
+  if (!m) throw fmt;
+  const [y, mo, d, h, mi] = m.slice(1).map(Number) as [number, number, number, number, number];
+  const wall = Date.UTC(y, mo - 1, d, h, mi);
+  const cal = new Date(wall);
+  if (mo < 1 || mo > 12 || h > 23 || mi > 59 || cal.getUTCFullYear() !== y || cal.getUTCMonth() !== mo - 1 || cal.getUTCDate() !== d) throw fmt;
+  let at = wall;
+  for (let i = 0; i < 3; i++) at = wall - (kyivWall(at) - at);
+  if (kyivWall(at) !== wall) throw new Error(`--schedule time ${input} does not exist in Europe/Kyiv (clock change)`);
+  if (at < now + SCHEDULE_MIN_MINUTES * 60000) throw new Error(`Schedule must be at least ${SCHEDULE_MIN_MINUTES} minutes in the future (Europe/Kyiv time)`);
+  if (at > now + SCHEDULE_MAX_DAYS * 86400000) throw new Error(`Schedule must be at most ${SCHEDULE_MAX_DAYS} days ahead (TikTok Studio limit)`);
+  return { date: m[0].slice(0, 10), time: m[0].slice(11), at };
+}
+
 export const DEFAULT_TIKTOK_UPLOADS_CAP = 5;
 export function tiktokUploadsCapFromEnv(v = process.env.SOCMEDIA_MAX_TIKTOK_UPLOADS_PER_DAY) {
   if (v === undefined || v === null || String(v).trim() === "") return DEFAULT_TIKTOK_UPLOADS_CAP;
   const n = Number(v);
   return Number.isInteger(n) && n >= 0 ? n : DEFAULT_TIKTOK_UPLOADS_CAP;
+}
+
+export const DEFAULT_TIKTOK_PRIVACY_CAP = 20;
+export function tiktokPrivacyCapFromEnv(v = process.env.SOCMEDIA_MAX_TIKTOK_PRIVACY_PER_DAY) {
+  if (v === undefined || v === null || String(v).trim() === "") return DEFAULT_TIKTOK_PRIVACY_CAP;
+  const n = Number(v);
+  return Number.isInteger(n) && n >= 0 ? n : DEFAULT_TIKTOK_PRIVACY_CAP;
 }
 
 export const DEFAULT_TG_CHANNELS_CAP = 3;
@@ -78,6 +111,26 @@ export function telegramChat(value: unknown): string {
   if (/t\.me\/\+|t\.me\/joinchat\//i.test(str) || str.startsWith("+")) {
     throw new Error("Invite links (t.me/+...) are not supported");
   }
+
+  // Web K / Web A URL with hash, e.g. https://web.telegram.org/k/#-3913521119 or https://web.telegram.org/k/#@username
+  if (/^https:\/\/web\.telegram\.org\/(?:k|a)\/#/i.test(str)) {
+    const hash = str.split("#")[1] || "";
+    if (/^-?\d{1,20}$/.test(hash)) return hash;
+    if (hash.startsWith("@")) return telegramChat(hash);
+    if (/^[a-zA-Z0-9_]{5,32}$/.test(hash)) return `@${hash}`;
+    throw new Error("Invalid Telegram chat URL hash");
+  }
+
+  // Raw hash peer ID, e.g. #-3913521119
+  if (/^#-?\d{1,20}$/.test(str)) {
+    return str.slice(1);
+  }
+
+  // Pure peer ID (digits, optionally starting with -)
+  if (/^-?\d{1,20}$/.test(str)) {
+    return str;
+  }
+
   let username = "";
   if (/^https?:\/\//i.test(str)) {
     let u: URL;
@@ -103,8 +156,12 @@ export function telegramChat(value: unknown): string {
   return `@${username}`;
 }
 
-export function validateMediaFile(file: string, allowedTypes: ("mp4" | "mov" | "webm" | "jpg" | "png" | "webp")[]): { path: string; size: number; ext: string; sha256: string } {
-  const abs = resolveHomePath(file);
+export function validateMediaFile(
+  file: string,
+  allowedTypes: ("mp4" | "mov" | "webm" | "jpg" | "png" | "webp")[],
+  cwd: string = process.cwd()
+): { path: string; size: number; ext: string; sha256: string } {
+  const abs = resolveHomePath(file, cwd);
   if (!existsSync(abs)) throw new Error(`File not found: ${abs}`);
   const st = lstatSync(abs);
   if (st.isSymbolicLink()) throw new Error(`Symlinks are not allowed: ${abs}`);
@@ -402,7 +459,7 @@ export function validateJob(value: unknown) {
   if (job.action === "tiktokUpload") {
     const args = job.args as Record<string, unknown>;
     for (const k of Object.keys(args)) {
-      if (!["file", "caption", "privacy", "sha256"].includes(k)) throw new Error(`Unknown tiktokUpload option: ${k}`);
+      if (!["file", "caption", "privacy", "sha256", "schedule"].includes(k)) throw new Error(`Unknown tiktokUpload option: ${k}`);
     }
     if (typeof args.file !== "string" || !args.file) throw new Error("file is required");
     const v = validateMediaFile(args.file, ["mp4", "mov", "webm"]);
@@ -412,6 +469,28 @@ export function validateJob(value: unknown) {
       if (typeof args.caption !== "string" || args.caption.length > 2200) throw new Error("Caption must be at most 2200 characters");
     }
     if (args.privacy !== undefined && !["public", "friends", "private"].includes(String(args.privacy))) {
+      throw new Error("privacy must be public, friends, or private");
+    }
+    if (args.schedule !== undefined) {
+      if (typeof args.schedule !== "string") throw new Error("schedule must be a string like YYYY-MM-DD HH:MM (Europe/Kyiv)");
+      if (args.privacy !== "public") throw new Error("A scheduled upload must be public (privacy public)");
+      parseKyivSchedule(args.schedule);
+    }
+  }
+  if (job.action === "tiktokStudioList") {
+    const args = job.args as Record<string, unknown>;
+    for (const k of Object.keys(args)) {
+      if (k !== "limit") throw new Error(`Unknown tiktokStudioList option: ${k}`);
+    }
+    if (args.limit !== undefined && (!Number.isInteger(args.limit) || Number(args.limit) < 1 || Number(args.limit) > 500)) throw new Error("Limit must be an integer from 1 to 500");
+  }
+  if (job.action === "tiktokSetPrivacy") {
+    const args = job.args as Record<string, unknown>;
+    for (const k of Object.keys(args)) {
+      if (!["videoId", "privacy"].includes(k)) throw new Error(`Unknown tiktokSetPrivacy option: ${k}`);
+    }
+    if (typeof args.videoId !== "string" || !/^\d{10,30}$/.test(args.videoId)) throw new Error("videoId must be a numeric video ID string");
+    if (!["public", "friends", "private"].includes(String(args.privacy))) {
       throw new Error("privacy must be public, friends, or private");
     }
   }
@@ -472,6 +551,19 @@ export function validateJob(value: unknown) {
     if (typeof args.title !== "string" || !args.title.trim() || args.title.length > 128) throw new Error("Channel title must be between 1 and 128 characters");
     if (args.description !== undefined && (typeof args.description !== "string" || args.description.length > 255)) {
       throw new Error("Channel description must be at most 255 characters");
+    }
+  }
+  if (job.action === "tgPinMessage") {
+    const args = job.args as Record<string, unknown>;
+    for (const k of Object.keys(args)) {
+      if (!["chat", "messageId"].includes(k)) throw new Error(`Unknown tgPinMessage option: ${k}`);
+    }
+    args.chat = telegramChat(args.chat);
+    if (args.messageId !== undefined && args.messageId !== null) {
+      if (typeof args.messageId !== "string" && typeof args.messageId !== "number") throw new Error("messageId must be a positive integer or string ID");
+      const s = String(args.messageId).trim();
+      if (!/^\d+$/.test(s)) throw new Error("messageId must be a positive integer ID");
+      args.messageId = s;
     }
   }
   if (job.key !== undefined && (typeof job.key !== "string" || !job.key)) throw new Error("--key must be a nonempty string");

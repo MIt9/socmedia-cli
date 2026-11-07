@@ -1,6 +1,6 @@
 {
   "name": "socmedia-cli",
-  "version": "0.17.1",
+  "version": "0.20.3",
   "private": true,
   "type": "module",
   "bin": { "socmedia": "./src/cli.ts" },

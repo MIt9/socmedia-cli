@@ -42,7 +42,7 @@ The CLI's `--help` is the source of truth; this skill mirrors and summarizes its
 ## Critical Safety Rails for AI Agents
 
 1. **NEVER autonomously add `--confirm`**:
-   - Write/mutating operations (`socmedia message send`, `socmedia youtube upload`, `socmedia tiktok upload`, `socmedia telegram message send`, `socmedia telegram media send`, `socmedia telegram channel create`) enforce a strict **Preview Gate**.
+   - Write/mutating operations (`socmedia message send`, `socmedia youtube upload`, `socmedia tiktok upload`, `socmedia tiktok privacy`, `socmedia telegram message send`, `socmedia telegram message pin`, `socmedia telegram media send`, `socmedia telegram channel create`) enforce a strict **Preview Gate**.
    - Running without `--confirm` returns a dry-run preview (`{ preview: {...}, sent: false }`, `{ preview: {...}, uploaded: false }`, or `{ preview: {...}, created: false }`).
    - The agent MUST show this preview to the user and await explicit confirmation. The agent must NEVER add `--confirm` without direct user request.
    - Note: execution with `--confirm` for `socmedia message send` and `socmedia youtube upload` is currently not implemented (`NOT_IMPLEMENTED`).
@@ -237,31 +237,48 @@ The CLI's `--help` is the source of truth; this skill mirrors and summarizes its
   ```bash
   socmedia tiktok upload ~/Videos/clip.mp4 --caption "My video" --privacy private [--json]
   ```
+- **Schedule an upload with Studio's native scheduler (preview, no `--confirm`)**: time is local **Europe/Kyiv**, 20 minutes to 10 days ahead, public only (default privacy becomes public). Counts toward the 5/day upload cap when confirmed. Scheduler selectors are not verified live.
+  ```bash
+  socmedia tiktok upload ~/Videos/clip.mp4 --caption "My video" --schedule "2026-11-10 18:00" [--json]
+  ```
+- **List own videos from Studio (`privacy` is `null` when it could not be read)**:
+  ```bash
+  socmedia tiktok studio list --limit 50 [--json]
+  ```
+- **Change privacy of a published video (preview, no `--confirm`)**:
+  ```bash
+  socmedia tiktok privacy 7703059197751037204 --set friends [--json]
+  ```
+  *(Preview only echoes the request; it does not read Studio. Not working live yet: the Studio flow was never inspected. Cap 20/day, `SOCMEDIA_MAX_TIKTOK_PRIVACY_PER_DAY`. `public` needs `SOCMEDIA_TIKTOK_ALLOW_PUBLIC=1` in the service environment.)*
 
 ### Telegram Web K Operations
-- **Check login status and account**:
+- **Check login status and account (`account` is `null` when the page data has no name; `accountId` identifies it)**:
   ```bash
   socmedia telegram status [--json]
   ```
-- **List dialogs**:
+- **List dialogs (extracts peer IDs like `-3913521119` and handles tips)**:
   ```bash
   socmedia telegram dialogs list --limit 20 [--json]
   ```
-- **Read messages from chat**:
+- **Read messages from chat or private channel (accepts `@username` or peer ID `-3913521119`)**:
   ```bash
-  socmedia telegram messages read @username --limit 30 [--json]
+  socmedia telegram messages read -3913521119 --limit 30 [--json]
   ```
-- **Send text message (preview, no `--confirm`)**:
+- **Send text message (preview, no `--confirm`; result has `messageId` for `message pin --id`; fails if the composer already holds an unsent draft)**:
   ```bash
-  socmedia telegram message send @username --text "Hello" [--json]
+  socmedia telegram message send -3913521119 --text "Hello" [--json]
   ```
-- **Download media from chat**:
+- **Pin message in chat or channel (preview, no `--confirm`)**:
   ```bash
-  socmedia telegram media download @username --limit 10 --types photo,video [--dir ~/Downloads] [--json]
+  socmedia telegram message pin -3913521119 [--id ID] [--json]
   ```
-- **Send photo or video (preview, no `--confirm`)**:
+- **Download media from chat or channel**:
   ```bash
-  socmedia telegram media send @username ~/Photos/pic.jpg --caption "Photo" [--json]
+  socmedia telegram media download -3913521119 --limit 10 --types photo,video [--dir ~/Downloads] [--json]
+  ```
+- **Send photo or video (preview, no `--confirm`; relative paths resolve against the caller's cwd; result has `messageId`)**:
+  ```bash
+  socmedia telegram media send -3913521119 relative/path/pic.jpg --caption "Photo" [--json]
   ```
 - **Create private channel (preview, no `--confirm`)**:
   ```bash
