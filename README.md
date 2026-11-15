@@ -94,6 +94,8 @@ mkdir -p ~/.claude/skills/socmedia-cli-usage && cp skills/socmedia-cli-usage/SKI
 
 ## Що не перевірено наживо
 
+- Виправлення Telegram Web K у 0.20.4 (навігація за username, повторне відкриття чату та перевірка повідомлень після швидкої відповіді) не перевірені наживо.
+
 - Справжній Chrome із розширенням 0.20.0, у тому числі обробник `{type:"reload"}` у `extension/background.js` (покрито лише тестом коду та мок-сокетом).
 - Instagram, Facebook, YouTube Studio, TikTok (`www.tiktok.com`) та Telegram Web K (`web.telegram.org/k/`) на живих сторінках у цьому зрізі (включно з TikTok Studio upload, перевіркою публікацій, Telegram Web K сесією, читанням повідомлень, чанковим скачуванням медіа та створенням каналів).
 - **Усі DOM-селектори для TikTok та Telegram Web K написані з пам'яті та специфікацій і є неперевіреними наживо (unverified live) у Chrome.**

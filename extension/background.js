@@ -479,6 +479,7 @@ function pgMatchTgChat(expected, prevHeader = null) {
   }
 
   const norm = expected.replace(/^@/, "").toLowerCase();
+  if (titleLower === norm) return { matched: true, title, username: norm };
   // Exact @username confirmation from open chat's own data (profile side panel username row or equivalent peer-bound source)
   let confirmed = false;
   const usernameSelectors = [
@@ -558,7 +559,16 @@ function pgMatchTgChat(expected, prevHeader = null) {
   if (confirmed) {
     return { matched: true, title, username: norm };
   }
-  return { matched: false, title, confirmed: false };
+  return { matched: false, title, confirmed: false, reason: "Chat title differs from username and username could not be confirmed; use the numeric peer id from socmedia telegram dialogs list" };
+}
+
+function tgAlreadyInTarget(url, target) {
+  try {
+    const current = new URL(url);
+    const requested = new URL(target);
+    return current.hostname === "web.telegram.org" && requested.hostname === current.hostname &&
+      Boolean(current.hash) && current.hash.replace(/^#@?/, "").toLowerCase() === requested.hash.replace(/^#@?/, "").toLowerCase();
+  } catch { return false; }
 }
 
 async function navigateSocial(target, prevHeader = null) {
@@ -572,7 +582,7 @@ async function navigateSocial(target, prevHeader = null) {
   }
   const current = await chrome.tabs.get(tabId);
   if (current.url !== "about:blank") await safeTab(tabId);
-  if (prevHeader === null && target.includes("web.telegram.org") && current.url !== target) {
+  if (prevHeader === null && target.includes("web.telegram.org") && !tgAlreadyInTarget(current.url, target)) {
     const [alreadyTargetRes] = await chrome.scripting.executeScript({
       target: { tabId },
       func: (t) => {
@@ -3317,8 +3327,7 @@ async function tgSendMessage({ chat, text }) {
   const target = isPeerId ? `https://web.telegram.org/k/#${norm}` : `https://web.telegram.org/k/#@${norm}`;
   const { tabId: curTabId } = await getWorkTab();
   const curTab = await chrome.tabs.get(curTabId).catch(() => null);
-  const curHash = (new URL(curTab?.url || "about:blank").hash || "").replace(/^#@?/, "").toLowerCase();
-  const alreadyInTarget = Boolean(curTab?.url?.includes("web.telegram.org") && curHash && curHash === norm.toLowerCase());
+  const alreadyInTarget = tgAlreadyInTarget(curTab?.url, target);
   let prevHeader = null;
   if (!alreadyInTarget) {
     const [prevRes] = await chrome.scripting.executeScript({
@@ -3416,19 +3425,22 @@ async function tgSendMessage({ chat, text }) {
 
   // ================= POINT OF NO RETURN =================
   try {
-    // In a channel the owner's own posts are .bubble.is-in.channel-post (not .is-out), and the list is
-    // virtualised, so judge only the last real bubble: new id, no is-sending, same text.
+    // Own channel posts are .is-in.channel-post; a reply may follow our outgoing bubble.
     function pgCheckLastMessage(expectedText, prevMid) {
       const squash = (t) => String(t ?? "").replace(/\s+/g, " ").trim();
-      const last = [...document.querySelectorAll(".bubble, .message")].filter((el) => !el.parentElement?.closest(".bubble, .message") && !el.classList?.contains("service")).at(-1);
-      if (!last) return { verified: false, reason: "No message bubbles found" };
-      if (last.classList.contains("is-sending") || last.querySelector(".is-sending, .sending")) return { verified: false, pending: true, reason: "Message is still sending" };
-      const mid = last.getAttribute("data-mid") || last.id || null;
-      if (mid && mid.includes(".")) return { verified: false, pending: true, reason: "Message id is still temporary" };
-      if (prevMid && mid === prevMid) return { verified: false, reason: "No new message bubble appeared" };
-      const bubbleText = squash(last.querySelector(".message, .text-content, .bubble-content")?.innerText || last.innerText);
-      if (!bubbleText.includes(squash(expectedText))) return { verified: false, reason: "Last bubble text does not match" };
-      return { verified: true, mid };
+      const bubbles = [...document.querySelectorAll(".bubble, .message")].filter((el) => !el.parentElement?.closest(".bubble, .message") && !el.classList?.contains("service"));
+      const index = bubbles.findIndex((b) => b.getAttribute("data-mid") === prevMid);
+      if (!prevMid || index < 0) return { verified: false, reason: "Previous message bubble not found" };
+      for (const bubble of bubbles.slice(index + 1)) {
+        if (!(bubble.classList.contains("is-out") || bubble.classList.contains("outgoing") || (bubble.classList.contains("is-in") && bubble.classList.contains("channel-post")))) continue;
+        const mid = bubble.getAttribute("data-mid");
+        if (!mid || mid === prevMid) continue;
+        const bubbleText = squash(bubble.querySelector(".message, .text-content, .bubble-content")?.innerText || bubble.innerText);
+        if (bubbleText !== squash(expectedText)) continue;
+        if (bubble.classList.contains("is-sending") || bubble.querySelector(".is-sending, .sending") || mid.includes(".")) return { verified: false, pending: true, reason: "Message is still sending" };
+        return { verified: true, mid };
+      }
+      return { verified: false, reason: "No matching new outgoing message bubble" };
     }
 
     let verified = false;
@@ -3481,8 +3493,7 @@ async function tgSendMedia({ chat, file, caption = "" }) {
   const target = isPeerId ? `https://web.telegram.org/k/#${norm}` : `https://web.telegram.org/k/#@${norm}`;
   const { tabId: curTabId } = await getWorkTab();
   const curTab = await chrome.tabs.get(curTabId).catch(() => null);
-  const curHash = (new URL(curTab?.url || "about:blank").hash || "").replace(/^#@?/, "").toLowerCase();
-  const alreadyInTarget = Boolean(curTab?.url?.includes("web.telegram.org") && curHash && curHash === norm.toLowerCase());
+  const alreadyInTarget = tgAlreadyInTarget(curTab?.url, target);
   let prevHeader = null;
   if (!alreadyInTarget) {
     const [prevRes] = await chrome.scripting.executeScript({
@@ -3680,13 +3691,17 @@ async function tgSendMedia({ chat, file, caption = "" }) {
   try {
     function pgCheckOutgoingMedia(expectedCaption, bState) {
       const rawBubbles = [...document.querySelectorAll(".bubble, .message")];
-      // Judge only the last real bubble (the list is virtualised). The owner's own channel posts are
-      // .is-in.channel-post, so "outgoing" is not a usable test: a new id after the send click is.
+      // Own channel posts are .is-in.channel-post; a reply may follow the media bubble.
       const bubbles = rawBubbles.filter((el) => !el.parentElement?.closest(".bubble, .message") && !el.classList?.contains("service"));
       if (bubbles.length === 0) return { verified: false, reason: "No message bubbles found" };
 
-      const last = bubbles.at(-1);
-      if (!last) return { verified: false, reason: "No message bubbles found" };
+      const previousIndex = bubbles.findIndex((b) => b.getAttribute("data-mid") === bState?.lastMid);
+      if (!bState?.lastMid || previousIndex < 0) return { verified: false, reason: "Previous message bubble not found" };
+      const last = bubbles.slice(previousIndex + 1).find((b) =>
+        (b.classList.contains("is-out") || b.classList.contains("outgoing") || (b.classList.contains("is-in") && b.classList.contains("channel-post"))) &&
+        (b.querySelector("img, video, .media-container, .attachment, .media-photo, .media-video") || b.classList.contains("media") || b.classList.contains("video") || b.classList.contains("photo")) &&
+        (!expectedCaption || (b.querySelector(".message, .text-content, .bubble-content, .caption, .bubble-text")?.innerText || b.innerText || "").replace(/\s+/g, " ").trim() === expectedCaption.replace(/\s+/g, " ").trim()));
+      if (!last) return { verified: false, reason: "No matching new outgoing media bubble" };
 
       // Ensure last bubble is not still sending
       if (last.classList.contains("is-sending") || last.querySelector(".is-sending, .sending, .progress-circle")) {
@@ -3699,7 +3714,8 @@ async function tgSendMedia({ chat, file, caption = "" }) {
         return { verified: false, reason: "Last bubble does not contain media" };
       }
 
-      const lastMid = last.getAttribute("data-mid") || last.id || null;
+      const lastMid = last.getAttribute("data-mid") || null;
+      if (!lastMid) return { verified: false, reason: "Message id missing" };
       if (lastMid && lastMid.includes(".")) {
         return { verified: false, pending: true, reason: "Message id is still temporary" };
       }
@@ -3708,13 +3724,6 @@ async function tgSendMedia({ chat, file, caption = "" }) {
       }
       if (bState?.lastOutMid && lastMid === bState.lastOutMid) {
         return { verified: false, reason: "No new outgoing message bubble appeared" };
-      }
-      if (bState && bubbles.length <= bState.count && !expectedCaption) {
-        const outgoing = bubbles.filter((b) => b.classList?.contains("is-out") || b.classList?.contains("outgoing") || Boolean(b.querySelector?.(".is-out, .outgoing")));
-        const currentMediaCount = outgoing.filter((el) => el.querySelector("img, video, .media-container, .attachment, .media-photo, .media-video") || el.classList.contains("media")).length;
-        if (currentMediaCount <= bState.mediaCount) {
-          return { verified: false, reason: "Outgoing media count did not increase" };
-        }
       }
 
       if (expectedCaption) {

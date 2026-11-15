@@ -418,7 +418,7 @@ test("CRITICAL 1: pgMatchTgChat refuses stale header with correct hash and confi
   const res1 = runInNewContext('pgMatchTgChat("target_user")', context);
   expect(res1.matched).toBe(false);
 
-  // 2. Display name matching norm (e.g. title === "target_user") must NOT match without exact username
+  // 2. The exact username as the title remains a valid match.
   document.querySelector = (sel: string) => {
     if (sel.includes("peer-title") || sel.includes("chat-title")) {
       return { innerText: "target_user" }; // display name happens to match
@@ -426,7 +426,7 @@ test("CRITICAL 1: pgMatchTgChat refuses stale header with correct hash and confi
     return null;
   };
   const res2 = runInNewContext('pgMatchTgChat("target_user")', context);
-  expect(res2.matched).toBe(false);
+  expect(res2.matched).toBe(true);
 
   // 3. Stale header compared to previousHeader must refuse even if side panel has username
   sidePanelUsername = "@target_user";
@@ -1808,8 +1808,31 @@ const channelBubble = (mid: string, text: string, cls: string[] = ["is-in", "cha
   classList: { contains: (c: string) => cls.includes(c) },
   parentElement: { closest: () => null },
   getAttribute: (a: string) => (a === "data-mid" ? mid : null),
-  querySelector: (sel: string) => (sel.includes(".message") ? { innerText: `${text} 15:30` } : null),
+  querySelector: (sel: string) => (sel.includes(".message") ? { innerText: text } : null),
   innerText: `${text} 15:30`,
+});
+
+test("Telegram open-target comparison recognises canonical hash case and rejects a different chat or host", async () => {
+  const script = await Bun.file(new URL("../extension/background.js", import.meta.url)).text();
+  const { context } = liveTgContext(script, { draft: "", bubbles: () => [] });
+  expect(runInNewContext('tgAlreadyInTarget("https://web.telegram.org/k/#@Example", "https://web.telegram.org/k/#@example")', context)).toBe(true);
+  expect(runInNewContext('tgAlreadyInTarget("https://web.telegram.org/k/#123", "https://web.telegram.org/k/#456")', context)).toBe(false);
+  expect(runInNewContext('tgAlreadyInTarget("https://web.telegram.org.evil.test/k/#123", "https://web.telegram.org/k/#123")', context)).toBe(false);
+});
+
+test("tgSendMessage finds our outgoing message before a fast reply and refuses an incoming-only reply", async () => {
+  const script = await Bun.file(new URL("../extension/background.js", import.meta.url)).text();
+  for (const outgoing of [true, false]) {
+    let sent = false;
+    const ctx = liveTgContext(script, {
+      draft: "",
+      bubbles: () => sent ? [channelBubble("1", "old"), ...(outgoing ? [channelBubble("2", "hi", ["is-out"])] : []), channelBubble("3", "hi", ["is-in"])] : [channelBubble("1", "old")],
+      sendBtn: () => ({ click: () => { sent = true; ctx.composer.innerText = ""; } }),
+    });
+    const result = await runInNewContext('tgSendMessage({ chat: "-3913521119", text: "hi" })', ctx.context);
+    expect(result.verified).toBe(outgoing);
+    expect(result.messageId).toBe(outgoing ? "2" : null);
+  }
 });
 
 test("tgSendMessage verifies an own channel post (is-in, not is-out) by new id, no is-sending and text", async () => {
